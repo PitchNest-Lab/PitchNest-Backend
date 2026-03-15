@@ -168,26 +168,39 @@ wss.on("connection", async (ws) => {
       }
 
       if (isEvaluating && (response.serverContent?.turnComplete || response.server_content?.turn_complete)) {
+        
+        let reportData: any = { 
+          summary: "Pitch completed. (AI evaluation was too long or unreadable).",
+          scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
+          sentiments: [], strengths: ["Completed Pitch"], risks: ["Data format error"], next_steps: []
+        };
+        
         try {
-          let reportData = { summary: "Pitch was too short. AI could not generate a full report." };
-          
-          const firstBrace = evaluationBuffer.indexOf('{');
-          const lastBrace = evaluationBuffer.lastIndexOf('}');
+          let cleanText = evaluationBuffer.replace(/```json/g, '').replace(/```/g, '').trim();
+          const firstBrace = cleanText.indexOf('{');
+          const lastBrace = cleanText.lastIndexOf('}');
           
           if (firstBrace !== -1 && lastBrace !== -1) {
-            const cleanJson = evaluationBuffer.substring(firstBrace, lastBrace + 1);
-            reportData = JSON.parse(cleanJson);
+            const cleanJson = cleanText.substring(firstBrace, lastBrace + 1);
+            const parsed = JSON.parse(cleanJson);
+            reportData = { ...reportData, ...parsed }; 
+            if (!reportData.scores) reportData.scores = { delivery: 0, clarity: 0, scalability: 0, readiness: 0 };
           }
-
-          const info = db.prepare("INSERT INTO sessions (business_name, summary, evaluation_report, video_url) VALUES (?, ?, ?, ?)").run(
-            currentBusinessName, reportData.summary || "Pitch completed.", JSON.stringify(reportData), currentVideoUrl
-          );
-          
-          ws.send(JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid }));
         } catch (e) {
           console.error("JSON Parsing Error:", e);
-          ws.send(JSON.stringify({ type: "report", data: { summary: "Failed to parse AI evaluation." } }));
         }
+
+        // 🔥 Inject the duration and transcript into the JSON before saving to DB
+        reportData.duration = (ws as any).finalDuration || 0;
+        reportData.transcript = (ws as any).finalTranscript || [];
+
+        try {
+          const info = db.prepare("INSERT INTO sessions (business_name, summary, evaluation_report, video_url) VALUES (?, ?, ?, ?)").run(
+            currentBusinessName, reportData.summary, JSON.stringify(reportData), currentVideoUrl
+          );
+          ws.send(JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid }));
+        } catch (dbErr) { console.error("DB Insert Error:", dbErr); }
+        
         isEvaluating = false;
         evaluationBuffer = "";
       }
@@ -203,12 +216,13 @@ wss.on("connection", async (ws) => {
         const config = data.config || {};
         currentBusinessName = config.businessName || "Unknown Pitch";
 
-        // 🔥 FIX: Highly optimized prompts and dynamic voice routing
         const isCoach = config.mode === 'coach';
         const agentVoice = isCoach ? "Aoede" : "Charon"; 
         
         const masterPrompt = isCoach 
         ? `
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. You must IMMEDIATELY speak in character as your persona.
+
           You are Riley, a friendly, supportive Startup Pitch Coach.
           BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
           
@@ -218,8 +232,11 @@ wss.on("connection", async (ws) => {
           3. SOUND HUMAN: Use filler words like "umm", "look", "right". Be warm, encouraging, and helpful. If they stumble, encourage them.
           4. VISUAL AWARENESS TEST: You are receiving a live video feed of their camera and screen. Reference their slides kindly: "I love that slide you just pulled up..." If the user explicitly asks "Can you see me?", "What am I wearing?", or anything about their appearance, you MUST look closely at the video feed and accurately describe their appearance, clothing, or background to prove your vision works.
           5. UI IDENTIFICATION: ALWAYS start your text response with "Riley: ". Do not say your name out loud in the audio.
+          6. LIVE FACT-CHECKING: You have real-time access to Google Search. If the founder mentions a market size or competitor, do a quick search and offer helpful insights: "I just pulled up some live data, and your market is actually growing faster than you thought!"
         `
         : `
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. You must IMMEDIATELY speak in character as your persona.
+
           You are Marcus, the Lead Partner at an elite, no-nonsense Venture Capital firm.
           BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
           
@@ -230,11 +247,13 @@ wss.on("connection", async (ws) => {
           4. THE PANEL ILLUSION: You are the only one speaking out loud, but your partners Sarah (Data Analyst) and Chen (Tech Expert) are in the room. Occasionally reference them: "Sarah just pointed out your tech stack..." 
           5. VISUAL AWARENESS TEST: You are receiving a live 4fps video feed of the user's camera and screen. You MUST prove you can see! Say things like, "Looking at this slide right now..." or if they ask "Can you see me?", describe their face, clothing, or room background accurately.
           6. UI IDENTIFICATION: ALWAYS start your text response with "Marcus: " so our frontend UI highlights your avatar. Do not say "Marcus:" out loud.
+          7. LIVE DUE DILIGENCE: You have real-time access to Google Search. If the founder states a specific market size, names a competitor, or makes a bold statistical claim, USE YOUR SEARCH TOOL to fact-check them live. Challenge them if their numbers don't match reality.
         `;
         
         aiWs.send(JSON.stringify({
           setup: {
             model: `models/${MODEL}`,
+            tools: [{ googleSearch: {} }], 
             generationConfig: { 
               responseModalities: ["AUDIO"], 
               speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } } 
@@ -250,9 +269,20 @@ wss.on("connection", async (ws) => {
       else if (data.type === "end_session") {
         isEvaluating = true;
         
+        // 🔥 Catch real duration and transcript to save to the DB
+        (ws as any).finalDuration = data.duration || 0;
+        (ws as any).finalTranscript = data.transcript || [];
+        
+        const formattedTranscript = (data.transcript || []).map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
+        
         const evaluationPrompt = `
           [SYSTEM OVERRIDE: DO NOT SPEAK. TEXT OUTPUT ONLY. NO MARKDOWN.]
-          The pitch is over. Evaluate performance and return ONLY raw JSON matching this structure exactly:
+          The pitch is over. The founder pitched for ${data.duration} seconds.
+          Here is the exact transcript of the pitch:
+          
+          ${formattedTranscript}
+          
+          Based on this transcript, evaluate performance and return ONLY raw JSON matching this structure exactly:
           {
             "summary": "2-sentence executive summary.",
             "scores": { "delivery": 8, "clarity": 7, "scalability": 9, "readiness": 8 },
