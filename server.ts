@@ -135,19 +135,65 @@ app.delete("/api/decks/:id", (req, res) => {
 });
 
 app.get("/api/sessions", (req, res) => {
-  try { res.json(db.prepare("SELECT * FROM sessions ORDER BY timestamp DESC").all().map((s: any) => ({ ...s, evaluation_report: s.evaluation_report ? JSON.parse(s.evaluation_report) : null }))); } 
-  catch (error) { res.status(500).json({ error: "Failed to fetch sessions" }); }
+  try {
+    const sessions = db.prepare("SELECT * FROM sessions ORDER BY timestamp DESC").all().map((s: any) => ({
+      ...s,
+      evaluation_report: s.evaluation_report ? JSON.parse(s.evaluation_report) : null
+    }));
+    res.json(sessions);
+  } catch (error) { res.status(500).json({ error: "Failed to fetch sessions" }); }
 });
 
-wss.on("connection", async (ws) => {
-  let isEvaluating = false;
-  let evaluationBuffer = "";
-  let currentVideoUrl = "";
-  let isSetupComplete = false; 
-  let hasSentSetup = false;
-  let currentBusinessName = "Unknown Pitch"; 
+/* ---------------- REST EVALUATION (CRITICAL FIX) ---------------- */
 
-  console.log("\n🔌 [SERVER] New client connected to PitchNest Brain!");
+async function evaluatePitch(transcript: any[], businessName: string) {
+  const transcriptText = Array.isArray(transcript) && transcript.length > 0
+    ? transcript.map(m => `${m.type === 'user' ? 'FOUNDER' : (m.speaker || 'INVESTOR')}: ${m.text}`).join("\n")
+    : "No transcript available.";
+
+  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY a valid JSON object — no markdown fences, no explanation, just raw JSON.
+
+BUSINESS: ${businessName}
+
+PITCH TRANSCRIPT:
+${transcriptText}
+
+Return this exact JSON structure:
+{
+  "summary": "2-3 sentence executive summary of the pitch quality and key themes",
+  "scores": { "delivery": 8, "clarity": 8, "scalability": 8, "readiness": 8 },
+  "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
+  "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
+  "next_steps": [ { "title": "Action title", "desc": "Short actionable description", "priority": "High Priority" } ],
+  "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." } ]
+}`;
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${API_KEY}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: evaluationPrompt }] }],
+        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
+      })
+    }
+  );
+
+  const data = await response.json();
+  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+  const cleaned = rawText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+  return JSON.parse(cleaned);
+}
+
+/* ---------------- LIVE WEBSOCKET AGENT ---------------- */
+
+wss.on("connection", async (ws) => {
+  let currentVideoUrl = "";
+  let currentBusinessName = "Unknown Pitch";
+  let hasSentSetup = false;
+
+  console.log("✅ Client connected to PitchNest Brain");
 
   if (!API_KEY) {
     console.error("🚨 CRITICAL ERROR: GEMINI_API_KEY is missing from environment variables!");
@@ -155,84 +201,41 @@ wss.on("connection", async (ws) => {
   }
 
   const aiWs = new WebSocket(`wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`);
-  
-  // 🔥 CRITICAL FIX: Memory Leak Prevention
+
   ws.on("close", () => {
-    console.log("🔌 [SERVER] Client disconnected. Cleaning up AI socket.");
-    if (aiWs.readyState === WebSocket.OPEN) {
-      aiWs.close();
-    }
+    console.log("🔌 Client disconnected. Cleaning up AI socket.");
+    if (aiWs.readyState === WebSocket.OPEN) aiWs.close();
   });
 
   aiWs.on("open", () => ws.send(JSON.stringify({ type: "status", status: "vertex_ready" })));
 
   aiWs.on("message", (data) => {
-    const response = JSON.parse(data.toString());
+    try {
+      const response = JSON.parse(data.toString());
+      if (response.setupComplete) return;
 
-    if (response.setupComplete) {
-      isSetupComplete = true;
-      aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: "Hello, I am ready to pitch." }] }], turnComplete: true } }));
-      return;
-    }
+      if (ws.readyState === WebSocket.OPEN) {
+        if (response.serverContent?.interrupted) ws.send(JSON.stringify({ type: "stop_audio" }));
 
-    if (ws.readyState === WebSocket.OPEN) {
-      if (response.serverContent?.interrupted) ws.send(JSON.stringify({ type: "stop_audio" }));
-
-      const modelTurn = response.serverContent?.modelTurn || response.server_content?.model_turn;
-      if (modelTurn?.parts) {
-        modelTurn.parts.forEach((part: any) => {
-          if (isEvaluating && part.text) evaluationBuffer += part.text;
-          else if (part.text) ws.send(JSON.stringify({ type: "transcript", text: part.text }));
-          else if (part.inlineData || part.inline_data) ws.send(JSON.stringify({ type: "audio", data: (part.inlineData || part.inline_data).data }));
-        });
-      }
-
-      if (isEvaluating && (response.serverContent?.turnComplete || response.server_content?.turn_complete)) {
-        
-        let reportData: any = { 
-          summary: "Pitch completed. (AI evaluation was too long or unreadable).",
-          scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
-          sentiments: [], strengths: ["Completed Pitch"], risks: ["Data format error"], next_steps: []
-        };
-        
-        try {
-          // 🔥 Safer JSON Extractor Fix
-          const match = evaluationBuffer.match(/\{[^]*\}/);
-          if (match) {
-            const parsed = JSON.parse(match[0]);
-            reportData = { ...reportData, ...parsed }; 
-            if (!reportData.scores) reportData.scores = { delivery: 0, clarity: 0, scalability: 0, readiness: 0 };
-          }
-        } catch (e) {
-          console.error("JSON Parsing Error:", e);
-        }
-
-        reportData.duration = (ws as any).finalDuration || 0;
-        reportData.transcript = (ws as any).finalTranscript || [];
-
-        try {
-          const info = db.prepare("INSERT INTO sessions (business_name, summary, evaluation_report, video_url) VALUES (?, ?, ?, ?)").run(
-            currentBusinessName, reportData.summary, JSON.stringify(reportData), currentVideoUrl
-          );
-          
-          // 🔥 CRITICAL FIX: Broadcast to all pages so Dashboard updates instantly
-          const payload = JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid });
-          wss.clients.forEach(client => {
-            if (client.readyState === WebSocket.OPEN) {
-              client.send(payload);
-            }
+        const modelTurn = response.serverContent?.modelTurn;
+        if (modelTurn?.parts) {
+          modelTurn.parts.forEach((part: any) => {
+            if (part.text) ws.send(JSON.stringify({ type: "transcript", text: part.text }));
+            if (part.inlineData?.data) ws.send(JSON.stringify({ type: "audio", data: part.inlineData.data }));
           });
-        } catch (dbErr) { console.error("DB Insert Error:", dbErr); }
-        
-        isEvaluating = false;
-        evaluationBuffer = "";
+        }
       }
-    }
+    } catch (e) { console.error("Error parsing Gemini message:", e); }
   });
 
   ws.on("message", async (message) => {
     try {
       const data = JSON.parse(message.toString());
+
+      if (data.type === "set_video_url") {
+        currentVideoUrl = data.url;
+        return;
+      }
 
       if (data.type === "client_ready" && !hasSentSetup) {
         hasSentSetup = true;
@@ -242,35 +245,37 @@ wss.on("connection", async (ws) => {
         const isCoach = config.mode === 'coach';
         const agentVoice = isCoach ? "Aoede" : "Charon"; 
         
+        // 🔥 THE GOD-TIER AGI PROMPTS
         const masterPrompt = isCoach 
         ? `
-          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. You must IMMEDIATELY speak in character as your persona.
-
-          You are Riley, a friendly, supportive Startup Pitch Coach.
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. Speak in character immediately.
+          You are Riley, a highly observant, elite Startup Pitch Coach.
           BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
-          
-          CRITICAL BEHAVIORAL RULES:
-          1. GREETING: Immediately say: "Hey there! I'm Riley, your pitch coach. I'm here to help you practice. Whenever you're ready, let's hear your pitch!"
-          2. NO MONOLOGUES: NEVER speak for more than 3 sentences at a time. Keep it punchy, conversational, and fast-paced. End your thoughts by passing the mic back to the founder.
-          3. SOUND HUMAN: Use filler words like "umm", "look", "right". Be warm, encouraging, and helpful. If they stumble, encourage them.
-          4. VISUAL AWARENESS TEST: You are receiving a live video feed of their camera and screen. Reference their slides kindly: "I love that slide you just pulled up..." If the user explicitly asks "Can you see me?", "What am I wearing?", or anything about their appearance, you MUST look closely at the video feed and accurately describe their appearance, clothing, or background to prove your vision works.
-          5. UI IDENTIFICATION: ALWAYS start your text response with "Riley: ". Do not say your name out loud in the audio.
-          6. LIVE FACT-CHECKING: You have real-time access to Google Search. If the founder mentions a market size or competitor, do a quick search and offer helpful insights: "I just pulled up some live data, and your market is actually growing faster than you thought!"
+
+          BEHAVIORAL RULES:
+          1. DYNAMIC GREETING: NEVER use a scripted greeting. Start naturally. Sometimes be energetic, sometimes be calm. Just ask them to start when they are ready. Do not repeat yourself.
+          2. BE HUMAN & UNPREDICTABLE: Use filler words naturally. Vary your tone. Have a real conversation.
+          3. ACTIVE VISION & OBSERVATION: You are watching their live video feed. Pay close attention to their body language.
+          4. HOLD THEM ACCOUNTABLE: If they dodge a question or give a fluffy, corporate answer, call it out gracefully: "You didn't really answer my question there..."
+          5. NO MONOLOGUES: Keep responses short and punchy (1-3 sentences max).
+          6. UI IDENTIFICATION: Start text responses with "Riley: " (Do not say this out loud).
+          7. THE SILENCE RULE: If there is dead air or the founder is stumbling, DO NOT WAIT. Jump in warmly: "It's okay, take a breath. Let's just talk through the problem you're solving."
+          8. VISION-ACTIVATED REACTIONS: You are processing a 4fps video stream. If they lean too close to the camera, gently tell them to adjust it. If they look away constantly, kindly remind them to make eye contact to build trust.
         `
         : `
-          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. You must IMMEDIATELY speak in character as your persona.
-
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. Speak in character immediately.
           You are Marcus, the Lead Partner at an elite, no-nonsense Venture Capital firm.
           BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
-          
-          CRITICAL BEHAVIORAL RULES FOR A LIVE AUDIO CALL:
-          1. GREETING: As soon as the user connects, immediately say: "Hey, Marcus here. Welcome to PitchNest. We don't have a lot of time, so let's get right into it, what are you building?"
-          2. NO MONOLOGUES: This is a live voice call. NEVER speak for more than 3 sentences at a time. Keep it punchy, conversational, and fast-paced. 
-          3. SOUND HUMAN: Use filler words like "umm", "look", "honestly". Do not sound like a text-bot. Be a slightly grumpy but highly intelligent investor.
-          4. THE PANEL ILLUSION: You are the only one speaking out loud, but your partners Sarah (Data Analyst) and Chen (Tech Expert) are in the room. Occasionally reference them: "Sarah just pointed out your tech stack..." 
-          5. VISUAL AWARENESS TEST: You are receiving a live 4fps video feed of the user's camera and screen. You MUST prove you can see! Say things like, "Looking at this slide right now..." or if they ask "Can you see me?", describe their face, clothing, or room background accurately.
-          6. UI IDENTIFICATION: ALWAYS start your text response with "Marcus: " so our frontend UI highlights your avatar. Do not say "Marcus:" out loud.
-          7. LIVE DUE DILIGENCE: You have real-time access to Google Search. If the founder states a specific market size, names a competitor, or makes a bold statistical claim, USE YOUR SEARCH TOOL to fact-check them live. Challenge them if their numbers don't match reality.
+
+          BEHAVIORAL RULES:
+          1. TAKE CHARGE IMMEDIATELY: NEVER use a scripted greeting. Start the meeting differently every time. Maybe you are reviewing their deck, maybe you just ask them to hit you with the elevator pitch. YOU lead the meeting.
+          2. THE PANEL ILLUSION: You are the only one speaking, but you must constantly reference the visual cues of your silent partners. Say things like: 'Sarah is shaking her head at your LTV/CAC ratio, and honestly, I agree with her,' or 'Chen just pulled up your website and the loading time is terrible.'
+          3. ZERO TOLERANCE FOR BS: If they dodge a financial question, give a generic marketing answer, or fail to answer directly, CUT THEM OFF. Say "You didn't answer the question. What are the actual numbers?" Push them hard. You are the judge.
+          4. NO MONOLOGUES: This is a fast-paced live call. 1-3 sentences max.
+          5. UI IDENTIFICATION: Start text responses with "Marcus: " (Do not say this out loud).
+          6. LIVE FACT-CHECKING: Use Google Search to fact-check bold claims live. Challenge them if their market size or competitor claims are wrong.
+          7. THE SILENCE RULE: If there is more than 5 seconds of dead air, or the founder is stumbling and saying 'uhhh' repeatedly, DO NOT WAIT. Interrupt them and say: 'Take a breath. Let's skip the pitch. Just tell me how you make money.'
+          8. VISION-ACTIVATED REACTIONS: You are processing a 4fps video stream of the founder. If they lean close to the camera, tell them to step back. If they look away from the camera for too long, say 'Look at me when you are pitching.' If they smile after a hard question, say 'I see you smiling, but the math doesn't add up.'
         `;
         
         aiWs.send(JSON.stringify({
@@ -284,44 +289,50 @@ wss.on("connection", async (ws) => {
             systemInstruction: { parts: [{ text: masterPrompt }] }
           }
         }));
+        
+        // Wait a second and send a trigger to make the AI speak first and take the lead
+        setTimeout(() => {
+          if (aiWs.readyState === WebSocket.OPEN) {
+            aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: "[SYSTEM TRIGGER: The meeting has started. Take the lead and speak first.]" }] }], turnComplete: true } }));
+          }
+        }, 1500);
+        return;
       } 
-      else if (data.type === "chat_message" && isSetupComplete) {
+
+      if (data.type === "chat_message" && hasSentSetup) {
         aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: data.text }] }], turnComplete: true } }));
       } 
-      else if (data.type === "set_video_url") {
-        currentVideoUrl = data.url;
-      }
-      else if (data.type === "end_session") {
-        isEvaluating = true;
-        
-        (ws as any).finalDuration = data.duration || 0;
-        (ws as any).finalTranscript = data.transcript || [];
-        
-        const formattedTranscript = (data.transcript || []).map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
-        
-        const evaluationPrompt = `
-          [SYSTEM OVERRIDE: DO NOT SPEAK. TEXT OUTPUT ONLY.]
-          The pitch is over. The founder pitched for ${data.duration} seconds.
-          Here is the exact transcript of the pitch:
-          
-          ${formattedTranscript}
-          
-          Based on this transcript, evaluate performance and return ONLY raw JSON matching this exact structure. Do NOT wrap it in markdown block quotes. Do NOT add conversational text.
-          {
-            "summary": "2-sentence executive summary.",
-            "scores": { "delivery": 8, "clarity": 7, "scalability": 9, "readiness": 8 },
-            "sentiments": [{ "persona": "VC Panelist", "quote": "Quote here." }],
-            "strengths": ["strength 1", "strength 2"],
-            "risks": ["risk 1", "risk 2"],
-            "next_steps": [{ "title": "Step 1", "desc": "Desc", "priority": "High Priority" }]
-          }
-        `;
-        aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: evaluationPrompt }] }], turnComplete: true } }));
+      
+      if (data.type === "end_session") {
+        console.log("🏁 Session ended, starting REST evaluation...");
+        const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : [];
+        if (aiWs.readyState === WebSocket.OPEN) aiWs.close();
+
+        let reportData = {
+          summary: "Pitch complete. Evaluation data unavailable.",
+          scores: { delivery: 5, clarity: 5, scalability: 5, readiness: 5 },
+          sentiments: [], strengths: [], risks: [], next_steps: [], transcript: frontendTranscript, duration: data.duration || 0
+        };
+
+        try {
+          const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName);
+          reportData = { ...reportData, ...evaluated };
+        } catch (evalErr) { console.error("❌ Evaluation failed:", evalErr); }
+
+        const info = db.prepare("INSERT INTO sessions (business_name, summary, evaluation_report, video_url) VALUES (?, ?, ?, ?)").run(
+          currentBusinessName, reportData.summary, JSON.stringify(reportData), currentVideoUrl
+        );
+
+        const payload = JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid });
+        wss.clients.forEach(client => { if (client.readyState === WebSocket.OPEN) client.send(payload); });
+        return;
       } 
-      else if (aiWs.readyState === WebSocket.OPEN && isSetupComplete && !isEvaluating) {
+
+      // Forward audio/vision chunks to Gemini
+      if (aiWs.readyState === WebSocket.OPEN && hasSentSetup) {
         aiWs.send(message.toString());
       }
-    } catch (e) {}
+    } catch (err) {}
   });
 });
 
