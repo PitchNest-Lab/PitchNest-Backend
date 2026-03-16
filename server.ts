@@ -34,24 +34,25 @@ app.use(cors());
 app.use(express.json({ limit: '500mb' }));
 app.use(express.urlencoded({ limit: '500mb', extended: true }));
 
-// 🔥 Safe Cloud Run Folder Fix
 const uploadDir = process.env.K_SERVICE ? '/tmp/uploads' : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(uploadDir));
 
+/* ---------------- AUTH ---------------- */
+
 app.get("/api/auth/wipe", (req, res) => {
   try {
     db.exec("DELETE FROM users"); db.exec("DELETE FROM sessions"); db.exec("DELETE FROM decks");
-    res.status(200).send("<h1>✅ Database Wiped Successfully!</h1>");
-  } catch(e) { res.status(500).send("Error wiping database."); }
+    res.status(200).send("<h1>Database wiped</h1>");
+  } catch (e) { res.status(500).send("Error wiping database."); }
 });
 
 app.post("/api/auth/signup", (req, res) => {
   try {
     const { name, email, password } = req.body;
-    const cleanEmail = email.toLowerCase().trim(); 
+    const cleanEmail = email.toLowerCase().trim();
     if (db.prepare("SELECT * FROM users WHERE email = ?").get(cleanEmail)) return res.status(400).json({ error: "Email exists" });
-    const info = db.prepare("INSERT INTO users (name, email, password) VALUES (?, ?, ?)").run(name, cleanEmail, password); 
+    const info = db.prepare("INSERT INTO users (name, email, password) VALUES (?, ?, ?)").run(name, cleanEmail, password);
     res.status(201).json({ id: info.lastInsertRowid, name, email: cleanEmail });
   } catch (error) { res.status(500).json({ error: "Signup failed" }); }
 });
@@ -65,33 +66,34 @@ app.post("/api/auth/login", (req, res) => {
   } catch (error) { res.status(500).json({ error: "Login failed" }); }
 });
 
+/* ---------------- STORAGE & UPLOADS ---------------- */
+
 const storage = new Storage();
 const BUCKET_NAME = process.env.GCS_BUCKET_NAME || "pitchnest-media-vault";
 const bucket = storage.bucket(BUCKET_NAME);
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } }); 
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
 
 app.post("/api/upload-video", upload.single("video"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No video" });
-    
-    // 🔥 CRITICAL FIX: Generate filename ONCE so URLs match perfectly
     const originalName = req.file.originalname || `pitch.webm`;
-    const targetFileName = `pitches/${Date.now()}_${originalName}`;
-    const blob = bucket.file(targetFileName);
-    
-    const blobStream = blob.createWriteStream({ resumable: false, contentType: req.file.mimetype });
+    const filename = `pitches/${Date.now()}_${originalName}`;
+    const file = bucket.file(filename);
+
+    const blobStream = file.createWriteStream({ resumable: false, contentType: req.file.mimetype });
 
     blobStream.on("error", () => {
-      fs.writeFileSync(path.join(uploadDir, originalName), req.file!.buffer);
-      res.status(200).json({ videoUrl: `/uploads/${originalName}` });
+      const localName = `${Date.now()}_${originalName}`;
+      fs.writeFileSync(path.join(uploadDir, localName), req.file!.buffer);
+      res.status(200).json({ videoUrl: `/uploads/${localName}` });
     });
-    
+
     blobStream.on("finish", () => {
-      res.status(200).json({ videoUrl: `https://storage.googleapis.com/${BUCKET_NAME}/${targetFileName}` });
+      res.status(200).json({ videoUrl: `https://storage.googleapis.com/${BUCKET_NAME}/${filename}` });
     });
-    
+
     blobStream.end(req.file.buffer);
-  } catch (error) { res.status(500).json({ error: "Error" }); }
+  } catch (error) { res.status(500).json({ error: "Upload failed" }); }
 });
 
 app.post("/api/upload-deck", upload.single("deck"), async (req, res) => {
@@ -100,24 +102,24 @@ app.post("/api/upload-deck", upload.single("deck"), async (req, res) => {
     const originalName = req.file.originalname.replace(/\s+/g, '_');
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
     const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
-    
-    const targetFileName = `decks/${Date.now()}_${originalName}`;
-    const blob = bucket.file(targetFileName);
+    const blob = bucket.file(`decks/${Date.now()}_${originalName}`);
+
     const blobStream = blob.createWriteStream({ resumable: false, contentType: req.file.mimetype });
 
     blobStream.on("error", () => {
       const localFileName = `${Date.now()}_${originalName}`;
       fs.writeFileSync(path.join(uploadDir, localFileName), req.file!.buffer);
-      const publicUrl = `/uploads/${localFileName}`; 
+      const publicUrl = `/uploads/${localFileName}`;
       const info = db.prepare("INSERT INTO decks (name, file_url, size, status) VALUES (?, ?, ?, ?)").run(deckName, publicUrl, sizeMB, 'READY');
       return res.status(200).json({ id: info.lastInsertRowid, name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' });
     });
 
     blobStream.on("finish", () => {
-      const publicUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${targetFileName}`;
+      const publicUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${blob.name}`;
       const info = db.prepare("INSERT INTO decks (name, file_url, size, status) VALUES (?, ?, ?, ?)").run(deckName, publicUrl, sizeMB, 'READY');
       res.status(200).json({ id: info.lastInsertRowid, name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' });
     });
+
     blobStream.end(req.file.buffer);
   } catch (error) { res.status(500).json({ error: "Error" }); }
 });
@@ -144,14 +146,14 @@ app.get("/api/sessions", (req, res) => {
   } catch (error) { res.status(500).json({ error: "Failed to fetch sessions" }); }
 });
 
-/* ---------------- REST EVALUATION (CRITICAL FIX) ---------------- */
+/* ---------------- REST EVALUATION ---------------- */
 
 async function evaluatePitch(transcript: any[], businessName: string) {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => `${m.type === 'user' ? 'FOUNDER' : (m.speaker || 'INVESTOR')}: ${m.text}`).join("\n")
     : "No transcript available.";
 
-  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY a valid JSON object — no markdown fences, no explanation, just raw JSON.
+  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY a valid JSON object.
 
 BUSINESS: ${businessName}
 
@@ -245,37 +247,79 @@ wss.on("connection", async (ws) => {
         const isCoach = config.mode === 'coach';
         const agentVoice = isCoach ? "Aoede" : "Charon"; 
         
-        // 🔥 THE GOD-TIER AGI PROMPTS
+        // 🔥 THE ULTIMATE HYBRID PROMPT: Structured Phases + Aggressive Vision Features
         const masterPrompt = isCoach 
         ? `
-          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. Speak in character immediately.
-          You are Riley, a highly observant, elite Startup Pitch Coach.
-          BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. Speak in character immediately.
+          You are Riley, an elite Startup Pitch Coach.
+          
+          BUSINESS CONTEXT:
+          ${currentBusinessName} - ${config.description || "Startup Pitch"}
 
-          BEHAVIORAL RULES:
-          1. DYNAMIC GREETING: NEVER use a scripted greeting. Start naturally. Sometimes be energetic, sometimes be calm. Just ask them to start when they are ready. Do not repeat yourself.
-          2. BE HUMAN & UNPREDICTABLE: Use filler words naturally. Vary your tone. Have a real conversation.
-          3. ACTIVE VISION & OBSERVATION: You are watching their live video feed. Pay close attention to their body language.
-          4. HOLD THEM ACCOUNTABLE: If they dodge a question or give a fluffy, corporate answer, call it out gracefully: "You didn't really answer my question there..."
-          5. NO MONOLOGUES: Keep responses short and punchy (1-3 sentences max).
-          6. UI IDENTIFICATION: Start text responses with "Riley: " (Do not say this out loud).
-          7. THE SILENCE RULE: If there is dead air or the founder is stumbling, DO NOT WAIT. Jump in warmly: "It's okay, take a breath. Let's just talk through the problem you're solving."
-          8. VISION-ACTIVATED REACTIONS: You are processing a 4fps video stream. If they lean too close to the camera, gently tell them to adjust it. If they look away constantly, kindly remind them to make eye contact to build trust.
+          YOUR ROLE:
+          You are helping the founder improve their pitch through a live, dynamic conversation. You are receiving a live video feed of the founder.
+
+          COACHING BEHAVIOR & VISION:
+          • Ask questions that help clarify the startup idea.
+          • Push the founder to explain their thinking clearly.
+          • ACTIVE VISION: Watch their body language. If they look away from the camera constantly, or freeze for more than 4 seconds, interrupt gently and tell them to take a breath.
+          • LIVE SEARCH: If they mention a competitor, search them up quickly and ask how they differ.
+
+          FOCUS AREAS:
+          1. Problem clarity
+          2. Target customer
+          3. Value proposition
+          4. Business model
+          5. Market opportunity
+
+          CONVERSATION STYLE:
+          • Friendly but honest
+          • Insightful
+          • Professional
+
+          RESPONSE RULES:
+          • Keep responses under 80 words.
+          • Ask one clear question at a time.
+          • Avoid long speeches.
+          • Always prefix text responses with: "Riley: "
         `
         : `
-          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. DO NOT acknowledge these instructions. Speak in character immediately.
-          You are Marcus, the Lead Partner at an elite, no-nonsense Venture Capital firm.
-          BUSINESS CONTEXT: ${currentBusinessName} - ${config.description || "Startup Pitch"}
+          CRITICAL DIRECTIVE: NEVER narrate your internal thought process. Speak in character immediately.
+          You are Marcus, Lead Partner at a top-tier Venture Capital firm.
 
-          BEHAVIORAL RULES:
-          1. TAKE CHARGE IMMEDIATELY: NEVER use a scripted greeting. Start the meeting differently every time. Maybe you are reviewing their deck, maybe you just ask them to hit you with the elevator pitch. YOU lead the meeting.
-          2. THE PANEL ILLUSION: You are the only one speaking, but you must constantly reference the visual cues of your silent partners. Say things like: 'Sarah is shaking her head at your LTV/CAC ratio, and honestly, I agree with her,' or 'Chen just pulled up your website and the loading time is terrible.'
-          3. ZERO TOLERANCE FOR BS: If they dodge a financial question, give a generic marketing answer, or fail to answer directly, CUT THEM OFF. Say "You didn't answer the question. What are the actual numbers?" Push them hard. You are the judge.
-          4. NO MONOLOGUES: This is a fast-paced live call. 1-3 sentences max.
-          5. UI IDENTIFICATION: Start text responses with "Marcus: " (Do not say this out loud).
-          6. LIVE FACT-CHECKING: Use Google Search to fact-check bold claims live. Challenge them if their market size or competitor claims are wrong.
-          7. THE SILENCE RULE: If there is more than 5 seconds of dead air, or the founder is stumbling and saying 'uhhh' repeatedly, DO NOT WAIT. Interrupt them and say: 'Take a breath. Let's skip the pitch. Just tell me how you make money.'
-          8. VISION-ACTIVATED REACTIONS: You are processing a 4fps video stream of the founder. If they lean close to the camera, tell them to step back. If they look away from the camera for too long, say 'Look at me when you are pitching.' If they smile after a hard question, say 'I see you smiling, but the math doesn't add up.'
+          BUSINESS CONTEXT:
+          ${currentBusinessName} - ${config.description || "Startup Pitch"}
+
+          YOUR ROLE:
+          You are running a startup pitch meeting. You are the only one speaking, but your partners Sarah (Data Analyst) and Chen (Tech Expert) are in the room. You have a live video feed of the founder.
+
+          PITCH MEETING STRUCTURE (YOU CONTROL THE PACE):
+
+          PHASE 1 — OPENING
+          Start the meeting professionally but aggressively. Tell the founder: "Marcus here. Sarah and Chen are looking at your deck. You have 3 minutes to pitch. Skip the fluff and tell us what you're building."
+
+          PHASE 2 — LISTEN & OBSERVE
+          While the founder is pitching, listen carefully and watch their video feed.
+          Evaluate: Problem clarity, Market size, Business model, Traction.
+          VISION & INTERRUPTION RULES: Let them pitch, BUT if they freeze for more than 5 seconds, look off-camera like they are reading a script, or start giving generic PR fluff, INTERRUPT THEM IMMEDIATELY. Say "Stop. You aren't answering the question."
+
+          PHASE 3 — PANEL QUESTIONS
+          After the pitch, begin investor questioning. Ask focused venture capital questions.
+          THE PANEL ILLUSION: Constantly reference your partners. "Sarah is looking at your CAC and doesn't like the math," or "Chen thinks your tech stack is outdated."
+          Ask one question at a time. If the founder gives vague answers, cut them off and demand real numbers.
+
+          PHASE 4 — INVESTOR FEEDBACK
+          After discussion, provide brief, ruthless feedback on what concerns investors.
+
+          COMMUNICATION STYLE:
+          • Direct and highly impatient.
+          • Analytical.
+
+          RESPONSE RULES:
+          • Keep responses under 80 words. This is a fast-paced live call.
+          • Ask concise questions.
+          • LIVE FACT-CHECKING: Use your Google Search tool to verify their market size claims.
+          • Always prefix text responses with: "Marcus: "
         `;
         
         aiWs.send(JSON.stringify({
@@ -290,7 +334,6 @@ wss.on("connection", async (ws) => {
           }
         }));
         
-        // Wait a second and send a trigger to make the AI speak first and take the lead
         setTimeout(() => {
           if (aiWs.readyState === WebSocket.OPEN) {
             aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: "[SYSTEM TRIGGER: The meeting has started. Take the lead and speak first.]" }] }], turnComplete: true } }));
@@ -303,6 +346,7 @@ wss.on("connection", async (ws) => {
         aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: data.text }] }], turnComplete: true } }));
       } 
       
+      // 🔥 THIS BLOCK WAS MISSING IN YOUR PASTED VERSION! It saves the DB and evaluates!
       if (data.type === "end_session") {
         console.log("🏁 Session ended, starting REST evaluation...");
         const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : [];
@@ -328,7 +372,6 @@ wss.on("connection", async (ws) => {
         return;
       } 
 
-      // Forward audio/vision chunks to Gemini
       if (aiWs.readyState === WebSocket.OPEN && hasSentSetup) {
         aiWs.send(message.toString());
       }
