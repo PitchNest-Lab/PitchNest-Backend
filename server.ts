@@ -34,7 +34,8 @@ app.use(cors());
 app.use(express.json({ limit: '500mb' }));
 app.use(express.urlencoded({ limit: '500mb', extended: true }));
 
-const uploadDir = path.join(__dirname, 'uploads');
+// 🔥 Safe Cloud Run Folder Fix
+const uploadDir = process.env.K_SERVICE ? '/tmp/uploads' : path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 app.use('/uploads', express.static(uploadDir));
 
@@ -65,21 +66,30 @@ app.post("/api/auth/login", (req, res) => {
 });
 
 const storage = new Storage();
-const BUCKET_NAME = process.env.GCS_BUCKET_NAME || "pitchnest-recordings-123";
+const BUCKET_NAME = process.env.GCS_BUCKET_NAME || "pitchnest-media-vault";
 const bucket = storage.bucket(BUCKET_NAME);
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } }); 
 
 app.post("/api/upload-video", upload.single("video"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No video" });
-    const originalName = req.file.originalname || `pitch_${Date.now()}.webm`;
-    const blobStream = bucket.file(`pitches/${Date.now()}_${originalName}`).createWriteStream({ resumable: false, contentType: req.file.mimetype });
+    
+    // 🔥 CRITICAL FIX: Generate filename ONCE so URLs match perfectly
+    const originalName = req.file.originalname || `pitch.webm`;
+    const targetFileName = `pitches/${Date.now()}_${originalName}`;
+    const blob = bucket.file(targetFileName);
+    
+    const blobStream = blob.createWriteStream({ resumable: false, contentType: req.file.mimetype });
 
     blobStream.on("error", () => {
       fs.writeFileSync(path.join(uploadDir, originalName), req.file!.buffer);
       res.status(200).json({ videoUrl: `/uploads/${originalName}` });
     });
-    blobStream.on("finish", () => res.status(200).json({ videoUrl: `https://storage.googleapis.com/${BUCKET_NAME}/pitches/${Date.now()}_${originalName}` }));
+    
+    blobStream.on("finish", () => {
+      res.status(200).json({ videoUrl: `https://storage.googleapis.com/${BUCKET_NAME}/${targetFileName}` });
+    });
+    
     blobStream.end(req.file.buffer);
   } catch (error) { res.status(500).json({ error: "Error" }); }
 });
@@ -90,7 +100,9 @@ app.post("/api/upload-deck", upload.single("deck"), async (req, res) => {
     const originalName = req.file.originalname.replace(/\s+/g, '_');
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
     const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
-    const blob = bucket.file(`decks/${Date.now()}_${originalName}`);
+    
+    const targetFileName = `decks/${Date.now()}_${originalName}`;
+    const blob = bucket.file(targetFileName);
     const blobStream = blob.createWriteStream({ resumable: false, contentType: req.file.mimetype });
 
     blobStream.on("error", () => {
@@ -102,7 +114,7 @@ app.post("/api/upload-deck", upload.single("deck"), async (req, res) => {
     });
 
     blobStream.on("finish", () => {
-      const publicUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${blob.name}`;
+      const publicUrl = `https://storage.googleapis.com/${BUCKET_NAME}/${targetFileName}`;
       const info = db.prepare("INSERT INTO decks (name, file_url, size, status) VALUES (?, ?, ?, ?)").run(deckName, publicUrl, sizeMB, 'READY');
       res.status(200).json({ id: info.lastInsertRowid, name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' });
     });
@@ -144,6 +156,14 @@ wss.on("connection", async (ws) => {
 
   const aiWs = new WebSocket(`wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${API_KEY}`);
   
+  // 🔥 CRITICAL FIX: Memory Leak Prevention
+  ws.on("close", () => {
+    console.log("🔌 [SERVER] Client disconnected. Cleaning up AI socket.");
+    if (aiWs.readyState === WebSocket.OPEN) {
+      aiWs.close();
+    }
+  });
+
   aiWs.on("open", () => ws.send(JSON.stringify({ type: "status", status: "vertex_ready" })));
 
   aiWs.on("message", (data) => {
@@ -176,13 +196,10 @@ wss.on("connection", async (ws) => {
         };
         
         try {
-          let cleanText = evaluationBuffer.replace(/```json/g, '').replace(/```/g, '').trim();
-          const firstBrace = cleanText.indexOf('{');
-          const lastBrace = cleanText.lastIndexOf('}');
-          
-          if (firstBrace !== -1 && lastBrace !== -1) {
-            const cleanJson = cleanText.substring(firstBrace, lastBrace + 1);
-            const parsed = JSON.parse(cleanJson);
+          // 🔥 Safer JSON Extractor Fix
+          const match = evaluationBuffer.match(/\{[^]*\}/);
+          if (match) {
+            const parsed = JSON.parse(match[0]);
             reportData = { ...reportData, ...parsed }; 
             if (!reportData.scores) reportData.scores = { delivery: 0, clarity: 0, scalability: 0, readiness: 0 };
           }
@@ -190,7 +207,6 @@ wss.on("connection", async (ws) => {
           console.error("JSON Parsing Error:", e);
         }
 
-        // 🔥 Inject the duration and transcript into the JSON before saving to DB
         reportData.duration = (ws as any).finalDuration || 0;
         reportData.transcript = (ws as any).finalTranscript || [];
 
@@ -198,7 +214,14 @@ wss.on("connection", async (ws) => {
           const info = db.prepare("INSERT INTO sessions (business_name, summary, evaluation_report, video_url) VALUES (?, ?, ?, ?)").run(
             currentBusinessName, reportData.summary, JSON.stringify(reportData), currentVideoUrl
           );
-          ws.send(JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid }));
+          
+          // 🔥 CRITICAL FIX: Broadcast to all pages so Dashboard updates instantly
+          const payload = JSON.stringify({ type: "report", data: reportData, sessionId: info.lastInsertRowid });
+          wss.clients.forEach(client => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(payload);
+            }
+          });
         } catch (dbErr) { console.error("DB Insert Error:", dbErr); }
         
         isEvaluating = false;
@@ -265,24 +288,25 @@ wss.on("connection", async (ws) => {
       else if (data.type === "chat_message" && isSetupComplete) {
         aiWs.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text: data.text }] }], turnComplete: true } }));
       } 
-      else if (data.type === "set_video_url") currentVideoUrl = data.url;
+      else if (data.type === "set_video_url") {
+        currentVideoUrl = data.url;
+      }
       else if (data.type === "end_session") {
         isEvaluating = true;
         
-        // 🔥 Catch real duration and transcript to save to the DB
         (ws as any).finalDuration = data.duration || 0;
         (ws as any).finalTranscript = data.transcript || [];
         
         const formattedTranscript = (data.transcript || []).map((t: any) => `${t.speaker}: ${t.text}`).join('\n');
         
         const evaluationPrompt = `
-          [SYSTEM OVERRIDE: DO NOT SPEAK. TEXT OUTPUT ONLY. NO MARKDOWN.]
+          [SYSTEM OVERRIDE: DO NOT SPEAK. TEXT OUTPUT ONLY.]
           The pitch is over. The founder pitched for ${data.duration} seconds.
           Here is the exact transcript of the pitch:
           
           ${formattedTranscript}
           
-          Based on this transcript, evaluate performance and return ONLY raw JSON matching this structure exactly:
+          Based on this transcript, evaluate performance and return ONLY raw JSON matching this exact structure. Do NOT wrap it in markdown block quotes. Do NOT add conversational text.
           {
             "summary": "2-sentence executive summary.",
             "scores": { "delivery": 8, "clarity": 7, "scalability": 9, "readiness": 8 },
