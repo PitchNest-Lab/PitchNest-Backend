@@ -8,6 +8,7 @@ import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
+import { handleWaitlist } from "./controllers/waitlistController.ts";
 
 const app = express();
 
@@ -16,8 +17,8 @@ app.use(cors({
   origin: config.allowedOrigin,
   credentials: true,
 }));
-app.use(express.json({ limit: '500mb' }));
-app.use(express.urlencoded({ limit: '500mb', extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // Serve local uploads statically
 app.use('/uploads', express.static(uploadDir));
@@ -25,9 +26,10 @@ app.use('/uploads', express.static(uploadDir));
 // API Routers
 app.use("/api/auth", authRoutes);
 app.use("/api/decks", deckRoutes);
-app.use("/api", uploadRoutes); // Hooks /api/upload-video directly
+app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/profile", profileRoutes);
+app.post("/api/waitlist", handleWaitlist);
 
 // Health check endpoint
 app.get("/health", (req, res) => res.send("🚀 PitchNest Brain Online!"));
