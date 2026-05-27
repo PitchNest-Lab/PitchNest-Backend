@@ -97,9 +97,15 @@ export function initLiveSocket(wss: WebSocketServer) {
           // Get properly configured system prompt from aiService
           const masterPrompt = getMasterPrompt(isCoach, currentBusinessName, clientConfig);
 
+          // Bidi WebSocket ONLY supports Gemini 2.0 models (e.g. gemini-2.0-flash).
+          // 2.5 models are not yet supported for real-time Bidi live gateways.
+          const bidiModel = config.geminiModel.startsWith("gemini-2.0")
+            ? config.geminiModel
+            : "gemini-2.0-flash";
+
           aiWs.send(JSON.stringify({
             setup: {
-              model: `models/${config.geminiModel}`,
+              model: `models/${bidiModel}`,
               tools: [{ googleSearch: {} }],
               generationConfig: {
                 responseModalities: ["AUDIO"],
