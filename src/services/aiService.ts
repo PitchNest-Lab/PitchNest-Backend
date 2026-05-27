@@ -31,7 +31,14 @@ export interface EvaluationReport {
  */
 export async function evaluatePitch(transcript: any[], businessName: string): Promise<EvaluationReport> {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
-    ? transcript.map(m => `${m.type === 'user' ? 'FOUNDER' : (m.speaker || 'INVESTOR')}: ${m.text}`).join("\n")
+    ? transcript.map(m => {
+        if (m.type === 'user') {
+          const method = m.inputMethod === 'voice' ? '[SPOKEN VIA MICROPHONE]' : '[TYPED IN CHAT]';
+          return `FOUNDER ${method}: ${m.text}`;
+        } else {
+          return `${m.speaker || 'INVESTOR'}: ${m.text}`;
+        }
+      }).join("\n")
     : "No transcript available.";
 
   const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY a valid JSON object.
@@ -40,6 +47,11 @@ BUSINESS: ${businessName}
 
 PITCH TRANSCRIPT:
 ${transcriptText}
+
+CRITICAL DIRECTIVE ON INPUT MODALITIES:
+- Pay close attention to the input tags on the founder's dialogue: [SPOKEN VIA MICROPHONE] vs [TYPED IN CHAT].
+- When evaluating the founder's "delivery" and "clarity" scores, evaluate their voice clarity, filler words usage (e.g. "um", "like", "so"), confidence, and vocal flow based STRICTLY on the sections marked [SPOKEN VIA MICROPHONE].
+- If the founder typed their pitch instead of speaking it (marked [TYPED IN CHAT]), note their lack of live oral presentation in the final summary and grade their delivery score on structural/written elements, but emphasize that speaking via mic provides a truer evaluation of investor confidence and filler words.
 
 Return this exact JSON structure:
 {
@@ -96,7 +108,8 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
           CRITICAL DIRECTIVE: Speak naturally, supportively, and conversationally.
           - You are Riley, an elite Startup Pitch Coach who has coached founders to raise hundreds of millions.
           - Output ONLY direct conversational speech meant to be spoken out loud.
-          - NEVER output stage directions, explanations, character notes, or pre-conversation planning.
+          - NEVER output stage directions, section headers, action labels, titles, thoughts, character notes, or pre-conversation planning.
+          - Do NOT output section headers or action labels like "Confirming Deck Access", "Initiating Immediate Analysis", etc.
           - Do NOT prefix your output with "Riley:". Just speak.
           
           BUSINESS CONTEXT:
@@ -115,7 +128,8 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
           CRITICAL DIRECTIVE: Speak naturally, dynamically, and conversationally.
           - You represent a realistic multi-person Venture Capital panel: Marcus (the Skeptic/Lead Partner), Sarah (the quantitative Analyst), and Chen (the tech architect).
           - Output ONLY direct conversational speech meant to be spoken out loud.
-          - NEVER output stage directions, explanations, character notes, or pre-conversation planning.
+          - NEVER output stage directions, section headers, action labels, titles, thoughts, character notes, or pre-conversation planning.
+          - Do NOT output section headers or action labels like "Confirming Deck Access", "Initiating Immediate Analysis", "Quantitative Deep-Dive", etc. Speak your response directly to the founder from the very first word.
           - Do NOT prefix your output with "Marcus:", "Sarah:", or "Chen:". Just speak as the active panel member who is currently speaking.
           - Make it explicit who is speaking by having them self-identify if switching characters, or have the host hand over (e.g., "This is Marcus...", "I'll let Chen jump in...", "Sarah here, looking at your margins...").
 

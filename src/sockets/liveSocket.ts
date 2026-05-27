@@ -67,6 +67,10 @@ export function initLiveSocket(wss: WebSocketServer) {
                 cleanText = cleanText.replace(/\([^\)]*\)/g, '');
                 cleanText = cleanText.replace(/\*[^*]*\*/g, '');
                 cleanText = cleanText.replace(/^(marcus|riley|sarah|chen|investor|founder):\s*/i, '');
+                
+                // Strip action headers, section titles, or thinking headers (e.g. "Confirming Deck Access", "Initiating Immediate Analysis")
+                cleanText = cleanText.replace(/^(confirming deck access|initiating immediate analysis|quantitative deep-dive|technical deep-dive|strategic coaching|deepening the dialogue|challenging the moat|welcome to the boardroom|first slide analysis|pacing assessment|delivery challenge|lead partner marcus|investor panel|analyst sarah|tech expert chen)[:\s\-\*]*/i, '');
+                
                 cleanText = cleanText.trim();
                 
                 // Filter out planning text or meta-narration thoughts
