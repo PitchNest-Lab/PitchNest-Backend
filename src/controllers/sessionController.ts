@@ -3,10 +3,19 @@ import { supabase } from "../config/supabase.ts";
 
 export const listSessions = async (req: Request, res: Response) => {
   try {
-    const { data: sessions, error } = await supabase
+    const userId = req.user?.id;
+
+    let query = supabase
       .from("sessions")
       .select("*")
       .order("timestamp", { ascending: false });
+
+    // Filter by user_id if authenticated (data isolation)
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
+    const { data: sessions, error } = await query;
 
     if (error) return res.status(500).json({ error: "Failed to fetch sessions" });
 
@@ -24,11 +33,19 @@ export const listSessions = async (req: Request, res: Response) => {
 
 export const getSession = async (req: Request, res: Response) => {
   try {
-    const { data: session, error } = await supabase
+    const userId = req.user?.id;
+
+    let query = supabase
       .from("sessions")
       .select("*")
-      .eq("id", req.params.id)
-      .maybeSingle();
+      .eq("id", req.params.id);
+
+    // Ensure user can only access their own sessions
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
+    const { data: session, error } = await query.maybeSingle();
 
     if (error || !session) return res.status(404).json({ error: "Session not found" });
 
@@ -46,10 +63,19 @@ export const getSession = async (req: Request, res: Response) => {
 
 export const deleteSession = async (req: Request, res: Response) => {
   try {
-    const { error } = await supabase
+    const userId = req.user?.id;
+
+    let query = supabase
       .from("sessions")
       .delete()
       .eq("id", req.params.id);
+
+    // Ensure user can only delete their own sessions
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
+    const { error } = await query;
 
     if (error) return res.status(500).json({ error: "Failed to delete session" });
     res.status(200).json({ success: true });

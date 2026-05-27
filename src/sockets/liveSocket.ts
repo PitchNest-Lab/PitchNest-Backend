@@ -7,6 +7,7 @@ export function initLiveSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws) => {
     let currentVideoUrl = "";
     let currentBusinessName = "Unknown Pitch";
+    let currentUserId: number | null = null;
     let hasSentSetup = false;
 
     console.log("✅ Client connected to PitchNest Brain");
@@ -41,7 +42,18 @@ export function initLiveSocket(wss: WebSocketServer) {
     aiWs.on("message", (data) => {
       try {
         const response = JSON.parse(data.toString());
-        if (response.setupComplete) return;
+        if (response.setupComplete) {
+          console.log("🟢 Gemini setup complete! Triggering pitch introduction...");
+          if (aiWs.readyState === WebSocket.OPEN) {
+            aiWs.send(JSON.stringify({ 
+              clientContent: { 
+                turns: [{ role: "user", parts: [{ text: "Hi, I'm ready to pitch. Please welcome me, introduce yourself and the panel, and invite me to begin." }] }], 
+                turnComplete: true 
+              } 
+            }));
+          }
+          return;
+        }
 
         if (ws.readyState === WebSocket.OPEN) {
           if (response.serverContent?.interrupted) ws.send(JSON.stringify({ type: "stop_audio" }));
@@ -90,6 +102,7 @@ export function initLiveSocket(wss: WebSocketServer) {
           hasSentSetup = true;
           const clientConfig = data.config || {};
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
+          currentUserId = clientConfig.userId || null;
 
           const isCoach = clientConfig.mode === 'coach';
           const agentVoice = isCoach ? "Aoede" : "Charon";
@@ -113,16 +126,6 @@ export function initLiveSocket(wss: WebSocketServer) {
             }
           }));
 
-          setTimeout(() => {
-            if (aiWs.readyState === WebSocket.OPEN) {
-              aiWs.send(JSON.stringify({ 
-                clientContent: { 
-                  turns: [{ role: "user", parts: [{ text: "Hi, I'm ready to pitch." }] }], 
-                  turnComplete: true 
-                } 
-              }));
-            }
-          }, 1500);
           return;
         }
 
@@ -155,14 +158,17 @@ export function initLiveSocket(wss: WebSocketServer) {
 
           let sessionId = 0;
           try {
-            const { data: dbData, error: dbError } = await supabase
-              .from("sessions")
-              .insert([{
+            const insertPayload: any = {
                 business_name: currentBusinessName,
                 summary: reportData.summary,
                 evaluation_report: reportData,
                 video_url: currentVideoUrl
-              }])
+              };
+            if (currentUserId) insertPayload.user_id = currentUserId;
+
+            const { data: dbData, error: dbError } = await supabase
+              .from("sessions")
+              .insert([insertPayload])
               .select()
               .single();
 
@@ -173,10 +179,9 @@ export function initLiveSocket(wss: WebSocketServer) {
             console.error("❌ Failed to save session to Supabase:", dbErr); 
           }
 
+          // Send report ONLY to the originating client (not all connected users)
           const payload = JSON.stringify({ type: "report", data: reportData, sessionId });
-          wss.clients.forEach(client => { 
-            if (client.readyState === WebSocket.OPEN) client.send(payload); 
-          });
+          if (ws.readyState === WebSocket.OPEN) ws.send(payload);
           return;
         }
 

@@ -1,11 +1,28 @@
 import { Request, Response } from "express";
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
+import { config } from "../config/env.ts";
+
+const BCRYPT_ROUNDS = 12;
+
+/**
+ * Signs a JWT token for the given user.
+ */
+function signToken(user: { id: number; email: string }): string {
+  return jwt.sign(
+    { id: user.id, email: user.email },
+    config.jwtSecret,
+    { expiresIn: "7d" }
+  );
+}
 
 export const wipeDb = async (req: Request, res: Response) => {
   try {
     await supabase.from("users").delete().neq("id", 0);
     await supabase.from("sessions").delete().neq("id", 0);
     await supabase.from("decks").delete().neq("id", 0);
+    await supabase.from("profiles").delete().neq("id", 0);
     res.status(200).send("<h1>Database wiped</h1>");
   } catch (e) {
     res.status(500).json({ error: "Error wiping database." });
@@ -28,16 +45,25 @@ export const signup = async (req: Request, res: Response) => {
 
     if (existingUser) return res.status(400).json({ error: "Email exists" });
 
+    // Hash password before storing
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
     const { data: newUser, error } = await supabase
       .from("users")
-      .insert([{ name, email: cleanEmail, password }])
+      .insert([{ name, email: cleanEmail, password: hashedPassword }])
       .select()
       .single();
 
     if (error || !newUser) return res.status(500).json({ error: "Signup failed" });
 
-    res.status(201).json({ id: newUser.id, name: newUser.name, email: newUser.email });
+    const token = signToken({ id: newUser.id, email: newUser.email });
+
+    res.status(201).json({
+      user: { id: newUser.id, name: newUser.name, email: newUser.email },
+      token
+    });
   } catch (error) {
+    console.error("Signup error:", error);
     res.status(500).json({ error: "Signup failed" });
   }
 };
@@ -56,11 +82,24 @@ export const login = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    if (error || !user || user.password !== password) {
+    if (error || !user) {
       return res.status(401).json({ error: "Invalid credentials." });
     }
-    res.status(200).json({ id: user.id, name: user.name, email: user.email });
+
+    // Compare hashed password
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    const token = signToken({ id: user.id, email: user.email });
+
+    res.status(200).json({
+      user: { id: user.id, name: user.name, email: user.email },
+      token
+    });
   } catch (error) {
+    console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
   }
 };

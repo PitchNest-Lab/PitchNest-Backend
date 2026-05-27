@@ -28,6 +28,9 @@ export const config = {
   geminiApiKey: customApiKey || process.env.GEMINI_API_KEY || "",
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash-exp",
   isGoogleCloud: !!process.env.K_SERVICE,
+  jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
+  allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5173",
+  nodeEnv: process.env.NODE_ENV || "development",
 };
 
 // Check for critical missing configurations
