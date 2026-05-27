@@ -53,6 +53,10 @@ export const getSession = async (req: Request, res: Response) => {
       .eq("id", req.params.id);
 
     // Ensure user can only access their own sessions
+    if (userId) {
+      query = query.eq("user_id", userId);
+    }
+
     let { data: session, error } = await query.maybeSingle();
 
     if (error) {
