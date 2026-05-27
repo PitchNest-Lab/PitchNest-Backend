@@ -136,6 +136,7 @@ export function initLiveSocket(wss: WebSocketServer) {
               turnComplete: true 
             } 
           }));
+          return;
         }
 
         if (data.type === "end_session") {
