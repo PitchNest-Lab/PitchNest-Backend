@@ -37,14 +37,28 @@ export const uploadDeck = async (req: Request, res: Response) => {
     const insertData: any = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
     if (userId) insertData.user_id = userId;
 
-    const { data: dbData, error: dbError } = await supabase
+    let { data: dbData, error: dbError } = await supabase
       .from("decks")
       .insert([insertData])
       .select()
       .single();
 
-    if (dbError || !dbData) {
-      return res.status(500).json({ error: "Failed to save deck to database" });
+    if (dbError) {
+      if (dbError.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered insert.");
+        const fallbackData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
+        const fallback = await supabase
+          .from("decks")
+          .insert([fallbackData])
+          .select()
+          .single();
+        if (fallback.error || !fallback.data) {
+          return res.status(500).json({ error: "Failed to save deck to database" });
+        }
+        dbData = fallback.data;
+      } else {
+        return res.status(500).json({ error: "Failed to save deck to database" });
+      }
     }
 
     res.status(200).json({
@@ -73,9 +87,21 @@ export const listDecks = async (req: Request, res: Response) => {
       query = query.eq("user_id", userId);
     }
 
-    const { data: decks, error } = await query;
+    let { data: decks, error } = await query;
 
-    if (error) return res.status(500).json({ error: "Failed to fetch decks" });
+    if (error) {
+      if (error.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        const fallback = await supabase
+          .from("decks")
+          .select("*")
+          .order("created_at", { ascending: false });
+        if (fallback.error) return res.status(500).json({ error: "Failed to fetch decks" });
+        decks = fallback.data;
+      } else {
+        return res.status(500).json({ error: "Failed to fetch decks" });
+      }
+    }
     res.json(decks);
   } catch (error) { 
     res.status(500).json({ error: "Failed to fetch decks" }); 
@@ -98,9 +124,20 @@ export const deleteDeck = async (req: Request, res: Response) => {
 
     const { error } = await query;
 
-    if (error) return res.status(500).json({ error: "Failed to delete" });
+    if (error) {
+      if (error.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        const fallback = await supabase
+          .from("decks")
+          .delete()
+          .eq("id", req.params.id);
+        if (fallback.error) return res.status(500).json({ error: "Failed to delete deck" });
+      } else {
+        return res.status(500).json({ error: "Failed to delete deck" });
+      }
+    }
     res.status(200).json({ success: true });
   } catch (error) { 
-    res.status(500).json({ error: "Failed to delete" }); 
+    res.status(500).json({ error: "Failed to delete deck" }); 
   }
 };

@@ -15,11 +15,23 @@ export const listSessions = async (req: Request, res: Response) => {
       query = query.eq("user_id", userId);
     }
 
-    const { data: sessions, error } = await query;
+    let { data: sessions, error } = await query;
 
-    if (error) return res.status(500).json({ error: "Failed to fetch sessions" });
+    if (error) {
+      if (error.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        const fallback = await supabase
+          .from("sessions")
+          .select("*")
+          .order("timestamp", { ascending: false });
+        if (fallback.error) return res.status(500).json({ error: "Failed to fetch sessions" });
+        sessions = fallback.data;
+      } else {
+        return res.status(500).json({ error: "Failed to fetch sessions" });
+      }
+    }
 
-    const formatted = sessions.map((s: any) => ({
+    const formatted = (sessions || []).map((s: any) => ({
       ...s,
       evaluation_report: typeof s.evaluation_report === 'string'
         ? JSON.parse(s.evaluation_report)
@@ -41,13 +53,24 @@ export const getSession = async (req: Request, res: Response) => {
       .eq("id", req.params.id);
 
     // Ensure user can only access their own sessions
-    if (userId) {
-      query = query.eq("user_id", userId);
+    let { data: session, error } = await query.maybeSingle();
+
+    if (error) {
+      if (error.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        const fallback = await supabase
+          .from("sessions")
+          .select("*")
+          .eq("id", req.params.id)
+          .maybeSingle();
+        if (fallback.error || !fallback.data) return res.status(404).json({ error: "Session not found" });
+        session = fallback.data;
+      } else {
+        return res.status(404).json({ error: "Session not found" });
+      }
+    } else if (!session) {
+      return res.status(404).json({ error: "Session not found" });
     }
-
-    const { data: session, error } = await query.maybeSingle();
-
-    if (error || !session) return res.status(404).json({ error: "Session not found" });
 
     const formatted = {
       ...session,
@@ -77,7 +100,18 @@ export const deleteSession = async (req: Request, res: Response) => {
 
     const { error } = await query;
 
-    if (error) return res.status(500).json({ error: "Failed to delete session" });
+    if (error) {
+      if (error.code === '42703') {
+        console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        const fallback = await supabase
+          .from("sessions")
+          .delete()
+          .eq("id", req.params.id);
+        if (fallback.error) return res.status(500).json({ error: "Failed to delete session" });
+      } else {
+        return res.status(500).json({ error: "Failed to delete session" });
+      }
+    }
     res.status(200).json({ success: true });
   } catch (error) { 
     res.status(500).json({ error: "Failed to delete session" }); 

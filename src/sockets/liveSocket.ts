@@ -166,11 +166,32 @@ export function initLiveSocket(wss: WebSocketServer) {
               };
             if (currentUserId) insertPayload.user_id = currentUserId;
 
-            const { data: dbData, error: dbError } = await supabase
+            let { data: dbData, error: dbError } = await supabase
               .from("sessions")
               .insert([insertPayload])
               .select()
               .single();
+
+            if (dbError) {
+              if (dbError.code === '42703') {
+                console.warn("⚠️ Warning: Supabase 'sessions' table is missing user_id column. Falling back to un-filtered insert.");
+                const fallbackPayload = {
+                  business_name: currentBusinessName,
+                  summary: reportData.summary,
+                  evaluation_report: reportData,
+                  video_url: currentVideoUrl
+                };
+                const fallback = await supabase
+                  .from("sessions")
+                  .insert([fallbackPayload])
+                  .select()
+                  .single();
+                if (!fallback.error && fallback.data) {
+                  dbData = fallback.data;
+                  dbError = null;
+                }
+              }
+            }
 
             if (!dbError && dbData) {
               sessionId = dbData.id;
