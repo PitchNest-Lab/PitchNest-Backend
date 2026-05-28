@@ -10,6 +10,9 @@ export function initLiveSocket(wss: WebSocketServer) {
     let currentBusinessName = "Unknown Pitch";
     let currentUserId: number | null = null;
     let hasSentSetup = false;
+    let lastUserActivityTime = Date.now();
+    let hasNudged = false;
+    let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
 
     console.log("✅ Client connected to PitchNest Brain");
 
@@ -32,6 +35,7 @@ export function initLiveSocket(wss: WebSocketServer) {
 
     ws.on("close", () => {
       console.log("🔌 Client disconnected. Cleaning up AI socket.");
+      if (idleCheckInterval) clearInterval(idleCheckInterval);
       if (aiWs.readyState === WebSocket.OPEN) aiWs.close();
     });
 
@@ -147,10 +151,40 @@ export function initLiveSocket(wss: WebSocketServer) {
             }
           }));
 
+          // Start idle detection — nudge at 2min, auto-end at 4min
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
+          idleCheckInterval = setInterval(() => {
+            const idleMs = Date.now() - lastUserActivityTime;
+            const NUDGE_THRESHOLD = 2 * 60 * 1000;  // 2 minutes
+            const END_THRESHOLD = 4 * 60 * 1000;     // 4 minutes
+
+            if (idleMs >= END_THRESHOLD) {
+              console.log("⏱️ User idle for 4+ minutes. Auto-ending session.");
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "idle_end", message: "Session ended due to inactivity. The panel noticed you've been silent for over 4 minutes." }));
+              }
+              if (idleCheckInterval) clearInterval(idleCheckInterval);
+            } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
+              hasNudged = true;
+              console.log("⏱️ User idle for 2+ minutes. Sending AI nudge.");
+              if (aiWs.readyState === WebSocket.OPEN) {
+                aiWs.send(JSON.stringify({
+                  clientContent: {
+                    turns: [{ role: "user", parts: [{ text: "[SYSTEM: The founder has been silent for 2 minutes. Gently nudge them to continue their pitch or ask if they need help. If they don't respond soon, the session will end automatically.]" }] }],
+                    turnComplete: true
+                  }
+                }));
+              }
+            }
+          }, 15000); // Check every 15 seconds
+
           return;
         }
 
         if (data.type === "chat_message" && hasSentSetup) {
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
           aiWs.send(JSON.stringify({ 
             clientContent: { 
               turns: [{ role: "user", parts: [{ text: data.text }] }], 
@@ -238,6 +272,9 @@ export function initLiveSocket(wss: WebSocketServer) {
         }
 
         if (aiWs.readyState === WebSocket.OPEN && hasSentSetup) {
+          // Any raw audio/data from the client = user is active
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
           aiWs.send(message.toString());
         }
       } catch (err) {
