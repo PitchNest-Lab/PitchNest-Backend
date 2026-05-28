@@ -1,7 +1,8 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
-import { signup, login, wipeDb } from "../controllers/authController.ts";
+import { signup, login, wipeDb, forgotPassword, resetPassword } from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
+import { authMiddleware } from "../middleware/authMiddleware.ts";
 
 const router = Router();
 
@@ -21,5 +22,11 @@ if (config.nodeEnv === "development") {
 
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
+router.post("/forgot-password", authLimiter, forgotPassword);
+router.post("/reset-password", authLimiter, resetPassword);
+
+router.get("/me", authMiddleware, (req, res) => {
+  res.json({ id: req.user!.id, email: req.user!.email });
+});
 
 export default router;

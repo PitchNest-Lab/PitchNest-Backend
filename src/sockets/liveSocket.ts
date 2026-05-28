@@ -265,6 +265,19 @@ export function initLiveSocket(wss: WebSocketServer) {
             console.error("❌ Failed to save session to Supabase:", dbErr); 
           }
 
+          // Emit real AI-evaluated scores to the client before sending the full report
+          if (ws.readyState === WebSocket.OPEN && reportData.scores) {
+            ws.send(JSON.stringify({
+              type: "SCORE_UPDATE",
+              scores: {
+                clarity: reportData.scores.clarity ?? 0,
+                confidence: reportData.scores.delivery ?? 0,
+                marketFit: reportData.scores.scalability ?? 0,
+                readiness: reportData.scores.readiness ?? 0,
+              }
+            }));
+          }
+
           // Send report ONLY to the originating client
           const payload = JSON.stringify({ type: "report", data: reportData, sessionId, shareId });
           if (ws.readyState === WebSocket.OPEN) ws.send(payload);
