@@ -140,7 +140,7 @@ export function initLiveSocket(wss: WebSocketServer) {
               model: `models/${bidiModel}`,
               tools: [{ googleSearch: {} }],
               generationConfig: {
-                responseModalities: ["AUDIO", "TEXT"],
+                responseModalities: ["AUDIO"],
                 speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } }
               },
               systemInstruction: { parts: [{ text: masterPrompt }] }
