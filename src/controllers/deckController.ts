@@ -18,7 +18,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
     if (req.file.mimetype === "application/pdf") {
       try {
         // Dynamic import — pdf-parse is CJS and has no default ESM export
-        const pdfParseModule = await import("pdf-parse");
+        const pdfParseModule: any = await import("pdf-parse");
         const parseFn = pdfParseModule.default || pdfParseModule;
         const pdfData = await parseFn(req.file.buffer);
         extractedText = pdfData.text || "";

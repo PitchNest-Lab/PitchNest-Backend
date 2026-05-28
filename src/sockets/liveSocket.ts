@@ -64,19 +64,41 @@ export function initLiveSocket(wss: WebSocketServer) {
             modelTurn.parts.forEach((part: any) => {
               if (part.text) {
                 let cleanText = part.text;
+                // Strip markdown formatting
                 cleanText = cleanText.replace(/\[[^\]]*\]/g, '');
                 cleanText = cleanText.replace(/\([^\)]*\)/g, '');
                 cleanText = cleanText.replace(/\*[^*]*\*/g, '');
+                // Strip "Name:" prefixes
                 cleanText = cleanText.replace(/^(marcus|riley|sarah|chen|investor|founder):\s*/i, '');
                 
-                // Strip action headers or thinking headers (e.g. "Confirming Deck Access", "Initiating Immediate Analysis")
-                cleanText = cleanText.replace(/^(confirming deck access|initiating immediate analysis|quantitative deep-dive|technical deep-dive|strategic coaching|deepening the dialogue|challenging the moat|welcome to the boardroom|first slide analysis|pacing assessment|delivery challenge|lead partner marcus|investor panel|analyst sarah|tech expert chen)[:\s\-\*]*/i, '');
+                // Strip thinking/action headers — any Title Case phrase that looks like internal monologue
+                // e.g. "Interpreting the Context", "Analyzing the Deck's Content", "Rephrasing the Core Question"
+                cleanText = cleanText.replace(/^[A-Z][a-z]+(?:[\s'-]+[A-Za-z]+){1,6}\s*$/gm, '');
+                // Strip lines that are just a header followed by nothing useful
+                cleanText = cleanText.replace(/^(confirming|initiating|interpreting|analyzing|rephrasing|assessing|evaluating|deepening|challenging|quantitative|technical|strategic|reviewing|processing|considering|formulating|preparing|transitioning|redirecting|addressing|summarizing|concluding|opening|closing|wrapping)[^.!?]*$/gim, '');
                 
                 cleanText = cleanText.trim();
                 
-                // Remove the overly aggressive isMeta block entirely to prevent swallowing valid responses
                 if (cleanText) {
-                  ws.send(JSON.stringify({ type: "transcript", text: cleanText }));
+                  // Detect which panelist is speaking from the text content
+                  let detectedSpeaker = "";
+                  const speakerMatch = cleanText.match(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)\s+here[,.]?/i)
+                    || cleanText.match(/(?:I'm|I am|This is|It's)\s+(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)/i)
+                    || cleanText.match(/(?:let me|I'll).*?(?:jump in|chime in|take|weigh in)/i);
+                  
+                  if (speakerMatch) {
+                    const name = speakerMatch[1];
+                    if (name) detectedSpeaker = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
+                  }
+                  
+                  // Also check if the text starts with a name reference
+                  const nameCheck = cleanText.match(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)[,:\s]/i);
+                  if (nameCheck && !detectedSpeaker) {
+                    detectedSpeaker = nameCheck[1].charAt(0).toUpperCase() + nameCheck[1].slice(1).toLowerCase();
+                    cleanText = cleanText.replace(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)[,:\s]+/i, '').trim();
+                  }
+                  
+                  ws.send(JSON.stringify({ type: "transcript", text: cleanText, speaker: detectedSpeaker || undefined }));
                 }
               }
               if (part.inlineData?.data) ws.send(JSON.stringify({ type: "audio", data: part.inlineData.data }));
@@ -118,7 +140,7 @@ export function initLiveSocket(wss: WebSocketServer) {
               model: `models/${bidiModel}`,
               tools: [{ googleSearch: {} }],
               generationConfig: {
-                responseModalities: ["AUDIO"],
+                responseModalities: ["AUDIO", "TEXT"],
                 speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } }
               },
               systemInstruction: { parts: [{ text: masterPrompt }] }
