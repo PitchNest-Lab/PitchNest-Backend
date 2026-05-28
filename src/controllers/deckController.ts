@@ -3,8 +3,6 @@ import { supabase } from "../config/supabase.ts";
 import { uploadDir } from "../services/storageService.ts";
 import path from "path";
 import fs from "fs";
-// @ts-ignore - pdf-parse has no proper ESM types
-import pdfParse from "pdf-parse";
 
 export const uploadDeck = async (req: Request, res: Response) => {
   try {
@@ -19,7 +17,9 @@ export const uploadDeck = async (req: Request, res: Response) => {
     let extractedText = "";
     if (req.file.mimetype === "application/pdf") {
       try {
-        const parseFn = (pdfParse as any).default || pdfParse;
+        // Dynamic import — pdf-parse is CJS and has no default ESM export
+        const pdfParseModule = await import("pdf-parse");
+        const parseFn = pdfParseModule.default || pdfParseModule;
         const pdfData = await parseFn(req.file.buffer);
         extractedText = pdfData.text || "";
       } catch (err) {

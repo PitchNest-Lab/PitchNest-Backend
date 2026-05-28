@@ -63,35 +63,50 @@ Return this exact JSON structure:
   "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." } ]
 }`;
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${config.geminiApiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: evaluationPrompt }] }],
-        generationConfig: { temperature: 0.2, maxOutputTokens: 2048 }
-      })
-    }
-  );
-
-  const data = await response.json();
-  const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  
-  try {
-    return JSON.parse(rawText);
-  } catch (e) {
-    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      try {
-        return JSON.parse(jsonMatch[0]);
-      } catch (innerErr) {
-        console.error("❌ Failed to parse extracted JSON block:", innerErr);
+  const callGemini = async (attempt: number = 1): Promise<any> => {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${config.geminiApiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: evaluationPrompt }] }],
+          generationConfig: { 
+            temperature: 0.2, 
+            maxOutputTokens: 2048,
+            responseMimeType: "application/json"
+          }
+        })
       }
+    );
+
+    const data = await response.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    if (!rawText || rawText.trim().length === 0) {
+      console.warn(`⚠️ Gemini returned empty response (attempt ${attempt})`);
+      if (attempt < 2) return callGemini(attempt + 1);
+      throw new Error("Gemini returned empty evaluation after 2 attempts.");
     }
-    console.error("❌ Raw Gemini evaluation response text:", rawText);
-    throw new Error("No valid JSON block found in response.");
-  }
+
+    try {
+      return JSON.parse(rawText);
+    } catch (e) {
+      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        try {
+          return JSON.parse(jsonMatch[0]);
+        } catch (innerErr) {
+          console.error("❌ Failed to parse extracted JSON block:", innerErr);
+        }
+      }
+      console.error("❌ Raw Gemini evaluation response text:", rawText.substring(0, 500));
+      if (attempt < 2) return callGemini(attempt + 1);
+      throw new Error("No valid JSON block found in response.");
+    }
+  };
+
+  return callGemini();
 }
 
 /**
