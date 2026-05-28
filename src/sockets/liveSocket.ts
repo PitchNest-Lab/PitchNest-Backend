@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { evaluatePitch, getMasterPrompt } from "../services/aiService.ts";
+import crypto from "crypto";
 
 export function initLiveSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws) => {
@@ -68,19 +69,13 @@ export function initLiveSocket(wss: WebSocketServer) {
                 cleanText = cleanText.replace(/\*[^*]*\*/g, '');
                 cleanText = cleanText.replace(/^(marcus|riley|sarah|chen|investor|founder):\s*/i, '');
                 
-                // Strip action headers, section titles, or thinking headers (e.g. "Confirming Deck Access", "Initiating Immediate Analysis")
+                // Strip action headers or thinking headers (e.g. "Confirming Deck Access", "Initiating Immediate Analysis")
                 cleanText = cleanText.replace(/^(confirming deck access|initiating immediate analysis|quantitative deep-dive|technical deep-dive|strategic coaching|deepening the dialogue|challenging the moat|welcome to the boardroom|first slide analysis|pacing assessment|delivery challenge|lead partner marcus|investor panel|analyst sarah|tech expert chen)[:\s\-\*]*/i, '');
                 
                 cleanText = cleanText.trim();
                 
-                // Filter out planning text or meta-narration thoughts
-                const isMeta = /^(acknowledge the|i've registered|my response|as per|i'll aim|transitioning into|i'm taking|i will|speak in character|internal thought|reasoning process|stage directions|system trigger)/i.test(cleanText)
-                  || cleanText.includes("instructions")
-                  || cleanText.includes("handover")
-                  || cleanText.includes("readiness to pitch")
-                  || cleanText.length > 200 && cleanText.includes("character");
-                  
-                if (cleanText && !isMeta) {
+                // Remove the overly aggressive isMeta block entirely to prevent swallowing valid responses
+                if (cleanText) {
                   ws.send(JSON.stringify({ type: "transcript", text: cleanText }));
                 }
               }
@@ -162,12 +157,14 @@ export function initLiveSocket(wss: WebSocketServer) {
           }
 
           let sessionId = 0;
+          let shareId = crypto.randomUUID();
           try {
             const insertPayload: any = {
                 business_name: currentBusinessName,
                 summary: reportData.summary,
                 evaluation_report: reportData,
-                video_url: currentVideoUrl
+                video_url: currentVideoUrl,
+                share_id: shareId
               };
             if (currentUserId) insertPayload.user_id = currentUserId;
 
@@ -179,18 +176,24 @@ export function initLiveSocket(wss: WebSocketServer) {
 
             if (dbError) {
               if (dbError.code === '42703') {
-                console.warn("⚠️ Warning: Supabase 'sessions' table is missing user_id column. Falling back to un-filtered insert.");
+                console.warn("⚠️ Warning: Supabase 'sessions' table is missing columns (like share_id or user_id). Falling back to un-filtered insert.");
                 const fallbackPayload = {
                   business_name: currentBusinessName,
                   summary: reportData.summary,
                   evaluation_report: reportData,
                   video_url: currentVideoUrl
                 };
-                const fallback = await supabase
-                  .from("sessions")
-                  .insert([fallbackPayload])
-                  .select()
-                  .single();
+                if (currentUserId) (fallbackPayload as any).user_id = currentUserId;
+                let fallback = await supabase.from("sessions").insert([fallbackPayload]).select().single();
+                if (fallback.error && fallback.error.code === '42703') {
+                    const basicPayload = {
+                      business_name: currentBusinessName,
+                      summary: reportData.summary,
+                      evaluation_report: reportData,
+                      video_url: currentVideoUrl
+                    };
+                    fallback = await supabase.from("sessions").insert([basicPayload]).select().single();
+                }
                 if (!fallback.error && fallback.data) {
                   dbData = fallback.data;
                   dbError = null;
@@ -200,13 +203,14 @@ export function initLiveSocket(wss: WebSocketServer) {
 
             if (!dbError && dbData) {
               sessionId = dbData.id;
+              if (dbData.share_id) shareId = dbData.share_id;
             }
           } catch (dbErr) { 
             console.error("❌ Failed to save session to Supabase:", dbErr); 
           }
 
-          // Send report ONLY to the originating client (not all connected users)
-          const payload = JSON.stringify({ type: "report", data: reportData, sessionId });
+          // Send report ONLY to the originating client
+          const payload = JSON.stringify({ type: "report", data: reportData, sessionId, shareId });
           if (ws.readyState === WebSocket.OPEN) ws.send(payload);
           return;
         }

@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
+import crypto from "crypto";
 
 export const listSessions = async (req: Request, res: Response) => {
   try {
@@ -46,29 +47,42 @@ export const listSessions = async (req: Request, res: Response) => {
 export const getSession = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
+    const identifier = req.params.id;
 
-    let query = supabase
-      .from("sessions")
-      .select("*")
-      .eq("id", req.params.id);
+    let query = supabase.from("sessions").select("*");
 
-    // Ensure user can only access their own sessions
-    if (userId) {
-      query = query.eq("user_id", userId);
+    // If identifier is a valid UUID, treat it as share_id and allow public access
+    const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(identifier);
+    
+    if (isUUID) {
+      query = query.eq("share_id", identifier);
+    } else {
+      query = query.eq("id", identifier);
+      // Ensure user can only access their own sessions if not using the public share link
+      if (userId) {
+        query = query.eq("user_id", userId);
+      }
     }
 
-    let { data: session, error } = await query.maybeSingle();
+    const { data: session, error } = await query.maybeSingle();
 
     if (error) {
       if (error.code === '42703') {
-        console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
+        console.warn("⚠️ Warning: Supabase 'sessions' table is missing columns. Falling back to simple query.");
         const fallback = await supabase
           .from("sessions")
           .select("*")
-          .eq("id", req.params.id)
+          .eq("id", identifier)
           .maybeSingle();
         if (fallback.error || !fallback.data) return res.status(404).json({ error: "Session not found" });
-        session = fallback.data;
+        
+        const formatted = {
+          ...fallback.data,
+          evaluation_report: typeof fallback.data.evaluation_report === 'string'
+            ? JSON.parse(fallback.data.evaluation_report)
+            : fallback.data.evaluation_report
+        };
+        return res.json(formatted);
       } else {
         return res.status(404).json({ error: "Session not found" });
       }

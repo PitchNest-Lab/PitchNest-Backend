@@ -3,6 +3,8 @@ import { supabase } from "../config/supabase.ts";
 import { uploadDir } from "../services/storageService.ts";
 import path from "path";
 import fs from "fs";
+// @ts-ignore - pdf-parse has no proper ESM types
+import pdfParse from "pdf-parse";
 
 export const uploadDeck = async (req: Request, res: Response) => {
   try {
@@ -13,6 +15,17 @@ export const uploadDeck = async (req: Request, res: Response) => {
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
     const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
     const filePath = `decks/${Date.now()}_${originalName}`;
+
+    let extractedText = "";
+    if (req.file.mimetype === "application/pdf") {
+      try {
+        const parseFn = (pdfParse as any).default || pdfParse;
+        const pdfData = await parseFn(req.file.buffer);
+        extractedText = pdfData.text || "";
+      } catch (err) {
+        console.warn("⚠️ Warning: Failed to parse PDF text:", err);
+      }
+    }
 
     const { data, error } = await supabase.storage
       .from("pitchnest-media")
@@ -34,7 +47,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
       publicUrl = pUrl;
     }
 
-    const insertData: any = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
+    const insertData: any = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY', extracted_text: extractedText };
     if (userId) insertData.user_id = userId;
 
     let { data: dbData, error: dbError } = await supabase
@@ -45,13 +58,18 @@ export const uploadDeck = async (req: Request, res: Response) => {
 
     if (dbError) {
       if (dbError.code === '42703') {
-        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered insert.");
+        console.warn("⚠️ Warning: Supabase 'decks' table is missing columns. Falling back to un-filtered insert without new columns.");
+        // Try without extracted_text if the column is missing
         const fallbackData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
-        const fallback = await supabase
-          .from("decks")
-          .insert([fallbackData])
-          .select()
-          .single();
+        if (userId) (fallbackData as any).user_id = userId;
+        
+        let fallback = await supabase.from("decks").insert([fallbackData]).select().single();
+        if (fallback.error && fallback.error.code === '42703') {
+            // Fallback for missing user_id as well
+            const basicData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
+            fallback = await supabase.from("decks").insert([basicData]).select().single();
+        }
+
         if (fallback.error || !fallback.data) {
           return res.status(500).json({ error: "Failed to save deck to database" });
         }
@@ -66,7 +84,8 @@ export const uploadDeck = async (req: Request, res: Response) => {
       name: dbData.name,
       file_url: dbData.file_url,
       size: dbData.size,
-      status: dbData.status
+      status: dbData.status,
+      extracted_text: extractedText
     });
   } catch (error) { 
     res.status(500).json({ error: "Error uploading deck" }); 
