@@ -120,6 +120,13 @@ export function initLiveSocket(wss: WebSocketServer) {
 
         if (data.type === "set_video_url") {
           currentVideoUrl = data.url;
+          if (sessionId && config.supabaseUrl && config.supabaseAnonKey) {
+            try {
+              await supabase.from('sessions').update({ video_url: currentVideoUrl }).eq('id', sessionId);
+            } catch (e) {
+              console.error("Failed to async update video URL:", e);
+            }
+          }
           return;
         }
 
