@@ -19,21 +19,18 @@ export const uploadDeck = async (req: Request, res: Response) => {
       try {
         // Dynamic import — pdf-parse is CJS and has no default ESM export
         const pdfParseModule: any = await import("pdf-parse");
-        let parseFn = pdfParseModule;
-        if (typeof parseFn.default === 'function') {
-          parseFn = parseFn.default;
-        } else if (parseFn.default && typeof parseFn.default.default === 'function') {
-          parseFn = parseFn.default.default;
-        }
         
-        if (typeof parseFn === 'function') {
-          const pdfData = await parseFn(req.file.buffer);
-          extractedText = pdfData.text || "";
+        if (typeof pdfParseModule.PDFParse === 'function') {
+          const parser = new pdfParseModule.PDFParse({ data: req.file.buffer });
+          const result = await parser.getText();
+          extractedText = result.text || "";
+          await parser.destroy();
+          console.log("✅ Successfully extracted text from PDF using PDFParse class! Length:", extractedText.length);
         } else {
-          console.warn("⚠️ Warning: Could not resolve pdf-parse to a function.", pdfParseModule);
+          console.warn("⚠️ Warning: Could not resolve PDFParse class in pdf-parse module.", pdfParseModule);
         }
       } catch (err) {
-        console.warn("⚠️ Warning: Failed to parse PDF text:", err);
+        console.warn("⚠️ Warning: Failed to parse PDF text using PDFParse class:", err);
       }
     }
 
@@ -68,29 +65,19 @@ export const uploadDeck = async (req: Request, res: Response) => {
       .single();
 
     if (dbError) {
-      console.error("❌ Supabase insertion failed:", dbError);
-      if (dbError.code === '42703') {
-        console.warn("⚠️ Warning: Supabase 'decks' table is missing columns. Falling back to un-filtered insert without new columns.");
-        // Try without extracted_text if the column is missing
-        const fallbackData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
-        if (userId) (fallbackData as any).user_id = userId;
-        
-        let fallback = await supabase.from("decks").insert([fallbackData]).select().single();
-        if (fallback.error && fallback.error.code === '42703') {
-            console.warn("⚠️ Warning: 'user_id' column also missing, falling back to basic insert.");
-            // Fallback for missing user_id as well
-            const basicData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
-            fallback = await supabase.from("decks").insert([basicData]).select().single();
-        }
-
-        if (fallback.error || !fallback.data) {
-          console.error("❌ Fallback database insertion also failed:", fallback.error);
-          return res.status(500).json({ error: "Failed to save deck to database (Fallback failed)" });
-        }
-        dbData = fallback.data;
-      } else {
-        return res.status(500).json({ error: "Failed to save deck to database" });
+      console.error("❌ Primary Supabase insertion failed:", dbError);
+      console.warn("⚠️ Warning: Primary insert failed. Executing resilient database insert fallback (omitting optional user_id and extracted_text)...");
+      
+      const fallbackData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
+      let fallback = await supabase.from("decks").insert([fallbackData]).select().single();
+      
+      if (fallback.error) {
+        console.error("❌ Resilient database insert fallback also failed:", fallback.error);
+        return res.status(500).json({ error: "Failed to save deck to database (All insertions failed)" });
       }
+      
+      console.log("✅ Success! Resilient insert fallback successfully saved deck in database!");
+      dbData = fallback.data;
     }
 
     res.status(200).json({
