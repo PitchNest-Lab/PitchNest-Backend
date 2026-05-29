@@ -165,6 +165,108 @@ export const forgotPassword = async (req: Request, res: Response) => {
   }
 };
 
+/** Extract Supabase storage object path from a public URL, e.g. decks/foo.pdf */
+function storagePathFromUrl(url: string | null | undefined): string | null {
+  if (!url || typeof url !== "string") return null;
+  const marker = "/pitchnest-media/";
+  const idx = url.indexOf(marker);
+  if (idx === -1) return null;
+  return url.slice(idx + marker.length).split("?")[0] || null;
+}
+
+/**
+ * Permanently delete a user and associated data (App Store 5.1.1(v) / Google Play).
+ */
+async function purgeUserAccount(userId: number): Promise<void> {
+  const { data: decks } = await supabase.from("decks").select("file_url").eq("user_id", userId);
+  const { data: sessions } = await supabase.from("sessions").select("video_url").eq("user_id", userId);
+
+  const storagePaths = new Set<string>();
+  for (const deck of decks || []) {
+    const path = storagePathFromUrl(deck.file_url);
+    if (path) storagePaths.add(path);
+  }
+  for (const session of sessions || []) {
+    const path = storagePathFromUrl(session.video_url);
+    if (path) storagePaths.add(path);
+  }
+
+  if (storagePaths.size > 0) {
+    const { error: storageError } = await supabase.storage
+      .from("pitchnest-media")
+      .remove([...storagePaths]);
+    if (storageError) {
+      console.warn("⚠️ Storage cleanup partial failure:", storageError.message);
+    }
+  }
+
+  await supabase.from("password_resets").delete().eq("user_id", userId);
+  await supabase.from("sessions").delete().eq("user_id", userId);
+  await supabase.from("decks").delete().eq("user_id", userId);
+  await supabase.from("profiles").delete().eq("user_id", userId);
+  await supabase.from("users").delete().eq("id", userId);
+}
+
+async function verifyUserPassword(userId: number, password: string): Promise<boolean> {
+  const { data: user } = await supabase.from("users").select("password").eq("id", userId).maybeSingle();
+  if (!user?.password) return false;
+  return bcrypt.compare(password, user.password);
+}
+
+/** DELETE /api/auth/account — authenticated in-app deletion */
+export const deleteAccount = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { password } = req.body;
+    if (!password) {
+      return res.status(400).json({ error: "Password is required to delete your account." });
+    }
+
+    const valid = await verifyUserPassword(userId, password);
+    if (!valid) {
+      return res.status(401).json({ error: "Incorrect password." });
+    }
+
+    await purgeUserAccount(userId);
+    res.status(200).json({ message: "Account deleted successfully." });
+  } catch (error) {
+    console.error("Delete account error:", error);
+    res.status(500).json({ error: "Failed to delete account. Please contact support." });
+  }
+};
+
+/** POST /api/auth/delete-account — public web page (Google Play delete URL) */
+export const deleteAccountByCredentials = async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required." });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+
+    const { data: user } = await supabase
+      .from("users")
+      .select("id, password")
+      .eq("email", cleanEmail)
+      .maybeSingle();
+
+    if (!user) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    await purgeUserAccount(user.id);
+    res.status(200).json({ message: "Account deleted successfully." });
+  } catch (error) {
+    console.error("Delete account (public) error:", error);
+    res.status(500).json({ error: "Failed to delete account. Please contact support." });
+  }
+};
+
 export const resetPassword = async (req: Request, res: Response) => {
   try {
     const { token, password } = req.body;

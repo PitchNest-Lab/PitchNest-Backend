@@ -1,6 +1,14 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
-import { signup, login, wipeDb, forgotPassword, resetPassword } from "../controllers/authController.ts";
+import {
+  signup,
+  login,
+  wipeDb,
+  forgotPassword,
+  resetPassword,
+  deleteAccount,
+  deleteAccountByCredentials,
+} from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
 import { authMiddleware } from "../middleware/authMiddleware.ts";
 
@@ -28,5 +36,8 @@ router.post("/reset-password", authLimiter, resetPassword);
 router.get("/me", authMiddleware, (req, res) => {
   res.json({ id: req.user!.id, email: req.user!.email });
 });
+
+router.delete("/account", authMiddleware, authLimiter, deleteAccount);
+router.post("/delete-account", authLimiter, deleteAccountByCredentials);
 
 export default router;
