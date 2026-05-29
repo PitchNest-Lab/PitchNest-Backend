@@ -71,6 +71,12 @@ Return this exact JSON structure:
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [{ role: "user", parts: [{ text: evaluationPrompt }] }],
+          safetySettings: [
+            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+          ],
           generationConfig: { 
             temperature: 0.2, 
             maxOutputTokens: 2048,
@@ -88,10 +94,15 @@ Return this exact JSON structure:
     }
 
     const data = await response.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    const candidate = data.candidates?.[0];
+    const rawText = candidate?.content?.parts?.[0]?.text || "";
     
     if (!rawText || rawText.trim().length === 0) {
       console.warn(`⚠️ Gemini returned empty response (attempt ${attempt})`);
+      console.warn(`⚠️ Full Gemini Data: ${JSON.stringify(data)}`);
+      if (candidate?.finishReason) {
+         console.warn(`⚠️ Finish Reason: ${candidate.finishReason}`);
+      }
       if (attempt < 3) return callGemini(attempt + 1);
       throw new Error("Gemini returned empty evaluation after 3 attempts.");
     }
