@@ -142,7 +142,6 @@ export function initLiveSocket(wss: WebSocketServer) {
           aiWs.send(JSON.stringify({
             setup: {
               model: `models/${bidiModel}`,
-              tools: [{ googleSearch: {} }],
               generationConfig: {
                 responseModalities: ["AUDIO"],
                 speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } }
@@ -197,6 +196,8 @@ export function initLiveSocket(wss: WebSocketServer) {
         if (data.type === "end_session") {
           console.log("🏁 Session ended, starting REST evaluation...");
           const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : [];
+          console.log(`📊 Transcript entries: ${frontendTranscript.length}, Business: ${currentBusinessName}, User ID: ${currentUserId}`);
+          console.log(`🔑 Env check — Gemini key: ${config.geminiApiKey ? 'SET' : 'MISSING'}, Supabase URL: ${config.supabaseUrl ? 'SET' : 'MISSING'}`);
           if (aiWs.readyState === WebSocket.OPEN) aiWs.close();
 
           let reportData: any = {
@@ -208,6 +209,7 @@ export function initLiveSocket(wss: WebSocketServer) {
           try {
             const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName);
             reportData = { ...reportData, ...evaluated };
+            console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
           } catch (evalErr) { 
             console.error("❌ Evaluation failed:", evalErr); 
           }

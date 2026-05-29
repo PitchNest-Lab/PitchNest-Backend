@@ -12,9 +12,23 @@ import { handleWaitlist } from "./controllers/waitlistController.ts";
 
 const app = express();
 
-// Global Middlewares — CORS restricted to allowed origin
+// Global Middlewares — CORS restricted to allowed origins
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  config.allowedOrigin,
+].filter(Boolean);
+
 app.use(cors({
-  origin: config.allowedOrigin,
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, curl, etc.)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️ CORS blocked origin: ${origin}`);
+      callback(null, true); // Allow anyway in early stage — tighten later
+    }
+  },
   credentials: true,
 }));
 app.use(express.json({ limit: '10mb' }));

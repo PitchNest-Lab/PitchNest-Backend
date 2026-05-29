@@ -80,13 +80,20 @@ Return this exact JSON structure:
       }
     );
 
+    if (!response.ok) {
+      const errorBody = await response.text().catch(() => "");
+      console.error(`❌ Gemini HTTP ${response.status} on evaluation (attempt ${attempt}):`, errorBody.substring(0, 300));
+      if (attempt < 3) return callGemini(attempt + 1);
+      throw new Error(`Gemini returned HTTP ${response.status} after 3 attempts.`);
+    }
+
     const data = await response.json();
     const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
     
     if (!rawText || rawText.trim().length === 0) {
       console.warn(`⚠️ Gemini returned empty response (attempt ${attempt})`);
-      if (attempt < 2) return callGemini(attempt + 1);
-      throw new Error("Gemini returned empty evaluation after 2 attempts.");
+      if (attempt < 3) return callGemini(attempt + 1);
+      throw new Error("Gemini returned empty evaluation after 3 attempts.");
     }
 
     try {
@@ -101,7 +108,7 @@ Return this exact JSON structure:
         }
       }
       console.error("❌ Raw Gemini evaluation response text:", rawText.substring(0, 500));
-      if (attempt < 2) return callGemini(attempt + 1);
+      if (attempt < 3) return callGemini(attempt + 1);
       throw new Error("No valid JSON block found in response.");
     }
   };
