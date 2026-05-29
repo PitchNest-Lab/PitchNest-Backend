@@ -13,6 +13,7 @@ export function initLiveSocket(wss: WebSocketServer) {
     let lastUserActivityTime = Date.now();
     let hasNudged = false;
     let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+    let sessionId = 0;
 
     console.log("✅ Client connected to PitchNest Brain");
 
@@ -66,8 +67,19 @@ export function initLiveSocket(wss: WebSocketServer) {
           const modelTurn = response.serverContent?.modelTurn;
           if (modelTurn?.parts) {
             modelTurn.parts.forEach((part: any) => {
+              // Discard any thinking/reasoning process parts (Gemini 2.5 chain-of-thought blocks)
+              if (part.thought) {
+                console.log("🤫 Filtered out Gemini thinking part:", part.text);
+                return;
+              }
               if (part.text) {
                 let cleanText = part.text;
+                
+                // Drop meta-talk or chain-of-thought leakages
+                if (/^(?:Okay, so the user said|Right, I need to|Okay, so|I need to keep this|I'm structuring the initial|I've successfully synthesized|I will execute Marcus|I've crafted Marcus's|I've refined Marcus's|I am focusing on)/i.test(cleanText)) {
+                  console.log("🤫 Filtered out residual meta-talk phrase:", cleanText);
+                  return;
+                }
                 // Strip markdown formatting
                 cleanText = cleanText.replace(/\[[^\]]*\]/g, '');
                 cleanText = cleanText.replace(/\([^\)]*\)/g, '');
@@ -151,7 +163,8 @@ export function initLiveSocket(wss: WebSocketServer) {
               model: `models/${bidiModel}`,
               generationConfig: {
                 responseModalities: ["AUDIO"],
-                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } }
+                speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } },
+                thinkingConfig: { thinkingBudget: 0 } // Disable thinking to reduce latency and eliminate meta-thought generation
               },
               systemInstruction: { parts: [{ text: masterPrompt }] }
             }
@@ -221,7 +234,7 @@ export function initLiveSocket(wss: WebSocketServer) {
             console.error("❌ Evaluation failed:", evalErr); 
           }
 
-          let sessionId = 0;
+          sessionId = 0;
           let shareId = crypto.randomUUID();
           try {
             const insertPayload: any = {
