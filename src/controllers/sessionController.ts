@@ -9,7 +9,7 @@ export const listSessions = async (req: Request, res: Response) => {
     let query = supabase
       .from("sessions")
       .select("*")
-      .order("timestamp", { ascending: false });
+      .order("created_at", { ascending: false });
 
     // Filter by user_id if authenticated (data isolation)
     if (userId) {
@@ -24,7 +24,7 @@ export const listSessions = async (req: Request, res: Response) => {
         const fallback = await supabase
           .from("sessions")
           .select("*")
-          .order("timestamp", { ascending: false });
+          .order("created_at", { ascending: false });
         if (fallback.error) return res.status(500).json({ error: "Failed to fetch sessions" });
         sessions = fallback.data;
       } else {

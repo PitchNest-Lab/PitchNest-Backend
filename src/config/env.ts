@@ -24,6 +24,7 @@ dotenv.config();
 export const config = {
   supabaseUrl: process.env.SUPABASE_URL || "",
   supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
+  supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
   geminiApiKey: customApiKey || process.env.GEMINI_API_KEY || "",
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash-exp",
@@ -34,8 +35,8 @@ export const config = {
 };
 
 // Check for critical missing configurations
-if (!config.supabaseUrl || !config.supabaseAnonKey) {
-  console.warn("⚠️ Warning: SUPABASE_URL or SUPABASE_ANON_KEY is missing in your backend environment variables!");
+if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {
+  console.warn("⚠️ Warning: SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY is missing in your backend environment variables!");
 }
 
 if (!config.geminiApiKey) {
