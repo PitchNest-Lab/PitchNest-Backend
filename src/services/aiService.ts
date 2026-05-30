@@ -65,7 +65,7 @@ Return this exact JSON structure:
 
   const callGemini = async (attempt: number = 1): Promise<any> => {
     const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${config.geminiApiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiModel}:generateContent?key=${config.geminiApiKey}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
