@@ -2,6 +2,32 @@ import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import crypto from "crypto";
 
+/**
+ * Safely parses stringified JSON structures, falling back to a structured object 
+ * containing the string text in case of database corruptions or plain text logs.
+ */
+const safeParseJSON = (val: any) => {
+  if (!val) return {
+    summary: "No evaluation details available.",
+    scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
+    strengths: [], risks: [], next_steps: [], sentiments: []
+  };
+  if (typeof val !== 'string') return val;
+  try {
+    return JSON.parse(val);
+  } catch (e: any) {
+    console.warn("⚠️ Failed to parse session JSON, using fallback report structure:", e.message);
+    return {
+      summary: val || "No evaluation details available.",
+      scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
+      strengths: [],
+      risks: [],
+      next_steps: [],
+      sentiments: []
+    };
+  }
+};
+
 export const listSessions = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -34,12 +60,11 @@ export const listSessions = async (req: Request, res: Response) => {
 
     const formatted = (sessions || []).map((s: any) => ({
       ...s,
-      evaluation_report: typeof s.evaluation_report === 'string'
-        ? JSON.parse(s.evaluation_report)
-        : s.evaluation_report
+      evaluation_report: safeParseJSON(s.evaluation_report)
     }));
     res.json(formatted);
-  } catch (error) { 
+  } catch (error: any) { 
+    console.error("❌ listSessions error:", error.message || error);
     res.status(500).json({ error: "Failed to fetch sessions" }); 
   }
 };
@@ -78,9 +103,7 @@ export const getSession = async (req: Request, res: Response) => {
         
         const formatted = {
           ...fallback.data,
-          evaluation_report: typeof fallback.data.evaluation_report === 'string'
-            ? JSON.parse(fallback.data.evaluation_report)
-            : fallback.data.evaluation_report
+          evaluation_report: safeParseJSON(fallback.data.evaluation_report)
         };
         return res.json(formatted);
       } else {
@@ -92,12 +115,11 @@ export const getSession = async (req: Request, res: Response) => {
 
     const formatted = {
       ...session,
-      evaluation_report: typeof session.evaluation_report === 'string'
-        ? JSON.parse(session.evaluation_report)
-        : session.evaluation_report
+      evaluation_report: safeParseJSON(session.evaluation_report)
     };
     res.json(formatted);
-  } catch (error) { 
+  } catch (error: any) { 
+    console.error("❌ getSession error:", error.message || error);
     res.status(500).json({ error: "Failed to fetch session" }); 
   }
 };
@@ -131,7 +153,8 @@ export const deleteSession = async (req: Request, res: Response) => {
       }
     }
     res.status(200).json({ success: true });
-  } catch (error) { 
+  } catch (error: any) { 
+    console.error("❌ deleteSession error:", error.message || error);
     res.status(500).json({ error: "Failed to delete session" }); 
   }
 };
