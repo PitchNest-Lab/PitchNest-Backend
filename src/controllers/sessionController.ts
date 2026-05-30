@@ -45,13 +45,17 @@ export const listSessions = async (req: Request, res: Response) => {
     let { data: sessions, error } = await query;
 
     if (error) {
+      console.error("❌ Supabase query error in listSessions:", error);
       if (error.code === '42703') {
         console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
         const fallback = await supabase
           .from("sessions")
           .select("*")
           .order("created_at", { ascending: false });
-        if (fallback.error) return res.status(500).json({ error: "Failed to fetch sessions" });
+        if (fallback.error) {
+          console.error("❌ Supabase fallback query error in listSessions:", fallback.error);
+          return res.status(500).json({ error: "Failed to fetch sessions" });
+        }
         sessions = fallback.data;
       } else {
         return res.status(500).json({ error: "Failed to fetch sessions" });
@@ -64,7 +68,7 @@ export const listSessions = async (req: Request, res: Response) => {
     }));
     res.json(formatted);
   } catch (error: any) { 
-    console.error("❌ listSessions error:", error.message || error);
+    console.error("❌ listSessions exception:", error.message || error);
     res.status(500).json({ error: "Failed to fetch sessions" }); 
   }
 };
@@ -92,6 +96,7 @@ export const getSession = async (req: Request, res: Response) => {
     const { data: session, error } = await query.maybeSingle();
 
     if (error) {
+      console.error("❌ Supabase query error in getSession:", error);
       if (error.code === '42703') {
         console.warn("⚠️ Warning: Supabase 'sessions' table is missing columns. Falling back to simple query.");
         const fallback = await supabase
@@ -99,7 +104,11 @@ export const getSession = async (req: Request, res: Response) => {
           .select("*")
           .eq("id", identifier)
           .maybeSingle();
-        if (fallback.error || !fallback.data) return res.status(404).json({ error: "Session not found" });
+        if (fallback.error) {
+          console.error("❌ Supabase fallback query error in getSession:", fallback.error);
+          return res.status(404).json({ error: "Session not found" });
+        }
+        if (!fallback.data) return res.status(404).json({ error: "Session not found" });
         
         const formatted = {
           ...fallback.data,
@@ -119,7 +128,7 @@ export const getSession = async (req: Request, res: Response) => {
     };
     res.json(formatted);
   } catch (error: any) { 
-    console.error("❌ getSession error:", error.message || error);
+    console.error("❌ getSession exception:", error.message || error);
     res.status(500).json({ error: "Failed to fetch session" }); 
   }
 };
@@ -141,20 +150,24 @@ export const deleteSession = async (req: Request, res: Response) => {
     const { error } = await query;
 
     if (error) {
+      console.error("❌ Supabase query error in deleteSession:", error);
       if (error.code === '42703') {
         console.warn("⚠️ Warning: Supabase 'sessions' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
         const fallback = await supabase
           .from("sessions")
           .delete()
           .eq("id", req.params.id);
-        if (fallback.error) return res.status(500).json({ error: "Failed to delete session" });
+        if (fallback.error) {
+          console.error("❌ Supabase fallback query error in deleteSession:", fallback.error);
+          return res.status(500).json({ error: "Failed to delete session" });
+        }
       } else {
         return res.status(500).json({ error: "Failed to delete session" });
       }
     }
     res.status(200).json({ success: true });
   } catch (error: any) { 
-    console.error("❌ deleteSession error:", error.message || error);
+    console.error("❌ deleteSession exception:", error.message || error);
     res.status(500).json({ error: "Failed to delete session" }); 
   }
 };
