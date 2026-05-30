@@ -35,7 +35,7 @@ export const listSessions = async (req: Request, res: Response) => {
     let query = supabase
       .from("sessions")
       .select("*")
-      .order("created_at", { ascending: false });
+      .order("timestamp", { ascending: false });
 
     // Filter by user_id if authenticated (data isolation)
     if (userId) {
@@ -51,7 +51,7 @@ export const listSessions = async (req: Request, res: Response) => {
         const fallback = await supabase
           .from("sessions")
           .select("*")
-          .order("created_at", { ascending: false });
+          .order("timestamp", { ascending: false });
         if (fallback.error) {
           console.error("❌ Supabase fallback query error in listSessions:", fallback.error);
           return res.status(500).json({ error: "Failed to fetch sessions" });
@@ -64,6 +64,7 @@ export const listSessions = async (req: Request, res: Response) => {
 
     const formatted = (sessions || []).map((s: any) => ({
       ...s,
+      created_at: s.created_at || s.timestamp,
       evaluation_report: safeParseJSON(s.evaluation_report)
     }));
     res.json(formatted);
@@ -112,6 +113,7 @@ export const getSession = async (req: Request, res: Response) => {
         
         const formatted = {
           ...fallback.data,
+          created_at: fallback.data.created_at || fallback.data.timestamp,
           evaluation_report: safeParseJSON(fallback.data.evaluation_report)
         };
         return res.json(formatted);
@@ -124,6 +126,7 @@ export const getSession = async (req: Request, res: Response) => {
 
     const formatted = {
       ...session,
+      created_at: session.created_at || session.timestamp,
       evaluation_report: safeParseJSON(session.evaluation_report)
     };
     res.json(formatted);
