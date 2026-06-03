@@ -9,7 +9,7 @@ import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
-import { handleWaitlist } from "./controllers/waitlistController.ts";
+import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 
 const app = express();
 
@@ -45,6 +45,7 @@ app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck d
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/profile", profileRoutes);
 app.post("/api/waitlist", handleWaitlist);
+app.post("/api/survey", handleSurvey);
 
 // Health check endpoint
 app.get("/health", (req, res) => res.send("🚀 PitchNest Brain Online!"));
