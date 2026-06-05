@@ -26,10 +26,133 @@ export interface EvaluationReport {
   transcript?: any[];
 }
 
+const DECK_TEXT_LIMIT = 8000;
+
+const OUTPUT_RULES = `OUTPUT RULES (strict):
+- Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
+- Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
+- Keep each turn to 1-3 short sentences. One question per turn.
+- Start speaking immediately — no preamble.`;
+
+function buildDeckContext(deckName: string, extractedDeckText: string): string {
+  if (!extractedDeckText?.trim()) {
+    return deckName && deckName !== "None Loaded"
+      ? `PITCH DECK: "${deckName}" is attached but text could not be extracted. Ask the founder to walk through key slides.`
+      : "PITCH DECK: None provided. Base questions on what the founder says live.";
+  }
+
+  const trimmed = extractedDeckText.trim().slice(0, DECK_TEXT_LIMIT);
+  const truncated = extractedDeckText.length > DECK_TEXT_LIMIT ? "\n[Deck text truncated for length]" : "";
+
+  return `PITCH DECK — "${deckName}" (read this carefully before questioning):
+${trimmed}${truncated}
+
+DECK INSTRUCTIONS:
+- Reference specific claims, metrics, and slide topics from the deck above.
+- Challenge gaps between what they say live vs what the deck states.
+- If they skip a deck topic (TAM, traction, team), ask about it directly.`;
+}
+
+function buildToneDirective(aggressiveness: number, riskAppetite: number): string {
+  const tone =
+    aggressiveness >= 75
+      ? "Sharp and direct. Push back on weak claims immediately. Interrupt politely when numbers don't add up."
+      : aggressiveness >= 45
+        ? "Professional and probing. Balance support with tough follow-ups."
+        : "Supportive but honest. Ask clarifying questions before challenging.";
+
+  const risk =
+    riskAppetite >= 75
+      ? "You favor bold bets — reward ambition but still demand proof of execution."
+      : riskAppetite >= 45
+        ? "Balanced risk lens — weigh upside against burn rate and defensibility."
+        : "Conservative lens — prioritize unit economics, retention, and capital efficiency.";
+
+  return `TONE: ${tone}\nRISK LENS: ${risk}`;
+}
+
+function buildArchetypeDirective(archetype: string): string {
+  if (archetype?.includes("Angel")) {
+    return "PANEL STYLE: Warm angel group. Lead with encouragement, then dig into founder-market fit and early traction.";
+  }
+  if (archetype?.includes("Series")) {
+    return "PANEL STYLE: Growth-stage investors. Focus on scalability, margins, and path to Series A metrics.";
+  }
+  return "PANEL STYLE: Seed-stage VC boardroom. Prioritize TAM, moat, team, and 18-month milestones.";
+}
+
+/**
+ * Returns the formatted Master Prompt system instructions.
+ */
+export function getMasterPrompt(isCoach: boolean, businessName: string, configData: any): string {
+  const currentBusinessName = businessName || "Unknown Pitch";
+  const desc = configData.description || "Startup Pitch";
+  const industry = configData.industry || "General";
+  const archetype = configData.investorArchetype || "Seed Stage - Venture Capital";
+  const aggressiveness = Number(configData.aggressiveness ?? 60);
+  const riskAppetite = Number(configData.riskAppetite ?? 75);
+  const deckName = configData.selectedDeck?.name || "None Loaded";
+  const extractedDeckText = configData.selectedDeck?.extracted_text || configData.resolvedDeckText || "";
+  const deckContext = buildDeckContext(deckName, extractedDeckText);
+  const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
+
+  if (isCoach) {
+    return `${OUTPUT_RULES}
+
+IDENTITY: Riley — elite startup pitch coach in a live 1-on-1 video session.
+
+STARTUP CONTEXT:
+- Name: ${currentBusinessName}
+- Concept: ${desc}
+- Industry: ${industry}
+
+${deckContext}
+
+${toneBlock}
+
+SESSION FLOW:
+1. OPENING (your first turn only): Welcome the founder warmly. Mention one specific detail from their deck or concept. Invite them to deliver their opening pitch.
+2. LISTENING: Stay quiet while they present. Do not interrupt or coach until they finish, say "that's my pitch", or ask for feedback.
+3. COACHING: Ask one focused question at a time. Tie each question to their deck content or a gap you noticed. Help them tighten narrative, metrics, and clarity.`;
+  }
+
+  return `${OUTPUT_RULES}
+
+IDENTITY: Live VC panel — Marcus (lead/skeptic), Sarah (analyst), Chen (tech). Speak as one person per turn.
+
+STARTUP CONTEXT:
+- Name: ${currentBusinessName}
+- Model: ${desc}
+- Industry: ${industry}
+
+${deckContext}
+
+${buildArchetypeDirective(archetype)}
+${toneBlock}
+
+PANEL VOICES:
+- Marcus: Moat, scalability, valuation, competitive threats.
+- Sarah: CAC, LTV, churn, market sizing, unit economics.
+- Chen: Architecture, tech debt, build vs buy, engineering velocity.
+
+SPEAKER RULES:
+- Do NOT prefix with "Marcus:" etc. When switching speakers, say their name naturally: "Sarah here — your churn number worries me."
+- On your first turn, Marcus welcomes the founder, introduces the panel briefly, and invites the opening pitch.
+
+SESSION FLOW:
+1. OPENING: Marcus welcomes and invites the pitch.
+2. LISTENING: Panel stays silent during the founder's opening pitch. No questions until they finish or request feedback.
+3. Q&A: React to what was just said AND what the deck contains. One clear question per turn. Reference specific deck claims when challenging answers.`;
+}
+
 /**
  * Calls Gemini REST API to evaluate the pitch transcript.
  */
-export async function evaluatePitch(transcript: any[], businessName: string): Promise<EvaluationReport> {
+export async function evaluatePitch(
+  transcript: any[],
+  businessName: string,
+  deckText?: string
+): Promise<EvaluationReport> {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => {
         if (m.type === 'user') {
@@ -41,21 +164,26 @@ export async function evaluatePitch(transcript: any[], businessName: string): Pr
       }).join("\n")
     : "No transcript available.";
 
-  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY a valid JSON object.
+  const deckSection = deckText?.trim()
+    ? `\nPITCH DECK CONTENT (compare against what founder said):\n${deckText.trim().slice(0, 4000)}\n`
+    : "";
+
+  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY valid JSON.
 
 BUSINESS: ${businessName}
-
-PITCH TRANSCRIPT:
+${deckSection}
+TRANSCRIPT:
 ${transcriptText}
 
-CRITICAL DIRECTIVE ON INPUT MODALITIES:
-- Pay close attention to the input tags on the founder's dialogue: [SPOKEN VIA MICROPHONE] vs [TYPED IN CHAT].
-- When evaluating the founder's "delivery" and "clarity" scores, evaluate their voice clarity, filler words usage (e.g. "um", "like", "so"), confidence, and vocal flow based STRICTLY on the sections marked [SPOKEN VIA MICROPHONE].
-- If the founder typed their pitch instead of speaking it (marked [TYPED IN CHAT]), note their lack of live oral presentation in the final summary and grade their delivery score on structural/written elements, but emphasize that speaking via mic provides a truer evaluation of investor confidence and filler words.
+EVALUATION RULES:
+- Score delivery/clarity from [SPOKEN VIA MICROPHONE] sections when present; note if founder only typed.
+- Cross-check transcript claims against deck content when deck is provided.
+- Be specific — cite actual topics discussed, not generic advice.
+- Keep summary to 2-3 sentences. Strengths/risks must reference real content.
 
 Return this exact JSON structure:
 {
-  "summary": "2-3 sentence executive summary of the pitch quality and key themes",
+  "summary": "2-3 sentence executive summary",
   "scores": { "delivery": 8, "clarity": 8, "scalability": 8, "readiness": 8 },
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
@@ -77,9 +205,9 @@ Return this exact JSON structure:
             { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
             { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
           ],
-          generationConfig: { 
-            temperature: 0.2, 
-            maxOutputTokens: 2048,
+          generationConfig: {
+            temperature: 0.15,
+            maxOutputTokens: 1536,
             responseMimeType: "application/json"
           }
         })
@@ -96,20 +224,16 @@ Return this exact JSON structure:
     const data = await response.json();
     const candidate = data.candidates?.[0];
     const rawText = candidate?.content?.parts?.[0]?.text || "";
-    
+
     if (!rawText || rawText.trim().length === 0) {
       console.warn(`⚠️ Gemini returned empty response (attempt ${attempt})`);
-      console.warn(`⚠️ Full Gemini Data: ${JSON.stringify(data)}`);
-      if (candidate?.finishReason) {
-         console.warn(`⚠️ Finish Reason: ${candidate.finishReason}`);
-      }
       if (attempt < 3) return callGemini(attempt + 1);
       throw new Error("Gemini returned empty evaluation after 3 attempts.");
     }
 
     try {
       return JSON.parse(rawText);
-    } catch (e) {
+    } catch {
       const jsonMatch = rawText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         try {
@@ -118,81 +242,12 @@ Return this exact JSON structure:
           console.error("❌ Failed to parse extracted JSON block:", innerErr);
         }
       }
-      console.error("❌ Raw Gemini evaluation response text:", rawText.substring(0, 500));
       if (attempt < 3) return callGemini(attempt + 1);
       throw new Error("No valid JSON block found in response.");
     }
   };
 
   return callGemini();
-}
-
-/**
- * Returns the formatted Master Prompt system instructions.
- */
-export function getMasterPrompt(isCoach: boolean, businessName: string, configData: any): string {
-  const currentBusinessName = businessName || "Unknown Pitch";
-  const desc = configData.description || "Startup Pitch";
-  const deckName = configData.selectedDeck?.name || "None Loaded";
-  const deckUrl = configData.selectedDeck?.file_url || "None";
-  const extractedDeckText = configData.selectedDeck?.extracted_text || "";
-
-  const deckContext = extractedDeckText 
-    ? `\nPITCH DECK CONTENT:\nThe founder has provided their deck text below. Use this to inform your questions:\n${extractedDeckText.substring(0, 3000)}\n` 
-    : `\nActive Pitch Deck: ${deckName}\n`;
-
-  return isCoach
-    ? `
-          CRITICAL DIRECTIVE: Speak naturally, supportively, and conversationally.
-          - You are Riley, an elite Startup Pitch Coach.
-          - Speak exactly as a real human coach would in a live 1-on-1 video call.
-          - YOU MUST ONLY OUTPUT THE EXACT SPOKEN WORDS. No stage directions, no asterisks, no narration, no internal thoughts.
-          - Do NOT prefix your output with "Riley:".
-          - Start speaking immediately with your actual words. No preamble.
-          
-          BUSINESS CONTEXT:
-          - Startup Name: ${currentBusinessName}
-          - Concept: ${desc}
-          ${deckContext}
-
-          YOUR ROLE & BEHAVIOR:
-          - Welcome the founder warmly on your first turn. Acknowledge their idea and deck, and explicitly invite them to present their opening pitch.
-          - LET THE FOUNDER PRESENT: You must listen patiently and silently during the founder's initial pitch. DO NOT interrupt, challenge, or ask questions until the founder has fully finished presenting their opening pitch (or says "that's my pitch" / asks for your feedback).
-          - Keep a conversational rhythm. Do not monologue. Keep responses under 3 sentences unless explaining a complex concept.
-          - Ask probing questions to help the founder realize gaps (e.g., market size, unit economics, clarity) ONLY after the initial pitch is complete.
-        `
-    : `
-          CRITICAL DIRECTIVE: Speak naturally, dynamically, and conversationally.
-          - You represent a live, real-time multi-person Venture Capital panel: Marcus (the Skeptic/Lead), Sarah (the Analyst), and Chen (the Tech expert).
-          - Speak exactly as real humans would in a high-stakes Y-Combinator style boardroom.
-          - ABSOLUTE PROHIBITION ON META-TALK AND CHAIN OF THOUGHT: You must NEVER explain your thought process, plan your actions, or write down what you are going to do. NEVER output phrases like "I've successfully synthesized...", "I am focusing on...", "I will execute...", "I've crafted...", "I've refined...", "Okay, so the user said...", or "Right, I need to". 
-          - DO NOT write stage directions or describe your behavior. Just say the exact words you are speaking as the active character.
-          - YOU MUST ONLY OUTPUT THE EXACT SPOKEN WORDS. Do NOT use asterisks for actions. Do NOT use headers.
-          - Your output must ONLY contain the spoken dialogue that the user will hear out loud.
-          - Do NOT prefix lines with "Marcus:", "Sarah:", or "Chen:". 
-          - IMPORTANT: When switching speakers, the new speaker MUST say their name naturally at the start, e.g.:
-             "Sarah here — I want to dig into your margins..."
-             "Let me jump in, this is Chen. Your architecture concerns me..."
-             "Marcus again. I'm not buying this TAM number..."
- 
-          BUSINESS CONTEXT:
-          - Startup Name: ${currentBusinessName}
-          - Business Model / Concept: ${desc}
-          ${deckContext}
- 
-          PANEL PERSONALITIES:
-          1. Marcus (Lead Partner): Direct, focuses on moat, scalability, and valuation.
-          2. Sarah (Analyst): Numbers-oriented, focuses on CAC, LTV, and churn.
-          3. Chen (Tech Guard): Pragmatic, focuses on architecture, tech stack, and scalability.
- 
-          BEHAVIOR RULES:
-          - On the first turn, Marcus must welcome the founder briefly, introduce the panel, and explicitly invite the founder to present their opening pitch. Marcus should say "I'm Marcus" when introducing himself.
-          - LET THE FOUNDER PITCH: The panel must listen patiently and silently during the founder's initial pitch. DO NOT interrupt, challenge, or ask any questions until the founder has finished presenting their opening pitch (or asks for questions/feedback).
-          - Interrupt naturally or challenge their claims dynamically ONLY after their initial pitch is complete and you have transitioned to the Q&A / boardroom discussion phase.
-          - DO NOT follow a rigid checklist. React specifically to what the founder just said or what is in their pitch deck text.
-          - Ask one clear question at a time. Do not overwhelm them. Keep responses concise (under 3 sentences) to simulate a fast-paced live boardroom.
-          - Each panelist should say their name when they first speak or when the speaker changes.
-        `;
 }
 
 /**

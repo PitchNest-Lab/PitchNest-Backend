@@ -17,21 +17,22 @@ export const uploadDeck = async (req: Request, res: Response) => {
     let extractedText = "";
     if (req.file.mimetype === "application/pdf") {
       try {
-        // Dynamic import — pdf-parse is CJS and has no default ESM export
-        const pdfParseModule: any = await import("pdf-parse");
-        
-        if (typeof pdfParseModule.PDFParse === 'function') {
-          const parser = new pdfParseModule.PDFParse({ data: req.file.buffer });
-          const result = await parser.getText();
-          extractedText = result.text || "";
-          await parser.destroy();
-          console.log("✅ Successfully extracted text from PDF using PDFParse class! Length:", extractedText.length);
-        } else {
-          console.warn("⚠️ Warning: Could not resolve PDFParse class in pdf-parse module.", pdfParseModule);
-        }
+        const { PDFParse } = await import("pdf-parse");
+        const parser = new PDFParse({ data: req.file.buffer });
+        const result = await parser.getText();
+        extractedText = (result.text || "").replace(/\s{2,}/g, " ").trim();
+        await parser.destroy();
+        console.log("✅ Extracted PDF text. Length:", extractedText.length);
       } catch (err) {
-        console.warn("⚠️ Warning: Failed to parse PDF text using PDFParse class:", err);
+        console.warn("⚠️ Failed to parse PDF text:", err);
       }
+    } else if (
+      req.file.mimetype === "text/plain" ||
+      originalName.endsWith(".txt") ||
+      originalName.endsWith(".md")
+    ) {
+      extractedText = req.file.buffer.toString("utf-8").replace(/\s{2,}/g, " ").trim();
+      console.log("✅ Extracted plain-text deck. Length:", extractedText.length);
     }
 
     const { data, error } = await supabase.storage

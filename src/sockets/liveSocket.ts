@@ -2,7 +2,35 @@ import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { evaluatePitch, getMasterPrompt } from "../services/aiService.ts";
+import { sanitizeAiSpeech, detectSpeaker } from "../utils/aiTextSanitizer.ts";
 import crypto from "crypto";
+
+async function resolveDeckText(clientConfig: any): Promise<string> {
+  const deck = clientConfig?.selectedDeck;
+  if (!deck) return "";
+
+  if (deck.extracted_text?.trim()) {
+    return deck.extracted_text.trim();
+  }
+
+  if (deck.id && config.supabaseUrl && config.supabaseAnonKey) {
+    try {
+      const { data } = await supabase
+        .from("decks")
+        .select("extracted_text")
+        .eq("id", deck.id)
+        .single();
+      if (data?.extracted_text?.trim()) {
+        console.log(`📄 Loaded deck text from DB for deck id ${deck.id}`);
+        return data.extracted_text.trim();
+      }
+    } catch (err) {
+      console.warn("⚠️ Could not fetch deck text from database:", err);
+    }
+  }
+
+  return "";
+}
 
 export function initLiveSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws) => {
@@ -14,6 +42,7 @@ export function initLiveSocket(wss: WebSocketServer) {
     let hasNudged = false;
     let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
     let sessionId = 0;
+    let resolvedDeckText = "";
 
     console.log("✅ Client connected to PitchNest Brain");
 
@@ -53,7 +82,7 @@ export function initLiveSocket(wss: WebSocketServer) {
           if (aiWs.readyState === WebSocket.OPEN) {
             aiWs.send(JSON.stringify({ 
               clientContent: { 
-                turns: [{ role: "user", parts: [{ text: "Hi, I'm ready to pitch. Please welcome me, introduce yourself and the panel, and invite me to begin." }] }], 
+                turns: [{ role: "user", parts: [{ text: "I'm ready. Welcome me and invite my opening pitch." }] }], 
                 turnComplete: true 
               } 
             }));
@@ -73,48 +102,19 @@ export function initLiveSocket(wss: WebSocketServer) {
                 return;
               }
               if (part.text) {
-                let cleanText = part.text;
-                
-                // Drop meta-talk or chain-of-thought leakages
-                if (/^(?:Okay, so the user said|Right, I need to|Okay, so|I need to keep this|I'm structuring the initial|I've successfully synthesized|I will execute Marcus|I've crafted Marcus's|I've refined Marcus's|I am focusing on)/i.test(cleanText)) {
-                  console.log("🤫 Filtered out residual meta-talk phrase:", cleanText);
+                const cleanText = sanitizeAiSpeech(part.text);
+                if (!cleanText) {
+                  console.log("🤫 Filtered non-spoken AI output:", part.text.substring(0, 80));
                   return;
                 }
-                // Strip markdown formatting
-                cleanText = cleanText.replace(/\[[^\]]*\]/g, '');
-                cleanText = cleanText.replace(/\([^\)]*\)/g, '');
-                cleanText = cleanText.replace(/\*[^*]*\*/g, '');
-                // Strip "Name:" prefixes
-                cleanText = cleanText.replace(/^(marcus|riley|sarah|chen|investor|founder):\s*/i, '');
-                
-                // Strip thinking/action headers — any Title Case phrase that looks like internal monologue
-                // e.g. "Interpreting the Context", "Analyzing the Deck's Content", "Rephrasing the Core Question"
-                cleanText = cleanText.replace(/^[A-Z][a-z]+(?:[\s'-]+[A-Za-z]+){1,6}\s*$/gm, '');
-                // Strip lines that are just a header followed by nothing useful
-                cleanText = cleanText.replace(/^(confirming|initiating|interpreting|analyzing|rephrasing|assessing|evaluating|deepening|challenging|quantitative|technical|strategic|reviewing|processing|considering|formulating|preparing|transitioning|redirecting|addressing|summarizing|concluding|opening|closing|wrapping)[^.!?]*$/gim, '');
-                
-                cleanText = cleanText.trim();
-                
-                if (cleanText) {
-                  // Detect which panelist is speaking from the text content
-                  let detectedSpeaker = "";
-                  const speakerMatch = cleanText.match(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)\s+here[,.]?/i)
-                    || cleanText.match(/(?:I'm|I am|This is|It's)\s+(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)/i)
-                    || cleanText.match(/(?:let me|I'll).*?(?:jump in|chime in|take|weigh in)/i);
-                  
-                  if (speakerMatch) {
-                    const name = speakerMatch[1];
-                    if (name) detectedSpeaker = name.charAt(0).toUpperCase() + name.slice(1).toLowerCase();
-                  }
-                  
-                  // Also check if the text starts with a name reference
-                  const nameCheck = cleanText.match(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)[,:\s]/i);
-                  if (nameCheck && !detectedSpeaker) {
-                    detectedSpeaker = nameCheck[1].charAt(0).toUpperCase() + nameCheck[1].slice(1).toLowerCase();
-                    cleanText = cleanText.replace(/^(Marcus|Sarah|Chen|Riley|Taylor|Elena|David|James)[,:\s]+/i, '').trim();
-                  }
-                  
-                  ws.send(JSON.stringify({ type: "transcript", text: cleanText, speaker: detectedSpeaker || undefined }));
+
+                const { speaker: detectedSpeaker, text: spokenText } = detectSpeaker(cleanText);
+                if (spokenText) {
+                  ws.send(JSON.stringify({
+                    type: "transcript",
+                    text: spokenText,
+                    speaker: detectedSpeaker || undefined
+                  }));
                 }
               }
               if (part.inlineData?.data) ws.send(JSON.stringify({ type: "audio", data: part.inlineData.data }));
@@ -148,23 +148,22 @@ export function initLiveSocket(wss: WebSocketServer) {
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
           currentUserId = clientConfig.userId || null;
 
+          resolvedDeckText = await resolveDeckText(clientConfig);
+          const enrichedConfig = { ...clientConfig, resolvedDeckText };
+
           const isCoach = clientConfig.mode === 'coach';
           const agentVoice = isCoach ? "Aoede" : "Charon";
-
-          // Get properly configured system prompt from aiService
-          const masterPrompt = getMasterPrompt(isCoach, currentBusinessName, clientConfig);
-
-          // Bidi WebSocket ONLY supports Gemini Live models.
-          // On this environment, the supported model is gemini-2.5-flash-native-audio-latest.
-          const bidiModel = "gemini-2.5-flash-native-audio-latest";
+          const masterPrompt = getMasterPrompt(isCoach, currentBusinessName, enrichedConfig);
 
           aiWs.send(JSON.stringify({
             setup: {
-              model: `models/${bidiModel}`,
+              model: `models/${config.geminiLiveModel}`,
               generationConfig: {
                 responseModalities: ["AUDIO"],
                 speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: agentVoice } } },
-                thinkingConfig: { thinkingBudget: 0 } // Disable thinking to reduce latency and eliminate meta-thought generation
+                thinkingConfig: { thinkingBudget: 0 },
+                temperature: isCoach ? 0.7 : 0.8,
+                maxOutputTokens: 512
               },
               systemInstruction: { parts: [{ text: masterPrompt }] }
             }
@@ -227,7 +226,7 @@ export function initLiveSocket(wss: WebSocketServer) {
           };
 
           try {
-            const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName);
+            const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName, resolvedDeckText);
             reportData = { ...reportData, ...evaluated };
             console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
           } catch (evalErr) { 
