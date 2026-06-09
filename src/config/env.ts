@@ -32,7 +32,13 @@ export const config = {
   isGoogleCloud: !!process.env.K_SERVICE,
   jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
   allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5173",
-  nodeEnv: process.env.NODE_ENV || "development",
+  azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
+  azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
+  openAiApiKey: process.env.OPENAI_API_KEY || "",
+  azureOpenAiEndpoint: process.env.AZURE_OPENAI_ENDPOINT || "",
+  azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
+  azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
+  azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
 };
 
 // Check for critical missing configurations

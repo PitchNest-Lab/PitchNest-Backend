@@ -31,8 +31,8 @@ const DECK_TEXT_LIMIT = 8000;
 const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
-- Keep each turn to 1-3 short sentences. One question per turn.
-- Start speaking immediately — no preamble.`;
+- Keep each turn to 1-2 short, conversational sentences. Shorter responses speed up panel generation and audio delivery. One question per turn.
+- Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly (not in every turn) to make the panel feel like they are thinking live.`;
 
 function buildDeckContext(deckName: string, extractedDeckText: string): string {
   if (!extractedDeckText?.trim()) {
@@ -55,18 +55,22 @@ DECK INSTRUCTIONS:
 
 function buildToneDirective(aggressiveness: number, riskAppetite: number): string {
   const tone =
-    aggressiveness >= 75
-      ? "Sharp and direct. Push back on weak claims immediately. Interrupt politely when numbers don't add up."
-      : aggressiveness >= 45
-        ? "Professional and probing. Balance support with tough follow-ups."
-        : "Supportive but honest. Ask clarifying questions before challenging.";
+    aggressiveness >= 80
+      ? "Analytical and direct. Focus purely on the data, metrics, and financials."
+      : aggressiveness >= 60
+      ? "Direct and professional. Ask about unit economics and growth."
+      : aggressiveness >= 40
+        ? "Professional and probing. Balance support with follow-ups."
+        : "Supportive and patient. Ask clarifying questions before challenging.";
 
   const risk =
-    riskAppetite >= 75
+    riskAppetite >= 80
+      ? "You favor massive moonshots. Ignore safe bets and focus purely on billion-dollar upside and hyper-scalability."
+      : riskAppetite >= 60
       ? "You favor bold bets — reward ambition but still demand proof of execution."
-      : riskAppetite >= 45
+      : riskAppetite >= 40
         ? "Balanced risk lens — weigh upside against burn rate and defensibility."
-        : "Conservative lens — prioritize unit economics, retention, and capital efficiency.";
+        : "Highly conservative — prioritize unit economics, retention, capital efficiency, and profitability over growth.";
 
   return `TONE: ${tone}\nRISK LENS: ${risk}`;
 }
@@ -75,8 +79,26 @@ function buildArchetypeDirective(archetype: string): string {
   if (archetype?.includes("Angel")) {
     return "PANEL STYLE: Warm angel group. Lead with encouragement, then dig into founder-market fit and early traction.";
   }
-  if (archetype?.includes("Series")) {
+  if (archetype?.includes("Series") || archetype?.includes("Growth")) {
     return "PANEL STYLE: Growth-stage investors. Focus on scalability, margins, and path to Series A metrics.";
+  }
+  if (archetype?.includes("Shark Tank")) {
+    return "PANEL STYLE: Fast-paced consumer investors. Focused on valuation and quick consumer adoption. Say 'I'm out' if the deal is not viable.";
+  }
+  if (archetype?.includes("Private Equity")) {
+    return "PANEL STYLE: Private Equity analysts. Obsessed with cash flow, EBITDA, restructuring, and debt efficiency.";
+  }
+  if (archetype?.includes("Corporate VC")) {
+    return "PANEL STYLE: Strategic Corporate VC. Focused on synergies with your parent company and M&A potential.";
+  }
+  if (archetype?.includes("Family Office")) {
+    return "PANEL STYLE: Wealthy Family Office. Patient capital, focused on generational wealth preservation and sustainable growth.";
+  }
+  if (archetype?.includes("Y Combinator")) {
+    return "PANEL STYLE: Y Combinator partners. Fast-paced, focused on launch velocity, product-market fit, and user growth.";
+  }
+  if (archetype?.includes("Impact") || archetype?.includes("ESG")) {
+    return "PANEL STYLE: ESG/Impact investors. Focused on sustainability, ethical metrics, and social/environmental impact alongside returns.";
   }
   return "PANEL STYLE: Seed-stage VC boardroom. Prioritize TAM, moat, team, and 18-month milestones.";
 }
@@ -136,18 +158,37 @@ PANEL VOICES:
 - Chen: Architecture, tech debt, build vs buy, engineering velocity.
 
 SPEAKER RULES:
-- Do NOT prefix with "Marcus:" etc. When switching speakers, say their name naturally: "Sarah here — your churn number worries me."
-- On your first turn, Marcus welcomes the founder, introduces the panel briefly, and invites the opening pitch.
+- You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
+- Only one panelist speaks per turn.
+- Do not add any extra text or stage directions.
+- Marcus usually leads the opening, but if the founder specifically asks for someone else (like Sarah or Chen), that panelist should respond immediately.
+
+VALIDATION & FACT-CHECKING RULES:
+- **Pitch Structure Validation**: If the founder merely introduces themselves and their business but fails to give a proper pitch (e.g. they don't cover problem, solution, market, or metrics), immediately point this out. Tell them that an introduction is not a pitch and ask them to actually pitch their business.
+- **Competitor Analysis**: Actively cross-reference the founder's claims against real-world companies. If they claim to have no competitors or claim a unique feature that already exists in products like Stripe, AWS, Shopify, etc., name-drop those real competitors and challenge them.
+- **Fact-Checking**: Use your internal knowledge to verify their market sizes, growth rates, and technical feasibility. If their numbers are wildly inaccurate or physically impossible, challenge them aggressively.
 
 SESSION FLOW:
 1. OPENING: Marcus welcomes and invites the pitch.
-2. LISTENING: Panel stays silent during the founder's opening pitch. No questions until they finish or request feedback.
-3. Q&A: React to what was just said AND what the deck contains. One clear question per turn. Reference specific deck claims when challenging answers.`;
+2. CONVERSATION & Q&A: React naturally to what the founder says. If they ask a question, answer it. If they are pitching, listen and ask a focused follow-up question. Feel free to rotate speakers (Marcus, Sarah, Chen) to keep the panel dynamic. Reference specific deck claims when challenging answers.
+3. CONCLUSION: If the system explicitly states that time is up or the session is ending, immediately conclude the pitch. Deliver a clear, spoken final verdict on behalf of the panel. Explicitly state whether you "accept the idea", "reject the idea", or "recommend improvements". Briefly give your primary reasons.`;
 }
 
-/**
- * Calls Gemini REST API to evaluate the pitch transcript.
- */
+import { OpenAI, AzureOpenAI } from "openai";
+
+function getOpenAIClient() {
+  if (config.azureOpenAiEndpoint && config.azureOpenAiApiKey) {
+    // Use AzureOpenAI client which handles the correct headers and paths automatically
+    return new AzureOpenAI({
+      endpoint: config.azureOpenAiEndpoint.replace("/openai/v1", ""), // Strip openai/v1 if present to let SDK handle it
+      apiKey: config.azureOpenAiApiKey,
+      apiVersion: config.azureOpenAiApiVersion,
+      deployment: config.azureOpenAiDeployment,
+    });
+  }
+  return new OpenAI({ apiKey: config.openAiApiKey });
+}
+
 export async function evaluatePitch(
   transcript: any[],
   businessName: string,
@@ -176,7 +217,7 @@ TRANSCRIPT:
 ${transcriptText}
 
 EVALUATION RULES:
-- Score delivery/clarity from [SPOKEN VIA MICROPHONE] sections when present; note if founder only typed.
+- Score each category (delivery, clarity, scalability, readiness) strictly from 1 to 100. 
 - Cross-check transcript claims against deck content when deck is provided.
 - Be specific — cite actual topics discussed, not generic advice.
 - Keep summary to 2-3 sentences. Strengths/risks must reference real content.
@@ -184,107 +225,98 @@ EVALUATION RULES:
 Return this exact JSON structure:
 {
   "summary": "2-3 sentence executive summary",
-  "scores": { "delivery": 8, "clarity": 8, "scalability": 8, "readiness": 8 },
+  "scores": { "delivery": 85, "clarity": 90, "scalability": 75, "readiness": 80 },
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
   "next_steps": [ { "title": "Action title", "desc": "Short actionable description", "priority": "High Priority" } ],
   "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." } ]
 }`;
 
-  const callGemini = async (attempt: number = 1): Promise<any> => {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiModel}:generateContent?key=${config.geminiApiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: evaluationPrompt }] }],
-          safetySettings: [
-            { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-            { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
-          ],
-          generationConfig: {
-            temperature: 0.15,
-            maxOutputTokens: 1536,
-            responseMimeType: "application/json"
-          }
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => "");
-      console.error(`❌ Gemini HTTP ${response.status} on evaluation (attempt ${attempt}):`, errorBody.substring(0, 300));
-      if (attempt < 3) return callGemini(attempt + 1);
-      throw new Error(`Gemini returned HTTP ${response.status} after 3 attempts.`);
-    }
-
-    const data = await response.json();
-    const candidate = data.candidates?.[0];
-    const rawText = candidate?.content?.parts?.[0]?.text || "";
-
-    if (!rawText || rawText.trim().length === 0) {
-      console.warn(`⚠️ Gemini returned empty response (attempt ${attempt})`);
-      if (attempt < 3) return callGemini(attempt + 1);
-      throw new Error("Gemini returned empty evaluation after 3 attempts.");
-    }
-
+  const callOpenAI = async (attempt: number = 1): Promise<any> => {
     try {
-      return JSON.parse(rawText);
-    } catch {
-      const jsonMatch = rawText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        try {
-          return JSON.parse(jsonMatch[0]);
-        } catch (innerErr) {
-          console.error("❌ Failed to parse extracted JSON block:", innerErr);
-        }
+      const openai = getOpenAIClient();
+      const response = await openai.chat.completions.create({
+        model: config.azureOpenAiDeployment || "gpt-4o",
+        messages: [{ role: "user", content: evaluationPrompt }],
+        temperature: 0.15,
+        max_tokens: 1536,
+        response_format: { type: "json_object" }
+      });
+
+      const rawText = response.choices[0]?.message?.content || "";
+      
+      if (!rawText || rawText.trim().length === 0) {
+        console.warn(`⚠️ OpenAI returned empty response (attempt ${attempt})`);
+        if (attempt < 3) return callOpenAI(attempt + 1);
+        throw new Error("OpenAI returned empty evaluation after 3 attempts.");
       }
-      if (attempt < 3) return callGemini(attempt + 1);
-      throw new Error("No valid JSON block found in response.");
+
+      return JSON.parse(rawText);
+    } catch (err: any) {
+      console.error(`❌ OpenAI API Error on evaluation (attempt ${attempt}):`, err.message);
+      if (attempt < 3) return callOpenAI(attempt + 1);
+      throw err;
     }
   };
 
-  return callGemini();
+  return callOpenAI();
 }
 
 /**
- * Validates the Gemini API key health and checks for 429 quota exhaustion or invalid key errors.
+ * Calls OpenAI API to generate the next turn in the conversation.
+ */
+export async function generatePanelResponse(
+  userInput: string,
+  history: any[],
+  systemInstruction: string
+): Promise<string> {
+  const openai = getOpenAIClient();
+  
+  const messages: any[] = [
+    { role: "system", content: systemInstruction },
+    ...history.map(m => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.text
+    })),
+    { role: "user", content: userInput }
+  ];
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: config.azureOpenAiDeployment || "gpt-4o",
+      messages: messages,
+      temperature: 0.7
+    });
+
+    return response.choices[0]?.message?.content || "";
+  } catch (err: any) {
+    console.error("❌ OpenAI Panel Response Error:", err.message);
+    throw err;
+  }
+}
+
+/**
+ * Validates the OpenAI API key health.
  */
 export async function checkApiKeyStatus(): Promise<void> {
-  if (!config.geminiApiKey || config.geminiApiKey === "your_gemini_api_key_here") {
-    console.error("\n🚨 WARNING: GEMINI_API_KEY is not set or is using the placeholder 'your_gemini_api_key_here' inside your backend/.env file!");
-    console.error("👉 Please get a free API Key from AI Studio (https://aistudio.google.com/) and paste it into backend/.env\n");
+  const isAzure = !!(config.azureOpenAiEndpoint && config.azureOpenAiApiKey);
+  const isStandard = !!config.openAiApiKey;
+
+  if (!isAzure && !isStandard) {
+    console.error("\n🚨 WARNING: No OpenAI or Azure OpenAI keys found in backend/.env!");
+    console.error("👉 Please provide either OPENAI_API_KEY or AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY\n");
     return;
   }
 
   try {
-    const res = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.geminiModel}:generateContent?key=${config.geminiApiKey}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: "ping" }] }]
-        })
-      }
-    );
-
-    if (res.status === 429) {
-      console.error("\n🚨 RESOURCE EXHAUSTED: Your Gemini API Key has run out of its free tier quota limit!");
-      console.error("👉 To fix this, please wait a minute or get a fresh API Key from Google AI Studio (https://aistudio.google.com/) and paste it into backend/.env\n");
-    } else if (res.status === 400 || res.status === 403) {
-      console.error("\n🚨 INVALID API KEY: The Gemini API Key provided is invalid or rejected by Google!");
-      console.error("👉 Please verify your key in backend/.env or fetch a new one from https://aistudio.google.com/\n");
-    } else if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      console.warn(`\n⚠️ Gemini API Status Check: Received HTTP ${res.status}. Message: ${data.error?.message || "Unknown error"}\n`);
-    } else {
-      console.log("\n🟢 Gemini API Status Check: Connection successful and key quota is healthy!\n");
-    }
+    const openai = getOpenAIClient();
+    await openai.chat.completions.create({
+      model: config.azureOpenAiDeployment || "gpt-4o",
+      messages: [{ role: "user", content: "ping" }],
+      max_tokens: 5
+    });
+    console.log(`\n🟢 OpenAI API Status Check: Connection successful (${isAzure ? 'Azure' : 'Standard'} OpenAI)!\n`);
   } catch (err: any) {
-    console.error("\n⚠️ Failed to connect to Gemini API during startup check. Network error:", err.message || err, "\n");
+    console.error("\n⚠️ Failed to connect to OpenAI API during startup check:", err.message, "\n");
   }
 }
