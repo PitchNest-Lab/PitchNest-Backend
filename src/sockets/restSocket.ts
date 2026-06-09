@@ -185,12 +185,19 @@ export function initRestSocket(wss: WebSocketServer) {
             sentiments: [], strengths: [], risks: [], next_steps: [], transcript: frontendTranscript, duration: data.duration || 0
           };
 
-          try {
-            const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName, resolvedDeckText);
-            reportData = { ...reportData, ...evaluated };
-            console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
-          } catch (evalErr) { 
-            console.error("❌ Evaluation failed:", evalErr); 
+          const userTurns = frontendTranscript.filter((m: any) => m.type === 'user');
+          const totalUserTextLength = userTurns.reduce((sum: number, m: any) => sum + (m.text || "").length, 0);
+
+          if (userTurns.length >= 1 && totalUserTextLength >= 25) {
+            try {
+              const evaluated = await evaluatePitch(frontendTranscript, currentBusinessName, resolvedDeckText);
+              reportData = { ...reportData, ...evaluated };
+              console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
+            } catch (evalErr) { 
+              console.error("❌ Evaluation failed:", evalErr); 
+            }
+          } else {
+            console.log("⚠️ Evaluation skipped: transcript is empty or too short.");
           }
 
           sessionId = 0;
