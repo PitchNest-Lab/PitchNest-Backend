@@ -110,6 +110,7 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
   const currentBusinessName = businessName || "Unknown Pitch";
   const desc = configData.description || "Startup Pitch";
   const industry = configData.industry || "General";
+  const fundingStage = configData.fundingStage || "Pre-Seed";
   const archetype = configData.investorArchetype || "Seed Stage - Venture Capital";
   const aggressiveness = Number(configData.aggressiveness ?? 60);
   const riskAppetite = Number(configData.riskAppetite ?? 75);
@@ -127,11 +128,12 @@ STARTUP CONTEXT:
 - Name: ${currentBusinessName}
 - Concept: ${desc}
 - Industry: ${industry}
+- Funding Stage: ${fundingStage}
 
 ${deckContext}
 
 ${toneBlock}
-
+` + `
 SESSION FLOW:
 1. OPENING (your first turn only): Welcome the founder warmly. Mention one specific detail from their deck or concept. Invite them to deliver their opening pitch.
 2. LISTENING: Stay quiet while they present. Do not interrupt or coach until they finish, say "that's my pitch", or ask for feedback.
@@ -146,6 +148,7 @@ STARTUP CONTEXT:
 - Name: ${currentBusinessName}
 - Model: ${desc}
 - Industry: ${industry}
+- Funding Stage: ${fundingStage}
 
 ${deckContext}
 
