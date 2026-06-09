@@ -56,29 +56,24 @@ export const uploadDeck = async (req: Request, res: Response) => {
       publicUrl = pUrl;
     }
 
-    const insertData: any = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY', extracted_text: extractedText };
-    if (userId) insertData.user_id = userId;
+    const insertData: any = { 
+      name: deckName, 
+      file_url: publicUrl, 
+      size: sizeMB, 
+      status: 'READY', 
+      extracted_text: extractedText,
+      user_id: userId
+    };
 
-    let { data: dbData, error: dbError } = await supabase
+    const { data: dbData, error: dbError } = await supabase
       .from("decks")
       .insert([insertData])
       .select()
       .single();
 
     if (dbError) {
-      console.error("❌ Primary Supabase insertion failed:", dbError);
-      console.warn("⚠️ Warning: Primary insert failed. Executing resilient database insert fallback (omitting optional user_id and extracted_text)...");
-      
-      const fallbackData = { name: deckName, file_url: publicUrl, size: sizeMB, status: 'READY' };
-      let fallback = await supabase.from("decks").insert([fallbackData]).select().single();
-      
-      if (fallback.error) {
-        console.error("❌ Resilient database insert fallback also failed:", fallback.error);
-        return res.status(500).json({ error: "Failed to save deck to database (All insertions failed)" });
-      }
-      
-      console.log("✅ Success! Resilient insert fallback successfully saved deck in database!");
-      dbData = fallback.data;
+      console.error("❌ Supabase insertion failed in uploadDeck:", dbError);
+      return res.status(500).json({ error: "Failed to save deck to database" });
     }
 
     res.status(200).json({
@@ -98,34 +93,23 @@ export const uploadDeck = async (req: Request, res: Response) => {
 export const listDecks = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-
-    let query = supabase
-      .from("decks")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    // Filter by user_id for data isolation
-    if (userId) {
-      query = query.eq("user_id", userId);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
     }
 
-    let { data: decks, error } = await query;
+    const { data: decks, error } = await supabase
+      .from("decks")
+      .select("*")
+      .eq("user_id", userId)
+      .order("created_at", { ascending: false });
 
     if (error) {
-      if (error.code === '42703') {
-        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
-        const fallback = await supabase
-          .from("decks")
-          .select("*")
-          .order("created_at", { ascending: false });
-        if (fallback.error) return res.status(500).json({ error: "Failed to fetch decks" });
-        decks = fallback.data;
-      } else {
-        return res.status(500).json({ error: "Failed to fetch decks" });
-      }
+      console.error("❌ Supabase query error in listDecks:", error);
+      return res.status(500).json({ error: "Failed to fetch decks" });
     }
     res.json(decks);
   } catch (error) { 
+    console.error("❌ listDecks exception:", error);
     res.status(500).json({ error: "Failed to fetch decks" }); 
   }
 };
@@ -133,33 +117,23 @@ export const listDecks = async (req: Request, res: Response) => {
 export const deleteDeck = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-
-    let query = supabase
-      .from("decks")
-      .delete()
-      .eq("id", req.params.id);
-
-    // Ensure user can only delete their own decks
-    if (userId) {
-      query = query.eq("user_id", userId);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { error } = await query;
+    const { error } = await supabase
+      .from("decks")
+      .delete()
+      .eq("id", req.params.id)
+      .eq("user_id", userId);
 
     if (error) {
-      if (error.code === '42703') {
-        console.warn("⚠️ Warning: Supabase 'decks' table is missing the 'user_id' column. Please run the SQL migration. Falling back to un-filtered query.");
-        const fallback = await supabase
-          .from("decks")
-          .delete()
-          .eq("id", req.params.id);
-        if (fallback.error) return res.status(500).json({ error: "Failed to delete deck" });
-      } else {
-        return res.status(500).json({ error: "Failed to delete deck" });
-      }
+      console.error("❌ Supabase query error in deleteDeck:", error);
+      return res.status(500).json({ error: "Failed to delete deck" });
     }
     res.status(200).json({ success: true });
   } catch (error) { 
+    console.error("❌ deleteDeck exception:", error);
     res.status(500).json({ error: "Failed to delete deck" }); 
   }
 };

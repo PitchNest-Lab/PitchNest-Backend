@@ -10,13 +10,13 @@ export const saveProfile = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: "Authentication required." });
 
-    const { startup_name, industry, goal } = req.body;
+    const { startup_name, industry, goal, funding_stage } = req.body;
 
     // Upsert: insert if not exists, update if exists
     const { data, error } = await supabase
       .from("profiles")
       .upsert(
-        { user_id: userId, startup_name, industry, goal },
+        { user_id: userId, startup_name, industry, goal, funding_stage },
         { onConflict: "user_id" }
       )
       .select()

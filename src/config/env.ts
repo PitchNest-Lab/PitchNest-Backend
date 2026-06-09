@@ -39,6 +39,7 @@ export const config = {
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
+  nodeEnv: process.env.NODE_ENV || "development",
 };
 
 // Check for critical missing configurations
