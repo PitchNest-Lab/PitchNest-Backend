@@ -91,10 +91,20 @@ export function initLiveSocket(wss: WebSocketServer) {
         }
 
         if (ws.readyState === WebSocket.OPEN) {
-          if (response.serverContent?.interrupted) ws.send(JSON.stringify({ type: "stop_audio" }));
+          if (response.serverContent?.interrupted) {
+            ws.send(JSON.stringify({ type: "stop_audio" }));
+          }
+
+          if (response.serverContent?.turnComplete) {
+            ws.send(JSON.stringify({ type: "turn_complete" }));
+          }
 
           const modelTurn = response.serverContent?.modelTurn;
           if (modelTurn?.parts) {
+            let textToSend = "";
+            let audioToSend = "";
+            let speakerToSend = "";
+
             modelTurn.parts.forEach((part: any) => {
               // Discard any thinking/reasoning process parts (Gemini 2.5 chain-of-thought blocks)
               if (part.thought) {
@@ -103,22 +113,29 @@ export function initLiveSocket(wss: WebSocketServer) {
               }
               if (part.text) {
                 const cleanText = sanitizeAiSpeech(part.text);
-                if (!cleanText) {
-                  console.log("🤫 Filtered non-spoken AI output:", part.text.substring(0, 80));
-                  return;
-                }
-
-                const { speaker: detectedSpeaker, text: spokenText } = detectSpeaker(cleanText);
-                if (spokenText) {
-                  ws.send(JSON.stringify({
-                    type: "transcript",
-                    text: spokenText,
-                    speaker: detectedSpeaker || undefined
-                  }));
+                if (cleanText) {
+                  const { speaker: detectedSpeaker, text: spokenText } = detectSpeaker(cleanText);
+                  if (spokenText) {
+                    textToSend += (textToSend ? " " : "") + spokenText;
+                  }
+                  if (detectedSpeaker) {
+                    speakerToSend = detectedSpeaker;
+                  }
                 }
               }
-              if (part.inlineData?.data) ws.send(JSON.stringify({ type: "audio", data: part.inlineData.data }));
+              if (part.inlineData?.data) {
+                audioToSend = part.inlineData.data;
+              }
             });
+
+            if (audioToSend || textToSend) {
+              ws.send(JSON.stringify({
+                type: "audio",
+                data: audioToSend || undefined,
+                text: textToSend || undefined,
+                speaker: speakerToSend || undefined
+              }));
+            }
           }
         }
       } catch (e) { 
@@ -169,33 +186,41 @@ export function initLiveSocket(wss: WebSocketServer) {
             }
           }));
 
-          // Start idle detection — nudge at 2min, auto-end at 4min
+          // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
           lastUserActivityTime = Date.now();
+          const sessionStartTimestamp = Date.now();
+          const initialDurationSeconds = Number(clientConfig.duration || 15) * 60;
           hasNudged = false;
+
           idleCheckInterval = setInterval(() => {
             const idleMs = Date.now() - lastUserActivityTime;
-            const NUDGE_THRESHOLD = 2 * 60 * 1000;  // 2 minutes
-            const END_THRESHOLD = 4 * 60 * 1000;     // 4 minutes
+            const NUDGE_THRESHOLD = 35 * 1000;      // 35 seconds
+            const END_THRESHOLD = 3 * 60 * 1000;     // 3 minutes
+
+            const elapsedSeconds = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
+            const timeLeftSeconds = Math.max(0, initialDurationSeconds - elapsedSeconds);
+            const mins = Math.floor(timeLeftSeconds / 60);
+            const secs = timeLeftSeconds % 60;
 
             if (idleMs >= END_THRESHOLD) {
-              console.log("⏱️ User idle for 4+ minutes. Auto-ending session.");
+              console.log("⏱️ User idle for 3+ minutes. Auto-ending session.");
               if (ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "idle_end", message: "Session ended due to inactivity. The panel noticed you've been silent for over 4 minutes." }));
+                ws.send(JSON.stringify({ type: "idle_end", message: "Session ended due to inactivity. The panel noticed you've been silent for over 3 minutes." }));
               }
               if (idleCheckInterval) clearInterval(idleCheckInterval);
             } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
               hasNudged = true;
-              console.log("⏱️ User idle for 2+ minutes. Sending AI nudge.");
+              console.log("⏱️ User idle for 35+ seconds. Sending AI nudge with time context.");
               if (aiWs.readyState === WebSocket.OPEN) {
                 aiWs.send(JSON.stringify({
                   clientContent: {
-                    turns: [{ role: "user", parts: [{ text: "[SYSTEM: The founder has been silent for 2 minutes. Gently nudge them to continue their pitch or ask if they need help. If they don't respond soon, the session will end automatically.]" }] }],
+                    turns: [{ role: "user", parts: [{ text: `[SYSTEM: The founder has been silent for 35 seconds. Pitch time remaining is ${mins} minutes and ${secs} seconds. Gently nudge them to continue their pitch, ask if they need help, or ask a specific follow-up question based on their pitch deck. Keep it conversational.]` }] }],
                     turnComplete: true
                   }
                 }));
               }
             }
-          }, 15000); // Check every 15 seconds
+          }, 5000); // Check every 5 seconds
 
           return;
         }
@@ -203,9 +228,17 @@ export function initLiveSocket(wss: WebSocketServer) {
         if (data.type === "chat_message" && hasSentSetup) {
           lastUserActivityTime = Date.now();
           hasNudged = false;
+
+          let textWithTime = data.text;
+          if (typeof data.timeLeft === "number") {
+            const mins = Math.floor(data.timeLeft / 60);
+            const secs = data.timeLeft % 60;
+            textWithTime = `[PITCH TIME REMAINING: ${mins}m ${secs}s] ${data.text}`;
+          }
+
           aiWs.send(JSON.stringify({ 
             clientContent: { 
-              turns: [{ role: "user", parts: [{ text: data.text }] }], 
+              turns: [{ role: "user", parts: [{ text: textWithTime }] }], 
               turnComplete: true 
             } 
           }));

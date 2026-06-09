@@ -32,7 +32,8 @@ const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
 - Keep each turn to 1-2 short, conversational sentences. Shorter responses speed up panel generation and audio delivery. One question per turn.
-- Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly (not in every turn) to make the panel feel like they are thinking live.`;
+- Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly (not in every turn) to make the panel feel like they are thinking live.
+- Be aware of the remaining pitch time metadata (e.g., \`[PITCH TIME REMAINING: ...]\`). Do not start complex new topics when less than 2 minutes remain; instead, guide the founder to summarize, handle final remarks, or conclude.`;
 
 function buildDeckContext(deckName: string, extractedDeckText: string): string {
   if (!extractedDeckText?.trim()) {
