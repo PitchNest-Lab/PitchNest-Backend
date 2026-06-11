@@ -2,13 +2,12 @@ import dotenv from "dotenv";
 import fs from "fs";
 import path from "path";
 
-// Read .env directly to see if a valid custom GEMINI_API_KEY is present
+// Read .env directly to see if a valid custom GEMINI_API_KEY is present (legacy liveSocket only)
 let customApiKey = "";
 try {
   const envPath = path.join(process.cwd(), ".env");
   if (fs.existsSync(envPath)) {
     const envContent = fs.readFileSync(envPath, "utf-8");
-    // Parse key matching pattern
     const match = envContent.match(/^GEMINI_API_KEY\s*=\s*(.+)$/m);
     if (match) {
       const val = match[1].trim();
@@ -17,7 +16,7 @@ try {
       }
     }
   }
-} catch (err) {}
+} catch {}
 
 dotenv.config();
 
@@ -31,7 +30,7 @@ export const config = {
   geminiLiveModel: process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-latest",
   isGoogleCloud: !!process.env.K_SERVICE,
   jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
-  allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5173",
+  allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
   openAiApiKey: process.env.OPENAI_API_KEY || "",
@@ -42,11 +41,36 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || "development",
 };
 
-// Check for critical missing configurations
-if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {
-  console.warn("⚠️ Warning: SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY is missing in your backend environment variables!");
+export function hasAzureOpenAiConfig(): boolean {
+  return !!(
+    config.azureOpenAiEndpoint &&
+    config.azureOpenAiApiKey &&
+    config.azureOpenAiDeployment
+  );
 }
 
-if (!config.geminiApiKey) {
-  console.error("🚨 CRITICAL ERROR: GEMINI_API_KEY is missing from environment variables!");
+export function hasOpenAiConfig(): boolean {
+  return hasAzureOpenAiConfig() || !!config.openAiApiKey;
+}
+
+export function hasAzureTtsConfig(): boolean {
+  return !!(config.azureSpeechKey && config.azureSpeechRegion);
+}
+
+if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {
+  console.warn(
+    "⚠️ Warning: SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY is missing in your backend environment variables!",
+  );
+}
+
+if (!hasOpenAiConfig()) {
+  console.error(
+    "🚨 CRITICAL: No AI provider configured. Set AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY + AZURE_OPENAI_DEPLOYMENT (or OPENAI_API_KEY).",
+  );
+}
+
+if (!hasAzureTtsConfig()) {
+  console.error(
+    "🚨 CRITICAL: Azure TTS is not configured. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION for voice output.",
+  );
 }

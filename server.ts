@@ -6,6 +6,7 @@ import { config } from "./src/config/env.ts";
 import app from "./src/app.ts";
 import { initRestSocket } from "./src/sockets/restSocket.ts";
 import { checkApiKeyStatus } from "./src/services/aiService.ts";
+import { checkTtsStatus } from "./src/services/ttsService.ts";
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
@@ -18,6 +19,6 @@ server.listen(config.port, "0.0.0.0", async () => {
   console.log(`\n🚀 PITCHNEST BRAIN IS ONLINE (MODULAR HIGH-PERFORMANCE PROD STANDARD)`);
   console.log(`📡 Listening on PORT ${config.port}\n`);
   
-  // Proactively check Gemini API health
   await checkApiKeyStatus();
+  await checkTtsStatus();
 });
