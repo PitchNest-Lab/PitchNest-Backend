@@ -118,6 +118,12 @@ export function initRestSocket(wss: WebSocketServer) {
     const turnQueue: QueuedTurn[] = [];
     let processingQueue = false;
 
+    let lastUserActivityTime = Date.now();
+    let hasNudged = false;
+    let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
+    let sessionStartTimestamp = Date.now();
+    let initialDurationSeconds = 15 * 60;
+
     console.log("✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)");
 
     if (!hasOpenAiConfig()) {
@@ -142,6 +148,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("close", () => {
       console.log("🔌 Client disconnected.");
+      if (idleCheckInterval) clearInterval(idleCheckInterval);
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
@@ -171,15 +178,14 @@ export function initRestSocket(wss: WebSocketServer) {
           return;
         }
 
-        sendJson(ws, {
-          type: "transcript",
-          text: spokenText,
-          speaker,
-        });
-
         fullTranscript.push({ type: "model", speaker, text: spokenText });
 
         if (!isTtsConfigured()) {
+          sendJson(ws, {
+            type: "transcript",
+            text: spokenText,
+            speaker,
+          });
           sendJson(ws, { type: "turn_complete" });
           return;
         }
@@ -201,6 +207,7 @@ export function initRestSocket(wss: WebSocketServer) {
             sendJson(ws, {
               type: "audio",
               data: base64Audio,
+              text: chunk,
               speaker,
             });
           } catch (ttsErr: any) {
@@ -218,6 +225,11 @@ export function initRestSocket(wss: WebSocketServer) {
 
         if (ttsFailed) {
           console.warn("⚠️ Continuing session without audio for this turn");
+          sendJson(ws, {
+            type: "transcript",
+            text: spokenText,
+            speaker,
+          });
         }
 
         sendJson(ws, { type: "turn_complete", audioChunks: chunks.length });
@@ -283,10 +295,47 @@ export function initRestSocket(wss: WebSocketServer) {
 
           console.log("🟢 Setup complete — triggering pitch introduction...");
           enqueueTurn({ text: "I'm ready. Welcome me and invite my opening pitch." });
+
+          // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
+          lastUserActivityTime = Date.now();
+          sessionStartTimestamp = Date.now();
+          initialDurationSeconds = Number(clientConfig.duration || 15) * 60;
+          hasNudged = false;
+
+          idleCheckInterval = setInterval(() => {
+            const idleMs = Date.now() - lastUserActivityTime;
+            const NUDGE_THRESHOLD = 35 * 1000;      // 35 seconds
+            const END_THRESHOLD = 3 * 60 * 1000;     // 3 minutes
+
+            const elapsedSeconds = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
+            const timeLeftSeconds = Math.max(0, initialDurationSeconds - elapsedSeconds);
+            const mins = Math.floor(timeLeftSeconds / 60);
+            const secs = timeLeftSeconds % 60;
+
+            if (idleMs >= END_THRESHOLD) {
+              console.log("⏱️ User idle for 3+ minutes. Auto-ending session.");
+              sendJson(ws, {
+                type: "idle_end",
+                message: "Session ended due to inactivity. The panel noticed you've been silent for over 3 minutes."
+              });
+              if (idleCheckInterval) clearInterval(idleCheckInterval);
+            } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
+              hasNudged = true;
+              console.log("⏱️ User idle for 35+ seconds. Sending AI nudge with time context.");
+              enqueueTurn({
+                text: `[SYSTEM: The founder has been silent for 35 seconds. Pitch time remaining is ${mins} minutes and ${secs} seconds. Gently nudge them to continue their pitch, ask if they need help, or ask a specific follow-up question based on their pitch deck. Keep it conversational.]`,
+                inputMethod: "chat"
+              });
+            }
+          }, 5000);
+
           return;
         }
 
         if (data.type === "chat_message" && hasSentSetup) {
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
+
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
           fullTranscript.push({
             type: "user",
