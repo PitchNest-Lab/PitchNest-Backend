@@ -1,10 +1,13 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
-import { config, hasAzureOpenAiConfig, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
+import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import { evaluatePitch, getMasterPrompt, generatePanelResponse } from "../services/aiService.ts";
-import { synthesizeSpeech, PANELIST_VOICES, isTtsConfigured } from "../services/ttsService.ts";
-import { detectSpeaker } from "../utils/aiTextSanitizer.ts";
+import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
+import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
 import crypto from "crypto";
+
+const MIN_EVAL_USER_CHARS = 150;
+const MIN_EVAL_DURATION_SEC = 60;
 
 async function resolveDeckText(clientConfig: any): Promise<string> {
   const deck = clientConfig?.selectedDeck;
@@ -40,6 +43,18 @@ function splitIntoSpokenChunks(text: string): string[] {
     .filter((s) => s.length > 0);
 }
 
+function formatTimeLeft(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(safe / 60);
+  const s = safe % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function buildUserTurnInput(text: string, timeLeft?: number): string {
+  if (timeLeft === undefined || timeLeft < 0) return text;
+  return `[PITCH TIME REMAINING: ${formatTimeLeft(timeLeft)}]\n${text}`;
+}
+
 function parseSpeakerResponse(aiResponse: string, isCoach: boolean): { speaker: string; spokenText: string } {
   let speaker = isCoach ? "Riley" : "Marcus";
   let spokenText = aiResponse.trim();
@@ -59,6 +74,9 @@ function parseSpeakerResponse(aiResponse: string, isCoach: boolean): { speaker: 
     spokenText = detected.text;
   }
 
+  const sanitized = sanitizeAiSpeech(spokenText);
+  spokenText = sanitized || spokenText;
+
   return { speaker, spokenText };
 }
 
@@ -67,6 +85,21 @@ function sendJson(ws: WebSocket, payload: Record<string, unknown>) {
     ws.send(JSON.stringify(payload));
   }
 }
+
+function shouldRunEvaluation(
+  userTurns: any[],
+  totalUserTextLength: number,
+  durationSec: number,
+): boolean {
+  if (userTurns.length < 1) return false;
+  return totalUserTextLength >= MIN_EVAL_USER_CHARS || durationSec >= MIN_EVAL_DURATION_SEC;
+}
+
+type QueuedTurn = {
+  text: string;
+  timeLeft?: number;
+  inputMethod?: "voice" | "chat";
+};
 
 export function initRestSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws) => {
@@ -82,6 +115,9 @@ export function initRestSocket(wss: WebSocketServer) {
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
 
+    const turnQueue: QueuedTurn[] = [];
+    let processingQueue = false;
+
     console.log("✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)");
 
     if (!hasOpenAiConfig()) {
@@ -90,8 +126,8 @@ export function initRestSocket(wss: WebSocketServer) {
         type: "error",
         message:
           "AI is not configured on the server. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and AZURE_OPENAI_DEPLOYMENT.",
+        code: "AI_NOT_CONFIGURED",
       });
-      return;
     }
 
     if (!hasAzureTtsConfig()) {
@@ -102,8 +138,6 @@ export function initRestSocket(wss: WebSocketServer) {
           "Voice output is not configured on the server. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.",
         code: "TTS_NOT_CONFIGURED",
       });
-    } else if (!hasAzureOpenAiConfig() && config.openAiApiKey) {
-      console.log("ℹ️ Using standard OpenAI (non-Azure) for text generation");
     }
 
     ws.on("close", () => {
@@ -112,14 +146,30 @@ export function initRestSocket(wss: WebSocketServer) {
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
 
-    const processAiTurn = async (userInput: string) => {
+    const processAiTurn = async (turn: QueuedTurn) => {
+      if (!hasOpenAiConfig()) {
+        sendJson(ws, {
+          type: "error",
+          message: "AI is not configured on the server.",
+          code: "AI_NOT_CONFIGURED",
+        });
+        sendJson(ws, { type: "turn_complete" });
+        return;
+      }
+
       try {
+        const userInput = buildUserTurnInput(turn.text, turn.timeLeft);
         const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
 
         conversationHistory.push({ role: "user", text: userInput });
         conversationHistory.push({ role: "assistant", text: aiResponse });
 
         const { speaker, spokenText } = parseSpeakerResponse(aiResponse, isCoachMode);
+
+        if (!spokenText.trim()) {
+          sendJson(ws, { type: "turn_complete" });
+          return;
+        }
 
         sendJson(ws, {
           type: "transcript",
@@ -134,7 +184,7 @@ export function initRestSocket(wss: WebSocketServer) {
           return;
         }
 
-        const voiceName = PANELIST_VOICES[speaker] || PANELIST_VOICES.Marcus;
+        const voiceName = resolveVoiceName(speaker);
         const chunks = splitIntoSpokenChunks(spokenText);
 
         if (chunks.length === 0) {
@@ -144,16 +194,10 @@ export function initRestSocket(wss: WebSocketServer) {
 
         let ttsFailed = false;
 
-        // Synthesize all chunks in parallel, stream to client in order for low latency + no gaps
-        const synthesisPromises = chunks.map((chunk) =>
-          synthesizeSpeech(chunk, voiceName).then((buf) =>
-            Buffer.from(buf).toString("base64"),
-          ),
-        );
-
-        for (let i = 0; i < synthesisPromises.length; i++) {
+        for (const chunk of chunks) {
           try {
-            const base64Audio = await synthesisPromises[i];
+            const buf = await synthesizeSpeech(chunk, voiceName);
+            const base64Audio = Buffer.from(buf).toString("base64");
             sendJson(ws, {
               type: "audio",
               data: base64Audio,
@@ -161,7 +205,7 @@ export function initRestSocket(wss: WebSocketServer) {
             });
           } catch (ttsErr: any) {
             ttsFailed = true;
-            console.error(`❌ TTS failed on chunk ${i + 1}/${chunks.length}:`, ttsErr.message);
+            console.error("❌ TTS failed:", ttsErr.message);
             sendJson(ws, {
               type: "error",
               message: `Voice synthesis failed: ${ttsErr.message}`,
@@ -173,11 +217,10 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (ttsFailed) {
-          // Text transcript was already sent — user can still read the panel response
           console.warn("⚠️ Continuing session without audio for this turn");
         }
 
-        sendJson(ws, { type: "turn_complete" });
+        sendJson(ws, { type: "turn_complete", audioChunks: chunks.length });
       } catch (err: any) {
         console.error("❌ Error generating AI response:", err);
         sendJson(ws, {
@@ -185,7 +228,29 @@ export function initRestSocket(wss: WebSocketServer) {
           message: err.message || "Failed to generate AI response",
           code: "AI_FAILED",
         });
+        sendJson(ws, { type: "turn_complete" });
       }
+    };
+
+    const drainTurnQueue = async () => {
+      if (processingQueue) return;
+      processingQueue = true;
+      try {
+        while (turnQueue.length > 0) {
+          const nextTurn = turnQueue.shift()!;
+          await processAiTurn(nextTurn);
+        }
+      } finally {
+        processingQueue = false;
+        if (turnQueue.length > 0) {
+          void drainTurnQueue();
+        }
+      }
+    };
+
+    const enqueueTurn = (turn: QueuedTurn) => {
+      turnQueue.push(turn);
+      void drainTurnQueue();
     };
 
     ws.on("message", async (message) => {
@@ -217,30 +282,41 @@ export function initRestSocket(wss: WebSocketServer) {
           masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
 
           console.log("🟢 Setup complete — triggering pitch introduction...");
-          await processAiTurn("I'm ready. Welcome me and invite my opening pitch.");
+          enqueueTurn({ text: "I'm ready. Welcome me and invite my opening pitch." });
           return;
         }
 
         if (data.type === "chat_message" && hasSentSetup) {
-          fullTranscript.push({ type: "user", text: data.text, inputMethod: "voice" });
-          await processAiTurn(data.text);
+          const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
+          fullTranscript.push({
+            type: "user",
+            text: data.text,
+            inputMethod,
+          });
+          enqueueTurn({
+            text: data.text,
+            timeLeft: typeof data.timeLeft === "number" ? data.timeLeft : undefined,
+            inputMethod,
+          });
           return;
         }
 
         if (data.type === "end_session") {
           console.log("🏁 Session ended, starting evaluation...");
           const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : fullTranscript;
+          const durationSec = Number(data.duration) || 0;
 
           let reportData: any = {
             summary:
-              "Pitch was too short to perform a full venture capital evaluation. Please speak for at least 2 minutes to get full VC grading.",
+              "Pitch was too short for a full evaluation. Speak for at least 2 minutes or share more detail to receive scored feedback.",
             scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
             sentiments: [],
             strengths: [],
             risks: [],
             next_steps: [],
             transcript: frontendTranscript,
-            duration: data.duration || 0,
+            duration: durationSec,
+            evaluationStatus: "insufficient_data",
           };
 
           const userTurns = frontendTranscript.filter((m: any) => m.type === "user");
@@ -249,20 +325,25 @@ export function initRestSocket(wss: WebSocketServer) {
             0,
           );
 
-          if (userTurns.length >= 1 && totalUserTextLength >= 25) {
+          if (shouldRunEvaluation(userTurns, totalUserTextLength, durationSec)) {
             try {
               const evaluated = await evaluatePitch(
                 frontendTranscript,
                 currentBusinessName,
                 resolvedDeckText,
               );
-              reportData = { ...reportData, ...evaluated };
+              reportData = { ...reportData, ...evaluated, evaluationStatus: "complete" };
               console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
             } catch (evalErr) {
               console.error("❌ Evaluation failed:", evalErr);
+              reportData.evaluationStatus = "failed";
+              reportData.summary =
+                "We could not generate a full evaluation right now. Your session was saved — try again or contact support if this persists.";
             }
           } else {
-            console.log("⚠️ Evaluation skipped: transcript is empty or too short.");
+            console.log(
+              `⚠️ Evaluation skipped: ${totalUserTextLength} chars, ${durationSec}s duration`,
+            );
           }
 
           sessionId = 0;

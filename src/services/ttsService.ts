@@ -6,27 +6,34 @@ export const PANELIST_VOICES: Record<string, string> = {
   Sarah: "en-US-AriaNeural",
   Chen: "en-US-JasonNeural",
   Riley: "en-US-JennyNeural",
+  Elena: "en-US-AriaNeural",
+  David: "en-US-DavisNeural",
+  James: "en-US-JasonNeural",
+  Taylor: "en-US-JennyNeural",
 };
+
+export function resolveVoiceName(speaker: string): string {
+  const normalized = speaker?.trim() || "Marcus";
+  const key = Object.keys(PANELIST_VOICES).find(
+    (name) => name.toLowerCase() === normalized.toLowerCase(),
+  );
+  return key ? PANELIST_VOICES[key] : PANELIST_VOICES.Marcus;
+}
 
 const SYNTHESIS_TIMEOUT_MS = 25_000;
 
-let cachedSpeechConfig: sdk.SpeechConfig | null = null;
-
-function getSpeechConfig(): sdk.SpeechConfig {
+function createSpeechConfig(): sdk.SpeechConfig {
   if (!config.azureSpeechKey || !config.azureSpeechRegion) {
     throw new Error("Azure Speech Key or Region is missing. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.");
   }
 
-  if (!cachedSpeechConfig) {
-    cachedSpeechConfig = sdk.SpeechConfig.fromSubscription(
-      config.azureSpeechKey,
-      config.azureSpeechRegion,
-    );
-    cachedSpeechConfig.speechSynthesisOutputFormat =
-      sdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm;
-  }
-
-  return cachedSpeechConfig;
+  const speechConfig = sdk.SpeechConfig.fromSubscription(
+    config.azureSpeechKey,
+    config.azureSpeechRegion,
+  );
+  speechConfig.speechSynthesisOutputFormat =
+    sdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm;
+  return speechConfig;
 }
 
 /** Escape text for safe inclusion inside SSML. */
@@ -76,11 +83,9 @@ export async function synthesizeSpeech(text: string, voiceName: string): Promise
     throw new Error("TTS received empty text");
   }
 
-  const speechConfig = getSpeechConfig();
-  speechConfig.speechSynthesisVoiceName = voiceName;
-
   const runSynthesis = (useSsml: boolean) =>
     new Promise<ArrayBuffer>((resolve, reject) => {
+      const speechConfig = createSpeechConfig();
       const synthesizer = new sdk.SpeechSynthesizer(speechConfig);
 
       const onResult = (result: sdk.SpeechSynthesisResult) => {

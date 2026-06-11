@@ -24,6 +24,56 @@ export interface EvaluationReport {
   }>;
   duration?: number;
   transcript?: any[];
+  evaluationStatus?: "complete" | "insufficient_data" | "failed";
+}
+
+function clampScore(value: unknown): number {
+  const n = Math.round(Number(value));
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(100, Math.max(0, n));
+}
+
+function validateEvaluationReport(raw: any): EvaluationReport {
+  const scores = raw?.scores || {};
+  const nextSteps = Array.isArray(raw?.next_steps)
+    ? raw.next_steps
+        .filter((step: any) => step && typeof step.title === "string")
+        .map((step: any) => ({
+          title: String(step.title),
+          desc: String(step.desc || ""),
+          priority: String(step.priority || "Medium Priority"),
+        }))
+    : [];
+
+  const strengths = Array.isArray(raw?.strengths)
+    ? raw.strengths.map((s: unknown) => String(s)).filter(Boolean)
+    : [];
+  const risks = Array.isArray(raw?.risks)
+    ? raw.risks.map((s: unknown) => String(s)).filter(Boolean)
+    : [];
+  const sentiments = Array.isArray(raw?.sentiments)
+    ? raw.sentiments
+        .filter((s: any) => s && typeof s.persona === "string")
+        .map((s: any) => ({
+          persona: String(s.persona),
+          quote: String(s.quote || ""),
+        }))
+    : [];
+
+  return {
+    summary: String(raw?.summary || "Evaluation completed."),
+    scores: {
+      delivery: clampScore(scores.delivery),
+      clarity: clampScore(scores.clarity),
+      scalability: clampScore(scores.scalability),
+      readiness: clampScore(scores.readiness),
+    },
+    strengths,
+    risks,
+    next_steps: nextSteps,
+    sentiments,
+    evaluationStatus: "complete",
+  };
 }
 
 const DECK_TEXT_LIMIT = 8000;
@@ -163,9 +213,11 @@ PANEL VOICES:
 
 SPEAKER RULES:
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
-- Only one panelist speaks per turn.
+- Only one panelist speaks per turn. Never write multiple speakers in one response.
+- Rotate naturally between Marcus, Sarah, and Chen across the session — do not let one person dominate.
 - Do not add any extra text or stage directions.
 - Marcus usually leads the opening, but if the founder specifically asks for someone else (like Sarah or Chen), that panelist should respond immediately.
+- When the founder asks a direct question, answer it before asking a new one.
 
 VALIDATION & FACT-CHECKING RULES:
 - **Pitch Structure Validation**: If the founder merely introduces themselves and their business but fails to give a proper pitch (e.g. they don't cover problem, solution, market, or metrics), immediately point this out. Tell them that an introduction is not a pitch and ask them to actually pitch their business.
@@ -221,10 +273,15 @@ TRANSCRIPT:
 ${transcriptText}
 
 EVALUATION RULES:
-- Score each category (delivery, clarity, scalability, readiness) strictly from 1 to 100. 
+- Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
+- delivery = vocal confidence, pacing, conviction, handling pressure.
+- clarity = problem/solution narrative, structure, jargon control.
+- scalability = market size, growth model, unit economics, GTM scalability.
+- readiness = overall investability for the stated funding stage.
 - Cross-check transcript claims against deck content when deck is provided.
 - Be specific — cite actual topics discussed, not generic advice.
 - Keep summary to 2-3 sentences. Strengths/risks must reference real content.
+- Include one sentiment quote each for Marcus, Sarah, and Chen when panel mode is implied.
 
 Return this exact JSON structure:
 {
@@ -263,7 +320,8 @@ Return this exact JSON structure:
     }
   };
 
-  return callOpenAI();
+  const parsed = await callOpenAI();
+  return validateEvaluationReport(parsed);
 }
 
 /**
@@ -289,7 +347,8 @@ export async function generatePanelResponse(
     const response = await openai.chat.completions.create({
       model: config.azureOpenAiDeployment || "gpt-4o",
       messages: messages,
-      temperature: 0.7
+      temperature: 0.7,
+      max_tokens: 320,
     });
 
     return response.choices[0]?.message?.content || "";
