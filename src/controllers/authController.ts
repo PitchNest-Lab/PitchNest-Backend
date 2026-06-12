@@ -4,18 +4,18 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
+import { Resend } from "resend";
 
 const BCRYPT_ROUNDS = 12;
+const resend = new Resend(`${process.env.RESEND_API_KEY}`);
 
 /**
  * Signs a JWT token for the given user.
  */
 function signToken(user: { id: number; email: string }): string {
-  return jwt.sign(
-    { id: user.id, email: user.email },
-    config.jwtSecret,
-    { expiresIn: "7d" }
-  );
+  return jwt.sign({ id: user.id, email: user.email }, config.jwtSecret, {
+    expiresIn: "7d",
+  });
 }
 
 export const wipeDb = async (req: Request, res: Response) => {
@@ -34,20 +34,28 @@ export const signup = async (req: Request, res: Response) => {
   try {
     const { name, email, password } = req.body;
     if (!name || !email || !password) {
-      return res.status(400).json({ error: "Name, email, and password are required." });
+      return res
+        .status(400)
+        .json({ error: "Name, email, and password are required." });
     }
 
     if (name.trim().length < 2) {
-      return res.status(400).json({ error: "Name must be at least 2 characters." });
+      return res
+        .status(400)
+        .json({ error: "Name must be at least 2 characters." });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!emailRegex.test(email)) {
-      return res.status(400).json({ error: "Please enter a valid email address." });
+      return res
+        .status(400)
+        .json({ error: "Please enter a valid email address." });
     }
 
     if (password.length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters." });
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 6 characters." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
@@ -68,13 +76,14 @@ export const signup = async (req: Request, res: Response) => {
       .select()
       .single();
 
-    if (error || !newUser) return res.status(500).json({ error: "Signup failed" });
+    if (error || !newUser)
+      return res.status(500).json({ error: "Signup failed" });
 
     const token = signToken({ id: newUser.id, email: newUser.email });
 
     res.status(201).json({
       user: { id: newUser.id, name: newUser.name, email: newUser.email },
-      token
+      token,
     });
   } catch (error) {
     console.error("Signup error:", error);
@@ -86,7 +95,9 @@ export const login = async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
+      return res
+        .status(400)
+        .json({ error: "Email and password are required." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
@@ -110,7 +121,7 @@ export const login = async (req: Request, res: Response) => {
 
     res.status(200).json({
       user: { id: user.id, name: user.name, email: user.email },
-      token
+      token,
     });
   } catch (error) {
     console.error("Login error:", error);
@@ -141,24 +152,47 @@ export const forgotPassword = async (req: Request, res: Response) => {
       .maybeSingle();
 
     // Always return 200 to prevent email enumeration
-    if (!user) return res.status(200).json({ message: "If that email exists, a reset link has been sent." });
+    if (!user) return res.status(200).json({ message: "user does not exist" });
 
     // Generate a reset token and store it
-    const resetToken = crypto.randomBytes(32).toString('hex');
+    const resetToken = crypto.randomBytes(32).toString("hex");
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    await supabase.from("password_resets").insert([{
-      user_id: user.id,
-      token: resetToken,
-      expires_at: expiresAt,
-      used: false
-    }]);
-
-    // TODO: Send email with reset link: `${config.allowedOrigin}/reset-password?token=${resetToken}`
+    await supabase.from("password_resets").insert([
+      {
+        user_id: user.id,
+        token: resetToken,
+        expires_at: expiresAt,
+        used: false,
+      },
+    ]);
+    const resetLink = `${config.allowedOrigin}/reset-password?token=${resetToken}`;
+    console.log(email);
+    const { data, error } = await resend.emails.send({
+      from: "abhishekgurjar0489@gmail.com",
+      to: email,
+      subject: "Reset Your Password",
+      html: `
+    <h2>Password Reset Request</h2>
+    <p>We received a request to reset your password.</p>
+    <p>
+      <a href="${resetLink}">
+        Reset Password
+      </a>
+    </p>
+    <p>If you didn't request this, you can safely ignore this email.</p>
+  `,
+    });
+    if (error) {
+      console.error("Resend error:", error); // ← this will tell you exactly what's wrong
+      return res.status(500).json({ error: "Failed to send email." });
+    }
     // For now, log it so you can test manually:
-    console.log(`Password reset link: ${config.allowedOrigin}/reset-password?token=${resetToken}`);
+    console.log(
+      `Password reset link: ${config.allowedOrigin}/reset-password?token=${resetToken}`,
+    );
 
-    res.status(200).json({ message: "If that email exists, a reset link has been sent." });
+    res.status(200).json({ message: "a reset link has been sent." });
   } catch (error) {
     console.error("Forgot password error:", error);
     res.status(500).json({ error: "Failed to process request." });
@@ -178,8 +212,14 @@ function storagePathFromUrl(url: string | null | undefined): string | null {
  * Permanently delete a user and associated data (App Store 5.1.1(v) / Google Play).
  */
 async function purgeUserAccount(userId: number): Promise<void> {
-  const { data: decks } = await supabase.from("decks").select("file_url").eq("user_id", userId);
-  const { data: sessions } = await supabase.from("sessions").select("video_url").eq("user_id", userId);
+  const { data: decks } = await supabase
+    .from("decks")
+    .select("file_url")
+    .eq("user_id", userId);
+  const { data: sessions } = await supabase
+    .from("sessions")
+    .select("video_url")
+    .eq("user_id", userId);
 
   const storagePaths = new Set<string>();
   for (const deck of decks || []) {
@@ -207,8 +247,15 @@ async function purgeUserAccount(userId: number): Promise<void> {
   await supabase.from("users").delete().eq("id", userId);
 }
 
-async function verifyUserPassword(userId: number, password: string): Promise<boolean> {
-  const { data: user } = await supabase.from("users").select("password").eq("id", userId).maybeSingle();
+async function verifyUserPassword(
+  userId: number,
+  password: string,
+): Promise<boolean> {
+  const { data: user } = await supabase
+    .from("users")
+    .select("password")
+    .eq("id", userId)
+    .maybeSingle();
   if (!user?.password) return false;
   return bcrypt.compare(password, user.password);
 }
@@ -219,7 +266,9 @@ export const deleteAccount = async (req: Request, res: Response) => {
     const userId = req.user!.id;
     const { password } = req.body;
     if (!password) {
-      return res.status(400).json({ error: "Password is required to delete your account." });
+      return res
+        .status(400)
+        .json({ error: "Password is required to delete your account." });
     }
 
     const valid = await verifyUserPassword(userId, password);
@@ -231,16 +280,23 @@ export const deleteAccount = async (req: Request, res: Response) => {
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account error:", error);
-    res.status(500).json({ error: "Failed to delete account. Please contact support." });
+    res
+      .status(500)
+      .json({ error: "Failed to delete account. Please contact support." });
   }
 };
 
 /** POST /api/auth/delete-account — public web page (Google Play delete URL) */
-export const deleteAccountByCredentials = async (req: Request, res: Response) => {
+export const deleteAccountByCredentials = async (
+  req: Request,
+  res: Response,
+) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
+      return res
+        .status(400)
+        .json({ error: "Email and password are required." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
@@ -263,15 +319,23 @@ export const deleteAccountByCredentials = async (req: Request, res: Response) =>
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account (public) error:", error);
-    res.status(500).json({ error: "Failed to delete account. Please contact support." });
+    res
+      .status(500)
+      .json({ error: "Failed to delete account. Please contact support." });
   }
 };
 
 export const resetPassword = async (req: Request, res: Response) => {
   try {
     const { token, password } = req.body;
-    if (!token || !password) return res.status(400).json({ error: "Token and new password are required." });
-    if (password.length < 6) return res.status(400).json({ error: "Password must be at least 6 characters." });
+    if (!token || !password)
+      return res
+        .status(400)
+        .json({ error: "Token and new password are required." });
+    if (password.length < 6)
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 6 characters." });
 
     const { data: resetRecord } = await supabase
       .from("password_resets")
@@ -280,13 +344,21 @@ export const resetPassword = async (req: Request, res: Response) => {
       .eq("used", false)
       .maybeSingle();
 
-    if (!resetRecord) return res.status(400).json({ error: "Invalid or expired reset token." });
-    if (new Date(resetRecord.expires_at) < new Date()) return res.status(400).json({ error: "Reset token has expired." });
+    if (!resetRecord)
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    if (new Date(resetRecord.expires_at) < new Date())
+      return res.status(400).json({ error: "Reset token has expired." });
 
     const hashedPassword = await bcrypt.hash(password, 12);
 
-    await supabase.from("users").update({ password: hashedPassword }).eq("id", resetRecord.user_id);
-    await supabase.from("password_resets").update({ used: true }).eq("id", resetRecord.id);
+    await supabase
+      .from("users")
+      .update({ password: hashedPassword })
+      .eq("id", resetRecord.user_id);
+    await supabase
+      .from("password_resets")
+      .update({ used: true })
+      .eq("id", resetRecord.id);
 
     res.status(200).json({ message: "Password updated successfully." });
   } catch (error) {
