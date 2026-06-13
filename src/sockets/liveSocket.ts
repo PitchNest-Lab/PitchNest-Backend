@@ -44,6 +44,14 @@ export function initLiveSocket(wss: WebSocketServer) {
     let sessionId = 0;
     let resolvedDeckText = "";
 
+    // ── Verdict phase state ──────────────────────────────────────────────
+    let verdictInProgress = false;
+    let verdictPanelists: { name: string; role: string }[] = [];
+    let verdictCurrentIndex = 0;
+    let verdictTextBuffer = "";
+    let verdictAudioChunks: string[] = [];
+    // ─────────────────────────────────────────────────────────────────────
+
     console.log("✅ Client connected to PitchNest Brain");
 
     if (!config.geminiApiKey) {
@@ -95,7 +103,51 @@ export function initLiveSocket(wss: WebSocketServer) {
             ws.send(JSON.stringify({ type: "stop_audio" }));
           }
 
-          if (response.serverContent?.turnComplete) {
+          // ── Verdict-phase turnComplete: parse all verdicts and finish ──
+          if (response.serverContent?.turnComplete && verdictInProgress) {
+            console.log(`🗳️ Verdict turnComplete. Full text buffer: "${verdictTextBuffer.substring(0, 200)}..."`);
+            
+            // Parse the accumulated text for each panelist's verdict
+            for (const panelist of verdictPanelists) {
+              // Try to find this panelist's section in the response
+              const nameRegex = new RegExp(`${panelist.name}[:\s]`, 'i');
+              let panelistText = verdictTextBuffer; // fallback: use full text
+              
+              // Try to extract just this panelist's portion
+              const nameMatch = verdictTextBuffer.match(new RegExp(`${panelist.name}[:\s](.+?)(?=(?:Marcus|Sarah|Chen)[:\s]|$)`, 'is'));
+              if (nameMatch) {
+                panelistText = nameMatch[1].trim();
+              }
+              
+              const lowerText = panelistText.toLowerCase();
+              let verdict: "invest" | "pass" | "maybe" = "maybe";
+              if (/\b(invest|i'm in|i am in|fund|back this|green light)\b/i.test(lowerText)) {
+                verdict = "invest";
+              } else if (/\b(pass|i'm out|i am out|decline|not invest|no deal|walk away)\b/i.test(lowerText)) {
+                verdict = "pass";
+              }
+
+              console.log(`🗳️ ${panelist.name} verdict: ${verdict}`);
+              ws.send(JSON.stringify({
+                type: "verdict_message",
+                speaker: panelist.name,
+                text: panelistText.substring(0, 300),
+                verdict
+              }));
+            }
+
+            // All verdicts parsed — finish
+            console.log("🗳️ All verdicts complete!");
+            verdictInProgress = false;
+            ws.send(JSON.stringify({ type: "verdict_complete" }));
+            // Close Gemini so AI cannot speak again
+            if (aiWs.readyState === WebSocket.OPEN) {
+              aiWs.close();
+            }
+            return;
+          }
+
+          if (response.serverContent?.turnComplete && !verdictInProgress) {
             ws.send(JSON.stringify({ type: "turn_complete" }));
           }
 
@@ -117,6 +169,10 @@ export function initLiveSocket(wss: WebSocketServer) {
                   const { speaker: detectedSpeaker, text: spokenText } = detectSpeaker(cleanText);
                   if (spokenText) {
                     textToSend += (textToSend ? " " : "") + spokenText;
+                    // Buffer text for verdict detection
+                    if (verdictInProgress) {
+                      verdictTextBuffer += (verdictTextBuffer ? " " : "") + spokenText;
+                    }
                   }
                   if (detectedSpeaker) {
                     speakerToSend = detectedSpeaker;
@@ -127,6 +183,11 @@ export function initLiveSocket(wss: WebSocketServer) {
                 audioToSend = part.inlineData.data;
               }
             });
+
+            // During verdict phase, override speaker with the current panelist
+            if (verdictInProgress && verdictPanelists[verdictCurrentIndex]) {
+              speakerToSend = verdictPanelists[verdictCurrentIndex].name;
+            }
 
             if (audioToSend || textToSend) {
               ws.send(JSON.stringify({
@@ -225,7 +286,45 @@ export function initLiveSocket(wss: WebSocketServer) {
           return;
         }
 
+        // ── Handle verdict_request — sequential per-panelist verdicts ────
+        if (data.type === "verdict_request" && hasSentSetup && !verdictInProgress) {
+          console.log("🗳️ Verdict request received!");
+          verdictInProgress = true;
+          verdictPanelists = Array.isArray(data.personas) && data.personas.length > 0
+            ? data.personas
+            : [{ name: "Marcus", role: "Lead Partner" }, { name: "Sarah", role: "Financial Analyst" }, { name: "Chen", role: "Technical Partner" }];
+          verdictCurrentIndex = 0;
+          verdictTextBuffer = "";
+          verdictAudioChunks = [];
+
+          // Stop idle detection — no nudges during verdicts
+          if (idleCheckInterval) {
+            clearInterval(idleCheckInterval);
+            idleCheckInterval = null;
+          }
+
+          // Prompt ALL panelists at once (Gemini's audio model gives one continuous response)
+          const first = verdictPanelists[0];
+          console.log(`🗳️ Requesting all verdicts...`);
+          if (aiWs.readyState === WebSocket.OPEN) {
+            const panelistNames = verdictPanelists.map(p => `${p.name} (${p.role})`).join(', ');
+            aiWs.send(JSON.stringify({
+              clientContent: {
+                turns: [{ role: "user", parts: [{ text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name, state INVEST or PASS, and give ONE reason in 1-2 sentences. Keep it brief. Start with ${first.name} now.]` }] }],
+                turnComplete: true
+              }
+            }));
+          }
+          return;
+        }
+
         if (data.type === "chat_message" && hasSentSetup) {
+          // Block all chat messages during verdict phase
+          if (verdictInProgress) {
+            console.log("⚠️ Blocked chat_message during verdict phase");
+            return;
+          }
+
           lastUserActivityTime = Date.now();
           hasNudged = false;
 
@@ -345,7 +444,7 @@ export function initLiveSocket(wss: WebSocketServer) {
           return;
         }
 
-        if (aiWs.readyState === WebSocket.OPEN && hasSentSetup) {
+        if (aiWs.readyState === WebSocket.OPEN && hasSentSetup && !verdictInProgress) {
           // Any raw audio/data from the client = user is active
           lastUserActivityTime = Date.now();
           hasNudged = false;

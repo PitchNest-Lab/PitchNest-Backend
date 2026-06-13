@@ -1,7 +1,7 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
-import { evaluatePitch, getMasterPrompt, generatePanelResponse } from "../services/aiService.ts";
+import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse } from "../services/aiService.ts";
 import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
 import crypto from "crypto";
@@ -99,6 +99,7 @@ type QueuedTurn = {
   text: string;
   timeLeft?: number;
   inputMethod?: "voice" | "chat";
+  isVerdict?: boolean;
 };
 
 export function initRestSocket(wss: WebSocketServer) {
@@ -166,73 +167,173 @@ export function initRestSocket(wss: WebSocketServer) {
 
       try {
         const userInput = buildUserTurnInput(turn.text, turn.timeLeft);
-        const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
 
-        conversationHistory.push({ role: "user", text: userInput });
-        conversationHistory.push({ role: "assistant", text: aiResponse });
+        if (turn.isVerdict) {
+          const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
+          conversationHistory.push({ role: "user", text: userInput });
+          conversationHistory.push({ role: "assistant", text: aiResponse });
 
-        const { speaker, spokenText } = parseSpeakerResponse(aiResponse, isCoachMode);
+          const { spokenText } = parseSpeakerResponse(aiResponse, isCoachMode);
 
-        if (!spokenText.trim()) {
-          sendJson(ws, { type: "turn_complete" });
-          return;
-        }
+          // In verdict mode, we need to extract each panelist's verdict and send them sequentially
+          const panelists = ["Marcus", "Sarah", "Chen"];
+          for (const pName of panelists) {
+            let panelistText = spokenText;
+            const nameMatch = spokenText.match(new RegExp(`${pName}[:\\s](.+?)(?=(?:Marcus|Sarah|Chen)[:\\s]|$)`, 'is'));
+            if (nameMatch) {
+              panelistText = nameMatch[1].trim();
+            }
 
-        fullTranscript.push({ type: "model", speaker, text: spokenText });
+            const lowerText = panelistText.toLowerCase();
+            let verdictVerdict: "invest" | "pass" | "maybe" = "maybe";
+            if (/\b(invest|i'm in|i am in|fund|back this|green light)\b/i.test(lowerText)) {
+              verdictVerdict = "invest";
+            } else if (/\b(pass|i'm out|i am out|decline|not invest|no deal|walk away)\b/i.test(lowerText)) {
+              verdictVerdict = "pass";
+            }
 
-        if (!isTtsConfigured()) {
-          sendJson(ws, {
-            type: "transcript",
-            text: spokenText,
-            speaker,
-          });
-          sendJson(ws, { type: "turn_complete" });
-          return;
-        }
-
-        const voiceName = resolveVoiceName(speaker);
-        const chunks = splitIntoSpokenChunks(spokenText);
-
-        if (chunks.length === 0) {
-          sendJson(ws, { type: "turn_complete" });
-          return;
-        }
-
-        let ttsFailed = false;
-
-        for (const chunk of chunks) {
-          try {
-            const buf = await synthesizeSpeech(chunk, voiceName);
-            const base64Audio = Buffer.from(buf).toString("base64");
+            // Send verdict text to UI
             sendJson(ws, {
-              type: "audio",
-              data: base64Audio,
-              text: chunk,
-              speaker,
+              type: "verdict_message",
+              speaker: pName,
+              text: panelistText.substring(0, 300),
+              verdict: verdictVerdict
             });
-          } catch (ttsErr: any) {
-            ttsFailed = true;
-            console.error("❌ TTS failed:", ttsErr.message);
-            sendJson(ws, {
-              type: "error",
-              message: `Voice synthesis failed: ${ttsErr.message}`,
-              code: "TTS_FAILED",
-              recoverable: true,
-            });
-            break;
+
+            // Synthesize audio for this panelist's verdict
+            if (isTtsConfigured() && panelistText.trim()) {
+               try {
+                 const vName = resolveVoiceName(pName);
+                 const buf = await synthesizeSpeech(panelistText, vName);
+                 const base64Audio = Buffer.from(buf).toString("base64");
+                 sendJson(ws, {
+                   type: "audio",
+                   data: base64Audio,
+                   text: panelistText,
+                   speaker: pName,
+                 });
+               } catch(e) {
+                 console.error("Verdict TTS error:", e);
+               }
+            }
+          }
+          sendJson(ws, { type: "verdict_complete" });
+          return;
+        }
+
+        // ── TURBO-STREAMING PIPELINE FOR STANDARD TURNS ──
+        let currentSentenceBuffer = "";
+        let isFirstChunk = true;
+        let activeSpeaker = isCoachMode ? "Riley" : "Marcus";
+        let activeVoiceName = resolveVoiceName(activeSpeaker);
+        let fullSpokenText = "";
+        let chunksProcessed = 0;
+        let ttsPromiseChain = Promise.resolve();
+
+        const stream = streamPanelResponse(userInput, conversationHistory, masterPrompt);
+
+        for await (const token of stream) {
+          currentSentenceBuffer += token;
+
+          // 1. On the very first burst, extract the speaker identity if it exists
+          if (isFirstChunk && currentSentenceBuffer.length > 5) {
+            const colonIndex = currentSentenceBuffer.indexOf(":");
+            if (colonIndex !== -1 && colonIndex < 24) {
+              const candidate = currentSentenceBuffer.substring(0, colonIndex).trim();
+              if (/^[A-Za-z][A-Za-z\s'-]{0,20}$/.test(candidate)) {
+                activeSpeaker = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
+                activeVoiceName = resolveVoiceName(activeSpeaker);
+                // Strip the prefix
+                currentSentenceBuffer = currentSentenceBuffer.substring(colonIndex + 1).trimStart();
+              }
+              isFirstChunk = false;
+            } else if (currentSentenceBuffer.length > 25) {
+               // Give up on finding a colon if text gets too long
+               isFirstChunk = false;
+            }
+          }
+
+          // 2. Look for sentence boundaries to chunk audio seamlessly
+          const boundaryMatch = currentSentenceBuffer.match(/([.!?]+[\"']?(?:\s+|\n+))/);
+          if (!isFirstChunk && boundaryMatch) {
+             const boundaryIndex = boundaryMatch.index! + boundaryMatch[0].length;
+             const sentence = currentSentenceBuffer.substring(0, boundaryIndex).trim();
+             currentSentenceBuffer = currentSentenceBuffer.substring(boundaryIndex).trimStart();
+
+             if (sentence.length > 0) {
+               const cleanSentence = sanitizeAiSpeech(sentence) || sentence;
+               fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
+               chunksProcessed++;
+
+               if (isTtsConfigured()) {
+                 const currentVoice = activeVoiceName; 
+                 const currentText = cleanSentence;
+                 const currentSpeaker = activeSpeaker;
+                 
+                 // Chain TTS calls so audio chunks are always sent in the exact correct order
+                 ttsPromiseChain = ttsPromiseChain.then(async () => {
+                   try {
+                     const buf = await synthesizeSpeech(currentText, currentVoice);
+                     const base64Audio = Buffer.from(buf).toString("base64");
+                     sendJson(ws, {
+                       type: "audio",
+                       data: base64Audio,
+                       text: currentText,
+                       speaker: currentSpeaker,
+                     });
+                   } catch(e) {
+                     console.error("TTS Stream Error:", e);
+                   }
+                 });
+               } else {
+                 sendJson(ws, {
+                   type: "transcript",
+                   text: cleanSentence,
+                   speaker: activeSpeaker,
+                 });
+               }
+             }
           }
         }
 
-        if (ttsFailed) {
-          console.warn("⚠️ Continuing session without audio for this turn");
-          sendJson(ws, {
-            type: "transcript",
-            text: spokenText,
-            speaker,
-          });
+        // 3. Process the final remaining chunk in the buffer
+        if (currentSentenceBuffer.trim().length > 0) {
+           const finalSentence = currentSentenceBuffer.trim();
+           const cleanSentence = sanitizeAiSpeech(finalSentence) || finalSentence;
+           fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
+           chunksProcessed++;
+
+           if (isTtsConfigured()) {
+             ttsPromiseChain = ttsPromiseChain.then(async () => {
+               try {
+                 const buf = await synthesizeSpeech(cleanSentence, activeVoiceName);
+                 const base64Audio = Buffer.from(buf).toString("base64");
+                 sendJson(ws, {
+                   type: "audio",
+                   data: base64Audio,
+                   text: cleanSentence,
+                   speaker: activeSpeaker,
+                 });
+               } catch(e) {
+                 console.error("Final TTS Error:", e);
+               }
+             });
+           } else {
+             sendJson(ws, { type: "transcript", text: cleanSentence, speaker: activeSpeaker });
+           }
         }
 
-        sendJson(ws, { type: "turn_complete", audioChunks: chunks.length });
+        // 4. Wait for the sequential TTS delivery pipeline to completely finish
+        await ttsPromiseChain;
+
+        // 5. Update histories
+        conversationHistory.push({ role: "user", text: userInput });
+        conversationHistory.push({ role: "assistant", text: fullSpokenText });
+        if (fullSpokenText.trim()) {
+           fullTranscript.push({ type: "model", speaker: activeSpeaker, text: fullSpokenText });
+        }
+
+        sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
       } catch (err: any) {
         console.error("❌ Error generating AI response:", err);
         sendJson(ws, {
@@ -346,6 +447,22 @@ export function initRestSocket(wss: WebSocketServer) {
             text: data.text,
             timeLeft: typeof data.timeLeft === "number" ? data.timeLeft : undefined,
             inputMethod,
+          });
+          return;
+        }
+
+        if (data.type === "verdict_request") {
+          console.log("🗳️ Verdict requested by user.");
+          const panelists = data.panelists || [
+            { name: "Marcus", role: "Lead Investor" },
+            { name: "Sarah", role: "Financial Analyst" },
+            { name: "Chen", role: "Technical Partner" }
+          ];
+          const panelistNames = panelists.map((p: any) => `${p.name} (${p.role})`).join(', ');
+
+          enqueueTurn({
+            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name, state INVEST or PASS, and give ONE reason in 1-2 sentences. Keep it brief. Do not ask any more questions. Start now.]`,
+            isVerdict: true
           });
           return;
         }

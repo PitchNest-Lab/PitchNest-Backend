@@ -225,9 +225,24 @@ VALIDATION & FACT-CHECKING RULES:
 - **Fact-Checking**: Use your internal knowledge to verify their market sizes, growth rates, and technical feasibility. If their numbers are wildly inaccurate or physically impossible, challenge them aggressively.
 
 SESSION FLOW:
-1. OPENING: Marcus welcomes and invites the pitch.
-2. CONVERSATION & Q&A: React naturally to what the founder says. If they ask a question, answer it. If they are pitching, listen and ask a focused follow-up question. Feel free to rotate speakers (Marcus, Sarah, Chen) to keep the panel dynamic. Reference specific deck claims when challenging answers.
-3. CONCLUSION: If the system explicitly states that time is up or the session is ending, immediately conclude the pitch. Deliver a clear, spoken final verdict on behalf of the panel. Explicitly state whether you "accept the idea", "reject the idea", or "recommend improvements". Briefly give your primary reasons.`;
+1. OPENING: Marcus welcomes and invites the pitch. Keep it to 1-2 sentences.
+2. LISTENING: When the founder is presenting their pitch, DO NOT interrupt. Let them finish their thought before asking questions.
+3. STRUCTURED Q&A: After the founder speaks, follow these rules strictly:
+   a. ASK ONE QUESTION AT A TIME. Wait for the founder to respond before asking the next question.
+   b. FOLLOW UP on the same topic if their answer is weak, unclear, or incomplete. Say something like "That doesn't fully address my concern" or "Can you be more specific about the numbers?"
+   c. If the founder gives a WRONG or WEAK response, point it out directly. Example: "That CAC number doesn't add up with your stated LTV" or "You said no competitors, but Stripe already does this."
+   d. If the founder does NOT answer or stays silent, gently remind them: "We're still waiting on that answer — this is a critical point that investors will ask about."
+   e. Only move to a NEW topic after the current topic has been adequately addressed.
+4. TOPIC FLOW: Follow a logical investor evaluation order:
+   - First: Problem and solution (What are you building? Why does it matter?)
+   - Then: Market size and opportunity (TAM/SAM/SOM)
+   - Then: Business model and unit economics (How do you make money?)
+   - Then: Traction and metrics (What have you achieved so far?)
+   - Then: Team and competitive advantage (Why you? What's your moat?)
+   - Finally: Ask and use of funds (How much are you raising? What will you do with it?)
+   Do NOT jump randomly between unrelated topics. The conversation should feel like a natural, guided evaluation.
+5. SPEAKER COORDINATION: When rotating speakers, the new speaker should build on what was just discussed, not start a completely new topic. For example, if Marcus just asked about revenue, Sarah might follow up with "And what are your margins on that?"
+6. CONCLUSION: If the system explicitly states that time is up or the session is ending, immediately stop asking questions and conclude.`;
 }
 
 import { OpenAI, AzureOpenAI } from "openai";
@@ -354,6 +369,46 @@ export async function generatePanelResponse(
     return response.choices[0]?.message?.content || "";
   } catch (err: any) {
     console.error("❌ OpenAI Panel Response Error:", err.message);
+    throw err;
+  }
+}
+
+/**
+ * Calls OpenAI API to generate the next turn via a streaming generator.
+ */
+export async function* streamPanelResponse(
+  userInput: string,
+  history: any[],
+  systemInstruction: string
+): AsyncGenerator<string, void, unknown> {
+  const openai = getOpenAIClient();
+  
+  const messages: any[] = [
+    { role: "system", content: systemInstruction },
+    ...history.map(m => ({
+      role: m.role === "assistant" ? "assistant" : "user",
+      content: m.text
+    })),
+    { role: "user", content: userInput }
+  ];
+
+  try {
+    const stream = await openai.chat.completions.create({
+      model: config.azureOpenAiDeployment || "gpt-4o",
+      messages: messages,
+      temperature: 0.7,
+      max_tokens: 320,
+      stream: true,
+    });
+
+    for await (const chunk of stream) {
+      const text = chunk.choices[0]?.delta?.content || "";
+      if (text) {
+        yield text;
+      }
+    }
+  } catch (err: any) {
+    console.error("❌ OpenAI Panel Streaming Error:", err.message);
     throw err;
   }
 }
