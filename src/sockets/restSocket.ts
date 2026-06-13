@@ -124,6 +124,7 @@ export function initRestSocket(wss: WebSocketServer) {
     let idleCheckInterval: ReturnType<typeof setInterval> | null = null;
     let sessionStartTimestamp = Date.now();
     let initialDurationSeconds = 15 * 60;
+    let sessionEnded = false;
 
     console.log("✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)");
 
@@ -370,6 +371,10 @@ export function initRestSocket(wss: WebSocketServer) {
       try {
         const data = JSON.parse(message.toString());
 
+        if (sessionEnded && data.type !== "set_video_url") {
+          return;
+        }
+
         if (data.type === "set_video_url") {
           currentVideoUrl = data.url;
           if (sessionId && config.supabaseUrl && config.supabaseAnonKey) {
@@ -468,6 +473,12 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "end_session") {
+          if (sessionEnded) return;
+          sessionEnded = true;
+          if (idleCheckInterval) {
+            clearInterval(idleCheckInterval);
+            idleCheckInterval = null;
+          }
           console.log("🏁 Session ended, starting evaluation...");
           const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : fullTranscript;
           const durationSec = Number(data.duration) || 0;
