@@ -324,6 +324,11 @@ export function initLiveSocket(wss: WebSocketServer) {
             console.log("⚠️ Blocked chat_message during verdict phase");
             return;
           }
+          // Do not send voice transcripts as text turns to Gemini (already sent via PCM audio stream)
+          if (data.inputMethod === "voice") {
+            console.log("🎙️ Skipping forwarding of voice transcript to Gemini (audio handles this)");
+            return;
+          }
 
           lastUserActivityTime = Date.now();
           hasNudged = false;
