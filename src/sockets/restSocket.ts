@@ -100,6 +100,9 @@ type QueuedTurn = {
   timeLeft?: number;
   inputMethod?: "voice" | "chat";
   isVerdict?: boolean;
+  isGreeting?: boolean;
+  isNudge?: boolean;
+  panelists?: any[];
 };
 
 export function initRestSocket(wss: WebSocketServer) {
@@ -169,21 +172,63 @@ export function initRestSocket(wss: WebSocketServer) {
       try {
         const userInput = buildUserTurnInput(turn.text, turn.timeLeft);
 
+        if (turn.isGreeting) {
+          const isCoach = isCoachMode;
+          const speaker = isCoach ? "Riley" : "Marcus";
+          const greetingText = isCoach 
+            ? `Hi there, I'm Riley, your pitch coach. I'm ready when you are. Let's hear your pitch for ${currentBusinessName}.`
+            : `Welcome to PitchNest. We're excited to hear about ${currentBusinessName}. Whenever you're ready, please go ahead with your opening pitch.`;
+
+          conversationHistory.push({ role: "assistant", text: greetingText });
+          fullTranscript.push({ type: "model", speaker, text: greetingText });
+          
+          if (isTtsConfigured()) {
+            try {
+              const vName = resolveVoiceName(speaker);
+              const buf = await synthesizeSpeech(greetingText, vName);
+              const base64Audio = Buffer.from(buf).toString("base64");
+              sendJson(ws, {
+                type: "audio",
+                data: base64Audio,
+                text: greetingText,
+                speaker: speaker,
+              });
+            } catch(e) {
+               console.error("Greeting TTS error:", e);
+               sendJson(ws, { type: "transcript", text: greetingText, speaker });
+            }
+          } else {
+             sendJson(ws, { type: "transcript", text: greetingText, speaker });
+          }
+          sendJson(ws, { type: "turn_complete", audioChunks: 1 });
+          return;
+        }
+
         if (turn.isVerdict) {
           const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
           conversationHistory.push({ role: "user", text: userInput });
           conversationHistory.push({ role: "assistant", text: aiResponse });
 
-          const { spokenText } = parseSpeakerResponse(aiResponse, isCoachMode);
+          const panelists = turn.panelists || [{name: "Marcus"}, {name: "Sarah"}, {name: "Chen"}];
+          const panelistNames = panelists.map((p: any) => p.name);
 
           // In verdict mode, we need to extract each panelist's verdict and send them sequentially
-          const panelists = ["Marcus", "Sarah", "Chen"];
-          for (const pName of panelists) {
-            let panelistText = spokenText;
-            const nameMatch = spokenText.match(new RegExp(`${pName}[:\\s](.+?)(?=(?:Marcus|Sarah|Chen)[:\\s]|$)`, 'is'));
+          for (const pName of panelistNames) {
+            let panelistText = "";
+            const nameRegex = new RegExp(`${pName}[:\\s]+(.+?)(?=(?:${panelistNames.join('|')})[:\\s]|$)`, 'is');
+            const nameMatch = aiResponse.match(nameRegex);
+            
             if (nameMatch) {
               panelistText = nameMatch[1].trim();
+            } else {
+               if (panelists.length === 1) {
+                  panelistText = aiResponse.replace(/^(Riley|Marcus|Coach)[\s:]+/i, '').trim();
+               } else {
+                  continue;
+               }
             }
+
+            panelistText = sanitizeAiSpeech(panelistText) || panelistText;
 
             const lowerText = panelistText.toLowerCase();
             let verdictVerdict: "invest" | "pass" | "maybe" = "maybe";
@@ -207,10 +252,10 @@ export function initRestSocket(wss: WebSocketServer) {
                  const vName = resolveVoiceName(pName);
                  const buf = await synthesizeSpeech(panelistText, vName);
                  const base64Audio = Buffer.from(buf).toString("base64");
+                 // DO NOT pass `text: panelistText` here to avoid duplicating the verdict message!
                  sendJson(ws, {
                    type: "audio",
                    data: base64Audio,
-                   text: panelistText,
                    speaker: pName,
                  });
                } catch(e) {
@@ -400,7 +445,7 @@ export function initRestSocket(wss: WebSocketServer) {
           masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
 
           console.log("🟢 Setup complete — triggering pitch introduction...");
-          enqueueTurn({ text: "I'm ready. Welcome me and invite my opening pitch." });
+          enqueueTurn({ text: "", isGreeting: true });
 
           // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
           lastUserActivityTime = Date.now();
@@ -410,8 +455,8 @@ export function initRestSocket(wss: WebSocketServer) {
 
           idleCheckInterval = setInterval(() => {
             const idleMs = Date.now() - lastUserActivityTime;
-            const NUDGE_THRESHOLD = 35 * 1000;      // 35 seconds
-            const END_THRESHOLD = 3 * 60 * 1000;     // 3 minutes
+            const NUDGE_THRESHOLD = 60 * 1000;      // 60 seconds
+            const END_THRESHOLD = 5 * 60 * 1000;     // 5 minutes
 
             const elapsedSeconds = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
             const timeLeftSeconds = Math.max(0, initialDurationSeconds - elapsedSeconds);
@@ -419,18 +464,19 @@ export function initRestSocket(wss: WebSocketServer) {
             const secs = timeLeftSeconds % 60;
 
             if (idleMs >= END_THRESHOLD) {
-              console.log("⏱️ User idle for 3+ minutes. Auto-ending session.");
+              console.log("⏱️ User idle for 5+ minutes. Auto-ending session.");
               sendJson(ws, {
                 type: "idle_end",
-                message: "Session ended due to inactivity. The panel noticed you've been silent for over 3 minutes."
+                message: "Session ended due to inactivity. The panel noticed you've been silent for over 5 minutes."
               });
               if (idleCheckInterval) clearInterval(idleCheckInterval);
             } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
               hasNudged = true;
-              console.log("⏱️ User idle for 35+ seconds. Sending AI nudge with time context.");
+              console.log("⏱️ User idle for 60+ seconds. Sending AI nudge with time context.");
               enqueueTurn({
-                text: `[SYSTEM: The founder has been silent for 35 seconds. Pitch time remaining is ${mins} minutes and ${secs} seconds. Gently nudge them to continue their pitch, ask if they need help, or ask a specific follow-up question based on their pitch deck. Keep it conversational.]`,
-                inputMethod: "chat"
+                text: `[SYSTEM: The founder has been silent for 60 seconds. Pitch time remaining is ${mins} minutes and ${secs} seconds. Gently nudge them to continue their pitch, ask if they need help, or ask a specific follow-up question based on their pitch deck. Keep it conversational.]`,
+                inputMethod: "chat",
+                isNudge: true
               });
             }
           }, 5000);
@@ -438,9 +484,22 @@ export function initRestSocket(wss: WebSocketServer) {
           return;
         }
 
+        if (data.type === "heartbeat") {
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
+          return;
+        }
+
         if (data.type === "chat_message" && hasSentSetup) {
           lastUserActivityTime = Date.now();
           hasNudged = false;
+
+          // Clear any pending nudges from the queue so they don't pile up!
+          for (let i = turnQueue.length - 1; i >= 0; i--) {
+            if (turnQueue[i].isNudge) {
+              turnQueue.splice(i, 1);
+            }
+          }
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
           fullTranscript.push({
@@ -458,6 +517,10 @@ export function initRestSocket(wss: WebSocketServer) {
 
         if (data.type === "verdict_request") {
           console.log("🗳️ Verdict requested by user.");
+          if (idleCheckInterval) {
+            clearInterval(idleCheckInterval);
+            idleCheckInterval = null;
+          }
           const panelists = data.panelists || [
             { name: "Marcus", role: "Lead Investor" },
             { name: "Sarah", role: "Financial Analyst" },
@@ -467,7 +530,8 @@ export function initRestSocket(wss: WebSocketServer) {
 
           enqueueTurn({
             text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name, state INVEST or PASS, and give ONE reason in 1-2 sentences. Keep it brief. Do not ask any more questions. Start now.]`,
-            isVerdict: true
+            isVerdict: true,
+            panelists: panelists
           });
           return;
         }
