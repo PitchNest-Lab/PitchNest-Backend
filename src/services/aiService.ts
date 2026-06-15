@@ -81,8 +81,9 @@ const DECK_TEXT_LIMIT = 8000;
 const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
-- Keep each turn to 1-2 short, conversational sentences. Shorter responses speed up panel generation and audio delivery. One question per turn.
-- Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly (not in every turn) to make the panel feel like they are thinking live.
+- CRITICAL: Keep each turn to 1-2 short, conversational sentences MAXIMUM. One single question per turn.
+- CRITICAL FORMATTING: You MUST speak as EXACTLY ONE person per turn. DO NOT include multiple people talking in the same response. STOP GENERATING after your chosen panelist has spoken.
+- Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly.
 - Be aware of the remaining pitch time metadata (e.g., \`[PITCH TIME REMAINING: ...]\`). Do not start complex new topics when less than 2 minutes remain; instead, guide the founder to summarize, handle final remarks, or conclude.`;
 
 function buildDeckContext(deckName: string, extractedDeckText: string): string {
@@ -213,7 +214,7 @@ PANEL VOICES:
 
 SPEAKER RULES:
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
-- Only one panelist speaks per turn. Never write multiple speakers in one response.
+- CRITICAL: ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their 1 question, STOP IMMEDIATELY.
 - Rotate naturally between Marcus, Sarah, and Chen across the session — do not let one person dominate.
 - Do not add any extra text or stage directions.
 - Marcus usually leads the opening, but if the founder specifically asks for someone else (like Sarah or Chen), that panelist should respond immediately.

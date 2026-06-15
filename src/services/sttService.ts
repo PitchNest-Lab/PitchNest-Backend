@@ -17,6 +17,7 @@ export interface StreamingRecognizer {
  */
 export function createStreamingRecognizer(
   onFinalText: (text: string) => void,
+  onPartialText?: (text: string) => void,
 ): StreamingRecognizer | null {
   if (!hasAzureSttConfig()) {
     console.warn("[stt] Azure Speech not configured — server STT disabled");
@@ -39,6 +40,15 @@ export function createStreamingRecognizer(
   const audioConfig = sdk.AudioConfig.fromStreamInput(pushStream);
 
   const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+  recognizer.recognizing = (_s, e) => {
+    if (e.result.reason === sdk.ResultReason.RecognizingSpeech) {
+      const text = e.result.text?.trim();
+      if (text && onPartialText) {
+        onPartialText(text);
+      }
+    }
+  };
 
   recognizer.recognized = (_s, e) => {
     if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {

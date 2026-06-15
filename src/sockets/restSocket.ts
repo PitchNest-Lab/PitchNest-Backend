@@ -466,8 +466,18 @@ export function initRestSocket(wss: WebSocketServer) {
                 inputMethod: "voice",
               });
 
-              enqueueTurn({ text, inputMethod: "voice" });
-            });
+                enqueueTurn({ text, inputMethod: "voice" });
+              },
+              (partialText) => {
+                if (sessionEnded) return;
+                const now = Date.now();
+                // Avoid spamming stop_audio too fast
+                if (now - (sttRecognizer as any)._lastInterruption > 2000 || !(sttRecognizer as any)._lastInterruption) {
+                  (sttRecognizer as any)._lastInterruption = now;
+                  sendJson(ws, { type: "stop_audio" });
+                }
+              }
+            );
           } else {
             console.warn("[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled");
           }
