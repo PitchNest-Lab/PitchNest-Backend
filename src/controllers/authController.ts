@@ -169,7 +169,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
     const resetLink = `${config.allowedOrigin}/reset-password?token=${resetToken}`;
     console.log(email);
     const { data, error } = await resend.emails.send({
-      from: "abhishekgurjar0489@gmail.com",
+      from: "pitchnestapp@gmail.com",
       to: email,
       subject: "Reset Your Password",
       html: `
