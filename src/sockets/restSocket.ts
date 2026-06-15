@@ -1,7 +1,7 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
-import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse } from "../services/aiService.ts";
+import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse, summarizeVoiceInput } from "../services/aiService.ts";
 import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
 import { createStreamingRecognizer, hasAzureSttConfig, StreamingRecognizer } from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
@@ -175,37 +175,7 @@ export function initRestSocket(wss: WebSocketServer) {
       try {
         const userInput = buildUserTurnInput(turn.text, turn.timeLeft);
 
-        if (turn.isGreeting) {
-          const isCoach = isCoachMode;
-          const speaker = isCoach ? "Riley" : "Marcus";
-          const greetingText = isCoach 
-            ? `Hi there, I'm Riley, your pitch coach. I'm ready when you are. Let's hear your pitch for ${currentBusinessName}.`
-            : `Welcome to PitchNest. We're excited to hear about ${currentBusinessName}. Whenever you're ready, please go ahead with your opening pitch.`;
-
-          conversationHistory.push({ role: "assistant", text: greetingText });
-          fullTranscript.push({ type: "model", speaker, text: greetingText });
-          
-          if (isTtsConfigured()) {
-            try {
-              const vName = resolveVoiceName(speaker);
-              const buf = await synthesizeSpeech(greetingText, vName);
-              const base64Audio = Buffer.from(buf).toString("base64");
-              sendJson(ws, {
-                type: "audio",
-                data: base64Audio,
-                text: greetingText,
-                speaker: speaker,
-              });
-            } catch(e) {
-               console.error("Greeting TTS error:", e);
-               sendJson(ws, { type: "transcript", text: greetingText, speaker });
-            }
-          } else {
-             sendJson(ws, { type: "transcript", text: greetingText, speaker });
-          }
-          sendJson(ws, { type: "turn_complete", audioChunks: 1 });
-          return;
-        }
+        // Removed hardcoded greeting block to let it fall through to streaming pipeline
 
         if (turn.isVerdict) {
           const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
@@ -279,7 +249,17 @@ export function initRestSocket(wss: WebSocketServer) {
         let chunksProcessed = 0;
         let ttsPromiseChain = Promise.resolve();
 
-        const stream = streamPanelResponse(userInput, conversationHistory, masterPrompt);
+        let promptToUse = masterPrompt;
+        let userInputToUse = userInput;
+
+        if (turn.isGreeting) {
+          promptToUse = isCoachMode
+            ? `IDENTITY: Riley — elite startup pitch coach.\nRULES: Warmly welcome the founder to pitch ${currentBusinessName}. Keep it strictly to 1 short conversational sentence. MUST prefix your response with "Riley: ".`
+            : `IDENTITY: Marcus — Lead VC Partner.\nRULES: Warmly welcome the founder to PitchNest and invite them to pitch ${currentBusinessName}. Keep it strictly to 1 short conversational sentence. MUST prefix your response with "Marcus: ".`;
+          userInputToUse = "Hello, I am ready.";
+        }
+
+        const stream = streamPanelResponse(userInputToUse, turn.isGreeting ? [] : conversationHistory, promptToUse);
 
         for await (const token of stream) {
           currentSentenceBuffer += token;
@@ -376,7 +356,9 @@ export function initRestSocket(wss: WebSocketServer) {
         await ttsPromiseChain;
 
         // 5. Update histories
-        conversationHistory.push({ role: "user", text: userInput });
+        if (!turn.isGreeting) {
+          conversationHistory.push({ role: "user", text: userInput });
+        }
         conversationHistory.push({ role: "assistant", text: fullSpokenText });
         if (fullSpokenText.trim()) {
            fullTranscript.push({ type: "model", speaker: activeSpeaker, text: fullSpokenText });
@@ -442,10 +424,14 @@ export function initRestSocket(wss: WebSocketServer) {
           currentUserId = clientConfig.userId || null;
           isCoachMode = clientConfig.mode === "coach";
 
-          resolvedDeckText = await resolveDeckText(clientConfig);
-          const enrichedConfig = { ...clientConfig, resolvedDeckText };
+          console.log("🟢 Setup complete — triggering pitch introduction...");
+          enqueueTurn({ text: "", isGreeting: true });
 
-          masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
+          resolveDeckText(clientConfig).then(text => {
+            resolvedDeckText = text;
+            const enrichedConfig = { ...clientConfig, resolvedDeckText };
+            masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
+          }).catch(err => console.error("Error resolving deck text:", err));
 
           if (hasAzureSttConfig()) {
             sttRecognizer = createStreamingRecognizer((text) => {
@@ -458,15 +444,17 @@ export function initRestSocket(wss: WebSocketServer) {
                 if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
               }
 
-              fullTranscript.push({ type: "user", text, inputMethod: "voice" });
-              sendJson(ws, {
-                type: "chat_message",
-                speaker: "user",
-                text,
-                inputMethod: "voice",
-              });
+              enqueueTurn({ text, inputMethod: "voice" });
 
-                enqueueTurn({ text, inputMethod: "voice" });
+              summarizeVoiceInput(text).then(summary => {
+                fullTranscript.push({ type: "user", text: summary, inputMethod: "voice", fullText: text });
+                sendJson(ws, {
+                  type: "chat_message",
+                  speaker: "user",
+                  text: summary,
+                  inputMethod: "voice",
+                });
+              }).catch(err => console.error("Summarization error:", err));
               },
               (partialText) => {
                 if (sessionEnded) return;
@@ -482,8 +470,7 @@ export function initRestSocket(wss: WebSocketServer) {
             console.warn("[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled");
           }
 
-          console.log("🟢 Setup complete — triggering pitch introduction...");
-          enqueueTurn({ text: "", isGreeting: true });
+          // Removed redundant enqueueTurn since it's now handled at the top of client_ready
 
           // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
           lastUserActivityTime = Date.now();
@@ -552,16 +539,35 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
-          fullTranscript.push({
-            type: "user",
-            text: data.text,
-            inputMethod,
-          });
+          
           enqueueTurn({
             text: data.text,
             timeLeft: typeof data.timeLeft === "number" ? data.timeLeft : undefined,
             inputMethod,
           });
+
+          if (inputMethod === "voice") {
+            summarizeVoiceInput(data.text).then(summary => {
+              fullTranscript.push({
+                type: "user",
+                text: summary,
+                inputMethod,
+                fullText: data.text
+              });
+              sendJson(ws, {
+                type: "chat_message",
+                speaker: "user",
+                text: summary,
+                inputMethod,
+              });
+            }).catch(err => console.error("Summarization error:", err));
+          } else {
+            fullTranscript.push({
+              type: "user",
+              text: data.text,
+              inputMethod,
+            });
+          }
           return;
         }
 
@@ -620,25 +626,19 @@ export function initRestSocket(wss: WebSocketServer) {
             0,
           );
 
-          if (shouldRunEvaluation(userTurns, totalUserTextLength, durationSec)) {
-            try {
-              const evaluated = await evaluatePitch(
-                frontendTranscript,
-                currentBusinessName,
-                resolvedDeckText,
-              );
-              reportData = { ...reportData, ...evaluated, evaluationStatus: "complete" };
-              console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
-            } catch (evalErr) {
-              console.error("❌ Evaluation failed:", evalErr);
-              reportData.evaluationStatus = "failed";
-              reportData.summary =
-                "We could not generate a full evaluation right now. Your session was saved — try again or contact support if this persists.";
-            }
-          } else {
-            console.log(
-              `⚠️ Evaluation skipped: ${totalUserTextLength} chars, ${durationSec}s duration`,
+          try {
+            const evaluated = await evaluatePitch(
+              frontendTranscript,
+              currentBusinessName,
+              resolvedDeckText,
             );
+            reportData = { ...reportData, ...evaluated, evaluationStatus: "complete" };
+            console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
+          } catch (evalErr) {
+            console.error("❌ Evaluation failed:", evalErr);
+            reportData.evaluationStatus = "failed";
+            reportData.summary =
+              "We could not generate a full evaluation right now. Your session was saved — try again or contact support if this persists.";
           }
 
           sessionId = 0;

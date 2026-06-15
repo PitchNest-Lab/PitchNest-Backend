@@ -290,6 +290,7 @@ ${transcriptText}
 
 EVALUATION RULES:
 - Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
+- IF THE FOUNDER WAS SILENT OR THE PITCH WAS TOO SHORT: Do not error out. Instead, provide low/fitting scores (e.g., 0-10) and use the summary to friendly critique the lack of material (e.g., "The system was listening, but you were mostly silent. Provide more detail next time.")
 - delivery = vocal confidence, pacing, conviction, handling pressure.
 - clarity = problem/solution narrative, structure, jargon control.
 - scalability = market size, growth model, unit economics, GTM scalability.
@@ -371,6 +372,27 @@ export async function generatePanelResponse(
   } catch (err: any) {
     console.error("❌ OpenAI Panel Response Error:", err.message);
     throw err;
+  }
+}
+
+/**
+ * Summarizes long voice input into a short sentence.
+ */
+export async function summarizeVoiceInput(text: string): Promise<string> {
+  const openai = getOpenAIClient();
+  const prompt = `Summarize the following user voice input into a single, concise sentence (maximum 15 words). Maintain the user's core intent or question. If it's already short, just return it as is.\n\nInput: ${text}`;
+  
+  try {
+    const response = await openai.chat.completions.create({
+      model: config.azureOpenAiDeployment || "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      max_tokens: 40,
+    });
+    return response.choices[0]?.message?.content?.trim() || text;
+  } catch (err) {
+    console.error("Voice summarization failed:", err);
+    return text;
   }
 }
 

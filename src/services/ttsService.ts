@@ -22,7 +22,10 @@ export function resolveVoiceName(speaker: string): string {
 
 const SYNTHESIS_TIMEOUT_MS = 25_000;
 
-function createSpeechConfig(): sdk.SpeechConfig {
+let cachedSpeechConfig: sdk.SpeechConfig | null = null;
+
+function getSpeechConfig(): sdk.SpeechConfig {
+  if (cachedSpeechConfig) return cachedSpeechConfig;
   if (!config.azureSpeechKey || !config.azureSpeechRegion) {
     throw new Error("Azure Speech Key or Region is missing. Set AZURE_SPEECH_KEY and AZURE_SPEECH_REGION.");
   }
@@ -33,6 +36,7 @@ function createSpeechConfig(): sdk.SpeechConfig {
   );
   speechConfig.speechSynthesisOutputFormat =
     sdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm;
+  cachedSpeechConfig = speechConfig;
   return speechConfig;
 }
 
@@ -85,7 +89,7 @@ export async function synthesizeSpeech(text: string, voiceName: string): Promise
 
   const runSynthesis = (useSsml: boolean) =>
     new Promise<ArrayBuffer>((resolve, reject) => {
-      const speechConfig = createSpeechConfig();
+      const speechConfig = getSpeechConfig();
       const synthesizer = new sdk.SpeechSynthesizer(speechConfig);
 
       const onResult = (result: sdk.SpeechSynthesisResult) => {
