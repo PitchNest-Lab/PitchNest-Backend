@@ -3,6 +3,7 @@ import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse } from "../services/aiService.ts";
 import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
+import { createStreamingRecognizer, hasAzureSttConfig, StreamingRecognizer } from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
 import crypto from "crypto";
 
@@ -115,6 +116,7 @@ export function initRestSocket(wss: WebSocketServer) {
     let resolvedDeckText = "";
     let masterPrompt = "";
     let isCoachMode = false;
+    let sttRecognizer: StreamingRecognizer | null = null;
 
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
@@ -154,6 +156,7 @@ export function initRestSocket(wss: WebSocketServer) {
     ws.on("close", () => {
       console.log("🔌 Client disconnected.");
       if (idleCheckInterval) clearInterval(idleCheckInterval);
+      if (sttRecognizer) sttRecognizer.stop();
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
@@ -444,6 +447,31 @@ export function initRestSocket(wss: WebSocketServer) {
 
           masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
 
+          if (hasAzureSttConfig()) {
+            sttRecognizer = createStreamingRecognizer((text) => {
+              if (sessionEnded) return;
+
+              lastUserActivityTime = Date.now();
+              hasNudged = false;
+
+              for (let i = turnQueue.length - 1; i >= 0; i--) {
+                if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
+              }
+
+              fullTranscript.push({ type: "user", text, inputMethod: "voice" });
+              sendJson(ws, {
+                type: "chat_message",
+                speaker: "user",
+                text,
+                inputMethod: "voice",
+              });
+
+              enqueueTurn({ text, inputMethod: "voice" });
+            });
+          } else {
+            console.warn("[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled");
+          }
+
           console.log("🟢 Setup complete — triggering pitch introduction...");
           enqueueTurn({ text: "", isGreeting: true });
 
@@ -481,6 +509,18 @@ export function initRestSocket(wss: WebSocketServer) {
             }
           }, 5000);
 
+          return;
+        }
+
+        if (data.type === "audio_chunk" && hasSentSetup) {
+          if (sttRecognizer && !sessionEnded) {
+            try {
+              const buf = Buffer.from(data.data, "base64");
+              sttRecognizer.pushAudio(buf);
+            } catch (e) {
+              console.error("[stt] failed to push audio chunk:", e);
+            }
+          }
           return;
         }
 
@@ -539,6 +579,10 @@ export function initRestSocket(wss: WebSocketServer) {
         if (data.type === "end_session") {
           if (sessionEnded) return;
           sessionEnded = true;
+          if (sttRecognizer) {
+            sttRecognizer.stop();
+            sttRecognizer = null;
+          }
           if (idleCheckInterval) {
             clearInterval(idleCheckInterval);
             idleCheckInterval = null;
