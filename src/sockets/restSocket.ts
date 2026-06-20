@@ -116,6 +116,7 @@ export function initRestSocket(wss: WebSocketServer) {
     let resolvedDeckText = "";
     let masterPrompt = "";
     let isCoachMode = false;
+    let sessionMode = "panel";
     let sttRecognizer: StreamingRecognizer | null = null;
 
     const conversationHistory: any[] = [];
@@ -422,7 +423,8 @@ export function initRestSocket(wss: WebSocketServer) {
           const clientConfig = data.config || {};
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
           currentUserId = clientConfig.userId || null;
-          isCoachMode = clientConfig.mode === "coach";
+          sessionMode = clientConfig.mode || "panel";
+          isCoachMode = sessionMode === "coach";
 
           console.log("🟢 Setup complete — triggering pitch introduction...");
           enqueueTurn({ text: "", isGreeting: true });
@@ -631,6 +633,7 @@ export function initRestSocket(wss: WebSocketServer) {
               frontendTranscript,
               currentBusinessName,
               resolvedDeckText,
+              sessionMode,
             );
             reportData = { ...reportData, ...evaluated, evaluationStatus: "complete" };
             console.log("✅ Evaluation succeeded! Scores:", reportData.scores);

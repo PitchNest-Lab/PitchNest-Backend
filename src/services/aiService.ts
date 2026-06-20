@@ -264,7 +264,8 @@ function getOpenAIClient() {
 export async function evaluatePitch(
   transcript: any[],
   businessName: string,
-  deckText?: string
+  deckText?: string,
+  mode: string = "panel"
 ): Promise<EvaluationReport> {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => {
@@ -272,7 +273,7 @@ export async function evaluatePitch(
           const method = m.inputMethod === 'voice' ? '[SPOKEN VIA MICROPHONE]' : '[TYPED IN CHAT]';
           return `FOUNDER ${method}: ${m.text}`;
         } else {
-          return `${m.speaker || 'INVESTOR'}: ${m.text}`;
+          return `${m.speaker || 'AI'}: ${m.text}`;
         }
       }).join("\n")
     : "No transcript available.";
@@ -281,7 +282,40 @@ export async function evaluatePitch(
     ? `\nPITCH DECK CONTENT (compare against what founder said):\n${deckText.trim().slice(0, 4000)}\n`
     : "";
 
-  const evaluationPrompt = `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY valid JSON.
+  const isCoachOrSolo = mode === "coach" || mode === "solo";
+
+  const evaluationPrompt = isCoachOrSolo
+    ? `You are Riley, an elite startup pitch coach. Review this coaching session and write a comprehensive development report for your student. Return ONLY valid JSON.
+
+BUSINESS: ${businessName}
+${deckSection}
+SESSION TRANSCRIPT:
+${transcriptText}
+
+COACHING EVALUATION RULES:
+- You are writing as a coach evaluating a student, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
+- Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
+- IF THE FOUNDER WAS SILENT OR THE SESSION WAS TOO SHORT: Provide low scores and use the summary to gently encourage more participation next time.
+- delivery = vocal confidence, pacing, how well they handle coaching questions under pressure.
+- clarity = how clearly they explain the problem, solution, and value proposition.
+- scalability = how well they understand market size, growth potential, and business model.
+- readiness = how prepared they are to face a real investor panel based on this session.
+- strengths: Specific things the founder did well — cite real moments from the transcript.
+- risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
+- next_steps: Concrete practice actions the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
+- sentiments: Write 1 coaching observation from Riley's perspective as the coach — be encouraging but honest.
+- Keep summary to 2-3 sentences framed as a coach's overall assessment of the session.
+
+Return this exact JSON structure:
+{
+  "summary": "2-3 sentence coach assessment of the overall session",
+  "scores": { "delivery": 75, "clarity": 80, "scalability": 65, "readiness": 70 },
+  "strengths": ["specific strength 1 from the session", "specific strength 2", "specific strength 3"],
+  "risks": ["specific gap or weakness 1", "gap 2", "gap 3"],
+  "next_steps": [ { "title": "Practice action title", "desc": "Short actionable coaching instruction", "priority": "High Priority" } ],
+  "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ]
+}`
+    : `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY valid JSON.
 
 BUSINESS: ${businessName}
 ${deckSection}
@@ -298,7 +332,7 @@ EVALUATION RULES:
 - Cross-check transcript claims against deck content when deck is provided.
 - Be specific — cite actual topics discussed, not generic advice.
 - Keep summary to 2-3 sentences. Strengths/risks must reference real content.
-- Include one sentiment quote each for Marcus, Sarah, and Chen when panel mode is implied.
+- Include one sentiment quote each for Marcus, Sarah, and Chen.
 
 Return this exact JSON structure:
 {
@@ -307,7 +341,7 @@ Return this exact JSON structure:
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
   "next_steps": [ { "title": "Action title", "desc": "Short actionable description", "priority": "High Priority" } ],
-  "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." } ]
+  "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ]
 }`;
 
   const callOpenAI = async (attempt: number = 1): Promise<any> => {
