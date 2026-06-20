@@ -1,6 +1,7 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import crypto from "crypto";
+import { generatePitchReportPDF } from "../services/pdfService.ts";
 
 /**
  * Safely parses stringified JSON structures, falling back to a structured object
@@ -168,5 +169,56 @@ export const createSession = async (req: Request, res: Response) => {
     res.status(500).json({
       error: "Failed to create session",
     });
+  }
+};
+
+export const generateSessionPDF = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in generateSessionPDF:", error);
+      return res.status(500).json({ error: "Failed to query session" });
+    }
+    if (!session) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    // Parse evaluation_report if stored as string
+    const formatted = {
+      ...session,
+      created_at: session.created_at || session.timestamp,
+      evaluation_report:
+        typeof session.evaluation_report === "string"
+          ? (() => { try { return JSON.parse(session.evaluation_report); } catch { return session.evaluation_report; } })()
+          : session.evaluation_report,
+    };
+
+    const pdfBuffer = await generatePitchReportPDF(formatted);
+
+    const safeName = (formatted.business_name || "Pitch_Report")
+      .replace(/[^a-zA-Z0-9_\- ]/g, "")
+      .replace(/\s+/g, "_");
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="PitchNest_Report_${safeName}.pdf"`,
+    );
+    res.setHeader("Content-Length", pdfBuffer.length);
+    res.end(pdfBuffer);
+  } catch (error: any) {
+    console.error("❌ generateSessionPDF exception:", error.message || error);
+    res.status(500).json({ error: "Failed to generate PDF report" });
   }
 };
