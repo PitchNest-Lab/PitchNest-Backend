@@ -2,6 +2,7 @@ import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse, summarizeVoiceInput } from "../services/aiService.ts";
+import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
 import { createStreamingRecognizer, hasAzureSttConfig, StreamingRecognizer } from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
@@ -472,8 +473,6 @@ export function initRestSocket(wss: WebSocketServer) {
             console.warn("[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled");
           }
 
-          // Removed redundant enqueueTurn since it's now handled at the top of client_ready
-
           // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
           lastUserActivityTime = Date.now();
           sessionStartTimestamp = Date.now();
@@ -665,6 +664,30 @@ export function initRestSocket(wss: WebSocketServer) {
             if (!dbError && dbData) {
               sessionId = dbData.id;
               if (dbData.share_id) shareId = dbData.share_id;
+
+              // Generate PDF in the background and cache in db
+              const formattedSession = {
+                ...dbData,
+                created_at: dbData.created_at || dbData.timestamp,
+                evaluation_report: reportData,
+              };
+              generatePitchReportPDF(formattedSession)
+                .then((buf) => {
+                  const base64Pdf = buf.toString("base64");
+                  return supabase
+                    .from("session_pdfs")
+                    .insert([{ session_id: dbData.id, pdf_base64: base64Pdf }]);
+                })
+                .then(({ error: cacheErr }) => {
+                  if (cacheErr) {
+                    console.warn(`⚠️ Failed to cache background PDF for session ${dbData.id}:`, cacheErr.message);
+                  } else {
+                    console.log(`✅ Background PDF cached successfully for session ${dbData.id}`);
+                  }
+                })
+                .catch((err) => {
+                  console.error(`❌ Background PDF generation failed for session ${dbData.id}:`, err);
+                });
             }
           } catch (dbErr) {
             console.error("❌ Failed to save session to Supabase:", dbErr);

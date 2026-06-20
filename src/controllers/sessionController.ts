@@ -179,34 +179,75 @@ export const generateSessionPDF = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { data: session, error } = await supabase
-      .from("sessions")
-      .select("*")
-      .eq("id", req.params.id)
-      .eq("user_id", userId)
+    // 1. Try to fetch cached PDF from session_pdfs table
+    const { data: cached, error: cacheError } = await supabase
+      .from("session_pdfs")
+      .select("pdf_base64")
+      .eq("session_id", req.params.id)
       .maybeSingle();
 
-    if (error) {
-      console.error("❌ Supabase query error in generateSessionPDF:", error);
-      return res.status(500).json({ error: "Failed to query session" });
+    let pdfBuffer: Buffer;
+    let businessName = "Pitch_Report";
+
+    if (!cacheError && cached?.pdf_base64) {
+      console.log(`📦 Serving cached PDF for session ID ${req.params.id}`);
+      pdfBuffer = Buffer.from(cached.pdf_base64, "base64");
+      
+      // Fetch minimal session details to get the correct filename
+      const { data: session } = await supabase
+        .from("sessions")
+        .select("business_name")
+        .eq("id", req.params.id)
+        .eq("user_id", userId)
+        .maybeSingle();
+      if (session?.business_name) {
+        businessName = session.business_name;
+      }
+    } else {
+      console.log(`🔨 PDF cache miss. Generating PDF on-demand for session ID ${req.params.id}`);
+      // 2. Fetch session if not cached
+      const { data: session, error } = await supabase
+        .from("sessions")
+        .select("*")
+        .eq("id", req.params.id)
+        .eq("user_id", userId)
+        .maybeSingle();
+
+      if (error) {
+        console.error("❌ Supabase query error in generateSessionPDF:", error);
+        return res.status(500).json({ error: "Failed to query session" });
+      }
+      if (!session) {
+        return res.status(404).json({ error: "Session not found" });
+      }
+
+      const formatted = {
+        ...session,
+        created_at: session.created_at || session.timestamp,
+        evaluation_report:
+          typeof session.evaluation_report === "string"
+            ? (() => { try { return JSON.parse(session.evaluation_report); } catch { return session.evaluation_report; } })()
+            : session.evaluation_report,
+      };
+
+      pdfBuffer = await generatePitchReportPDF(formatted);
+      businessName = formatted.business_name || "Pitch_Report";
+
+      // 3. Cache generated PDF in database asynchronously
+      const base64Pdf = pdfBuffer.toString("base64");
+      supabase
+        .from("session_pdfs")
+        .insert([{ session_id: req.params.id, pdf_base64: base64Pdf }])
+        .then(({ error: insertErr }) => {
+          if (insertErr) {
+            console.warn(`⚠️ Failed to cache generated PDF for session ${req.params.id}:`, insertErr.message);
+          } else {
+            console.log(`✅ Cached generated PDF for session ${req.params.id}`);
+          }
+        });
     }
-    if (!session) {
-      return res.status(404).json({ error: "Session not found" });
-    }
 
-    // Parse evaluation_report if stored as string
-    const formatted = {
-      ...session,
-      created_at: session.created_at || session.timestamp,
-      evaluation_report:
-        typeof session.evaluation_report === "string"
-          ? (() => { try { return JSON.parse(session.evaluation_report); } catch { return session.evaluation_report; } })()
-          : session.evaluation_report,
-    };
-
-    const pdfBuffer = await generatePitchReportPDF(formatted);
-
-    const safeName = (formatted.business_name || "Pitch_Report")
+    const safeName = businessName
       .replace(/[^a-zA-Z0-9_\- ]/g, "")
       .replace(/\s+/g, "_");
 
