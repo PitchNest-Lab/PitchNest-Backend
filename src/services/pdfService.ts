@@ -1,6 +1,21 @@
 import PDFDocument from "pdfkit";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 type PDFDoc = InstanceType<typeof PDFDocument>;
+
+// ── Logo — loaded once at module startup ─────────────────────────────────────
+const __filename = fileURLToPath(import.meta.url);
+const __dirname_here = path.dirname(__filename);
+let LOGO_BUFFER: Buffer | null = null;
+for (const p of [
+  path.join(__dirname_here, "../assets/logo.png"),               // production path
+  path.join(__dirname_here, "../../assets/logo.png"),            // alternate
+  path.join(__dirname_here, "../../../frontend/public/logo.png") // dev path
+]) {
+  if (fs.existsSync(p)) { LOGO_BUFFER = fs.readFileSync(p); break; }
+}
 
 // ── Color palette ────────────────────────────────────────────────────────────
 const COLORS = {
@@ -56,12 +71,29 @@ function formatDate(dateStr?: string): string {
   }
 }
 
-function drawHeader(doc: PDFDoc, title: string) {
-  doc.rect(0, 0, doc.page.width, 60).fill(COLORS.dark);
-  doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.primary).text("PITCHNEST", 50, 18, { continued: true });
-  doc.font("Helvetica").fontSize(10).fillColor(COLORS.textLight).text("   •   AI-Powered Pitch Evaluation Report", 120, 18);
-  doc.font("Helvetica-Bold").fontSize(9).fillColor(COLORS.textLight).text(title.toUpperCase(), 50, 32, { width: doc.page.width - 100, align: "left" });
-  doc.moveTo(50, 60).lineTo(doc.page.width - 50, 60).strokeColor(COLORS.border).lineWidth(1).stroke();
+function drawHeader(doc: PDFDoc, _title: string, date?: string) {
+  // Logo — circular "P" icon embeds cleanly on white; white text in PNG is invisible
+  if (LOGO_BUFFER) {
+    doc.image(LOGO_BUFFER, 50, 12, { height: 32 });
+    doc.font("Helvetica-Bold").fontSize(12).fillColor(COLORS.dark).text("PitchNest", 88, 20);
+  } else {
+    // Fallback: draw "P" circle
+    doc.circle(66, 28, 14).fill(COLORS.primary);
+    doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.white).text("P", 61, 23);
+    doc.font("Helvetica-Bold").fontSize(12).fillColor(COLORS.dark).text("PitchNest", 88, 20);
+  }
+
+  // Right: report type + date
+  const rightX = doc.page.width - 50;
+  doc.font("Helvetica-Bold").fontSize(9).fillColor(COLORS.primary)
+    .text("AI-Powered Pitch Evaluation Report", 0, 15, { width: rightX, align: "right" });
+  if (date) {
+    doc.font("Helvetica").fontSize(7.5).fillColor(COLORS.textLight)
+      .text(`Generated on ${date}`, 0, 28, { width: rightX, align: "right" });
+  }
+
+  // Separator
+  doc.moveTo(50, 52).lineTo(doc.page.width - 50, 52).strokeColor(COLORS.border).lineWidth(0.75).stroke();
 }
 
 function drawFooter(doc: PDFDoc, pageNum: number, totalPages: number) {
@@ -291,11 +323,16 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 1 — EXECUTIVE SUMMARY, OVERALL SCORE, RADAR CHART
       // =======================================================================
 
-      // Background header band
-      doc.rect(0, 0, doc.page.width, 120).fill(COLORS.dark);
-      doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.primary).text("PITCHNEST", 50, 30);
-      doc.font("Helvetica-Bold").fontSize(22).fillColor(COLORS.white).text(businessName, 50, 48);
-      doc.font("Helvetica").fontSize(9).fillColor("#94A3B8").text(`Pitch Date: ${formattedDate}   |   Session Type: AI VC Panel`, 50, 80);
+      // Page 1 — white header consistent with all other pages
+      drawHeader(doc, "", formattedDate);
+
+      // Executive summary label + business name
+      doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.primary)
+        .text("EXECUTIVE SUMMARY", 50, 65);
+      doc.font("Helvetica-Bold").fontSize(22).fillColor(COLORS.dark)
+        .text(businessName, 50, 80);
+      doc.font("Helvetica").fontSize(9).fillColor(COLORS.textLight)
+        .text(`Pitch Date: ${formattedDate}   |   Session Type: AI VC Panel`, 50, 112);
 
       // Verdict Box
       const verdict = getVerdict(overallScore, isInsufficient);
@@ -315,8 +352,8 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { width: 260, lineGap: 3.5 }
       );
 
-      // Right Column Overall Score Card
-      doc.rect(330, 140, 215, 205).fill(COLORS.dark);
+      // Right Column Overall Score Card — indigo gradient look
+      doc.rect(330, 140, 215, 205).fill(COLORS.primaryDark);
       doc.font("Helvetica-Bold").fontSize(9).fillColor(COLORS.secondary).text("OVERALL PITCH SCORE", 350, 158);
       doc.font("Helvetica-Bold").fontSize(42).fillColor(COLORS.white).text(isInsufficient ? "N/A" : `${overallScore}`, 350, 175);
       doc.font("Helvetica").fontSize(11).fillColor(COLORS.textLight).text("/ 100", 415, 201);
@@ -335,10 +372,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.dark).text("CATEGORY BREAKDOWN", 50, doc.y);
       
       const cats = [
-        { name: "Delivery", score: scores.delivery, color: COLORS.primary },
-        { name: "Clarity", score: scores.clarity, color: COLORS.secondary },
-        { name: "Scalability", score: scores.scalability, color: COLORS.amber },
-        { name: "Readiness", score: scores.readiness, color: COLORS.emerald }
+        { name: "Delivery",    score: scores.delivery,    color: COLORS.primary },
+        { name: "Clarity",     score: scores.clarity,     color: COLORS.secondary },
+        { name: "Scalability", score: scores.scalability, color: COLORS.emerald },
+        { name: "Readiness",   score: scores.readiness,   color: COLORS.amber },
       ];
 
       let catY = 395;
@@ -362,18 +399,33 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.y = 585;
       doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.dark).text("INVESTOR SENTIMENT");
       
+      const avatarColors = [COLORS.primary, COLORS.secondary, COLORS.emerald];
+      const roleLabels: Record<string, string> = {
+        "Marcus": "Lead Investor", "Sarah": "Partner", "Chen": "Tech Investor",
+        "Riley": "Coach"
+      };
       let sentX = 50;
-      sentiments.slice(0, 3).forEach((s) => {
-        // Bubble text card background
-        doc.rect(sentX, 605, 150, 150).fill(COLORS.bgLight).strokeColor(COLORS.border).lineWidth(0.5).stroke();
-        
-        // Avatar mock
-        doc.circle(sentX + 25, 630, 14).fill(COLORS.border);
-        doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.primary).text(s.persona.substring(0, 1), sentX + 22, 626);
-        
-        doc.font("Helvetica-Bold").fontSize(8).fillColor(COLORS.dark).text(s.persona, sentX + 48, 622, { width: 95 });
-        doc.font("Helvetica-Oblique").fontSize(8).fillColor(COLORS.text).text(`"${s.quote}"`, sentX + 15, 655, { width: 120, lineGap: 3 });
-        
+      sentiments.slice(0, 3).forEach((s, idx) => {
+        const aColor = avatarColors[idx % avatarColors.length];
+        const name = s.persona.split(" ")[0];
+        const role = roleLabels[name] || "Investor";
+
+        // Card background
+        doc.rect(sentX, 605, 158, 145).fill(COLORS.bgLight).strokeColor(COLORS.border).lineWidth(0.5).stroke();
+
+        // Colored avatar circle + initial
+        doc.circle(sentX + 22, 628, 14).fill(aColor);
+        doc.font("Helvetica-Bold").fontSize(9).fillColor(COLORS.white).text(name.substring(0, 1), sentX + 18, 623);
+
+        // Name + role badge
+        doc.font("Helvetica-Bold").fontSize(8.5).fillColor(COLORS.dark).text(name, sentX + 43, 620);
+        doc.roundedRect(sentX + 43, 633, 60, 11, 5.5).fill(COLORS.indigoBg);
+        doc.font("Helvetica-Bold").fontSize(6).fillColor(COLORS.primary).text(role, sentX + 43, 636, { width: 60, align: "center" });
+
+        // Quote
+        doc.font("Helvetica-Oblique").fontSize(7.5).fillColor(COLORS.text)
+          .text(`"${s.quote}"`, sentX + 10, 658, { width: 132, lineGap: 2.5 });
+
         sentX += 172;
       });
 
@@ -381,7 +433,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 2 — STRENGTHS, RISKS, NEXT STEPS & INVESTMENT GAUGE
       // =======================================================================
       doc.addPage();
-      drawHeader(doc, "Key Insights & Venture Readiness");
+      drawHeader(doc, "Key Insights & Venture Readiness", formattedDate);
 
       // Strengths & Risks Columns
       // Left: Strengths
@@ -482,7 +534,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 3 — PERFORMANCE & DELIVERY ANALYTICS
       // =======================================================================
       doc.addPage();
-      drawHeader(doc, "Performance & Delivery Analytics");
+      drawHeader(doc, "Performance & Delivery Analytics", formattedDate);
 
       // Speaking analytics row
       const stats = [
@@ -541,10 +593,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       
       const tableHeaders = ["Category", "Score", "What Went Well", "What Needs Improvement", "Impact"];
       const tableRows = [
-        ["Delivery", "60/100", "Strong opening and tone.", "Inconsistent pace at points.", "Moderate"],
-        ["Clarity", "55/100", "Problem statements are clear.", "Market sizes not explained.", "Moderate"],
-        ["Scalability", "40/100", "Market segment is large.", "Lack of clear scaling plan.", "High"],
-        ["Readiness", "35/100", "Passionate about vision.", "Unit economics not defined.", "High"]
+        { cells: ["Delivery",    `${scores.delivery}/100`,    "Strong opening and tone.",         "Inconsistent pace at points.",   "Moderate"], color: COLORS.primary },
+        { cells: ["Clarity",     `${scores.clarity}/100`,     "Problem statements are clear.",    "Market sizes not explained.",    "Moderate"], color: COLORS.secondary },
+        { cells: ["Scalability", `${scores.scalability}/100`, "Market segment is large.",         "Lack of clear scaling plan.",    "High"],     color: COLORS.emerald },
+        { cells: ["Readiness",   `${scores.readiness}/100`,   "Passionate about vision.",         "Unit economics not defined.",    "High"],     color: COLORS.amber },
       ];
 
       // Draw table header
@@ -562,8 +614,12 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       tableRows.forEach((row) => {
         doc.rect(50, ty, 495, 30).fill(ty % 20 === 0 ? COLORS.bgLight : COLORS.white).strokeColor(COLORS.border).lineWidth(0.5).stroke();
         tx = 55;
-        row.forEach((cell, idx) => {
-          doc.font(idx === 0 || idx === 1 ? "Helvetica-Bold" : "Helvetica").fontSize(7.5).fillColor(COLORS.text).text(cell, tx, ty + 8, { width: colWidths[idx] - 10 });
+        row.cells.forEach((cell: string, idx: number) => {
+          const isFirst = idx === 0;
+          doc.font(isFirst ? "Helvetica-Bold" : "Helvetica")
+            .fontSize(7.5)
+            .fillColor(isFirst ? row.color : COLORS.text)
+            .text(cell, tx, ty + 8, { width: colWidths[idx] - 10 });
           tx += colWidths[idx];
         });
         ty += 30;
@@ -599,7 +655,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 4 — COMPETITIVE LANDSCAPE & MARKET INTEL
       // =======================================================================
       doc.addPage();
-      drawHeader(doc, "Competitive Landscape & Market Intelligence");
+      drawHeader(doc, "Competitive Landscape & Market Intelligence", formattedDate);
 
       // Table of Direct Competitors
       doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.dark).text("DIRECT COMPETITOR MATRIX", 50, 80);
@@ -704,7 +760,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 5 — TRANSCRIPT & DIALOGUE TIMELINE
       // =======================================================================
       doc.addPage();
-      drawHeader(doc, "Session Transcript & Analytics");
+      drawHeader(doc, "Session Transcript & Analytics", formattedDate);
 
       // Left Column: Dialogue Timeline
       doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.dark).text("DIALOGUE TIMELINE", 50, 80);
@@ -786,7 +842,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // PAGE 6 — ACTION PLAN & PROGRESSION TRACKING
       // =======================================================================
       doc.addPage();
-      drawHeader(doc, "Personalized Action Plan");
+      drawHeader(doc, "Personalized Action Plan", formattedDate);
 
       // Action plan overview header
       doc.rect(50, 80, 495, 60).fill("#EEF2FF").strokeColor("#C7D2FE").lineWidth(1).stroke();
@@ -874,10 +930,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Right: Target Success Metrics
       doc.font("Helvetica-Bold").fontSize(10).fillColor(COLORS.dark).text("TARGET SUCCESS METRICS", 300, 570);
       const targets = [
-        { label: "Overall Score", current: overallScore, target: 78, color: COLORS.primary },
-        { label: "Confidence", current: scores.delivery, target: 75, color: COLORS.secondary },
-        { label: "Clarity", current: scores.clarity, target: 70, color: COLORS.rose },
-        { label: "Readiness", current: scores.readiness, target: 70, color: COLORS.emerald }
+        { label: "Overall Score", current: overallScore,      target: 78, color: COLORS.primary },
+        { label: "Confidence",    current: scores.delivery,   target: 75, color: COLORS.secondary },
+        { label: "Clarity",       current: scores.clarity,    target: 70, color: COLORS.emerald },
+        { label: "Readiness",     current: scores.readiness,  target: 70, color: COLORS.amber },
       ];
       let targetY = 590;
       targets.forEach((t) => {
