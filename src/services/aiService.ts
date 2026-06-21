@@ -25,6 +25,53 @@ export interface EvaluationReport {
   duration?: number;
   transcript?: any[];
   evaluationStatus?: "complete" | "insufficient_data" | "failed";
+  // ── Phase 2: Dynamic market intelligence fields ─────────────
+  topic_coverage?: Array<{ topic: string; percentage: number }>;
+  transcript_summary?: string;
+  questions_to_prepare?: string[];
+  competitive_landscape?: {
+    swot: {
+      strengths: string[];
+      weaknesses: string[];
+      opportunities: string[];
+      threats: string[];
+    };
+    strategic_recommendation: string;
+    key_focus_areas: string[];
+  };
+  practice_drills?: Array<{ title: string; desc: string; reps: string; time: string }>;
+  // ── Phase 3: Business-specific market intelligence ───────────
+  market_gaps?: Array<{ title: string; desc: string }>;
+  collaboration_opportunities?: string[];
+  question_difficulty?: { easy: number; medium: number; hard: number };
+  vc_investment_probability?: number;
+  // ── Phase 4: Fully dynamic report data ───────────────────────
+  competitors?: Array<{
+    name: string;
+    similarity: number;
+    strength: string;
+    weakness: string;
+    size: string;
+  }>;
+  companies_to_study?: Array<{ name: string; why: string }>;
+  top_priorities?: Array<{
+    title: string;
+    desc: string;
+    priority: string;
+    impact: string;
+  }>;
+  answer_framework?: {
+    question: string;
+    steps: Array<{ label: string; text: string }>;
+  };
+  category_matrix?: Array<{
+    category: string;
+    went_well: string;
+    needs_improvement: string;
+    impact: string;
+  }>;
+  confidence_timeline?: Array<{ time: string; value: number }>;
+  founder_percentile?: number;
 }
 
 function clampScore(value: unknown): number {
@@ -60,6 +107,132 @@ function validateEvaluationReport(raw: any): EvaluationReport {
         }))
     : [];
 
+  // ── New dynamic fields ──────────────────────────────────────
+  const topicCoverage = Array.isArray(raw?.topic_coverage)
+    ? raw.topic_coverage
+        .filter((t: any) => t && typeof t.topic === "string")
+        .map((t: any) => ({ topic: String(t.topic), percentage: clampScore(t.percentage) }))
+    : undefined;
+
+  const transcriptSummary = typeof raw?.transcript_summary === "string" && raw.transcript_summary.trim()
+    ? raw.transcript_summary.trim()
+    : undefined;
+
+  const questionsToPrepare = Array.isArray(raw?.questions_to_prepare)
+    ? raw.questions_to_prepare.map((q: unknown) => String(q)).filter(Boolean)
+    : undefined;
+
+  const rawLandscape = raw?.competitive_landscape;
+  const competitiveLandscape = rawLandscape ? {
+    swot: {
+      strengths: Array.isArray(rawLandscape?.swot?.strengths) ? rawLandscape.swot.strengths.map(String) : [],
+      weaknesses: Array.isArray(rawLandscape?.swot?.weaknesses) ? rawLandscape.swot.weaknesses.map(String) : [],
+      opportunities: Array.isArray(rawLandscape?.swot?.opportunities) ? rawLandscape.swot.opportunities.map(String) : [],
+      threats: Array.isArray(rawLandscape?.swot?.threats) ? rawLandscape.swot.threats.map(String) : [],
+    },
+    strategic_recommendation: String(rawLandscape?.strategic_recommendation || ""),
+    key_focus_areas: Array.isArray(rawLandscape?.key_focus_areas) ? rawLandscape.key_focus_areas.map(String) : [],
+  } : undefined;
+
+  const practiceDrills = Array.isArray(raw?.practice_drills)
+    ? raw.practice_drills
+        .filter((d: any) => d && typeof d.title === "string")
+        .map((d: any) => ({
+          title: String(d.title),
+          desc: String(d.desc || ""),
+          reps: String(d.reps || "2 Reps"),
+          time: String(d.time || "5 min"),
+        }))
+    : undefined;
+
+  const marketGaps = Array.isArray(raw?.market_gaps)
+    ? raw.market_gaps
+        .filter((g: any) => g && typeof g.title === "string")
+        .map((g: any) => ({ title: String(g.title), desc: String(g.desc || "") }))
+    : undefined;
+
+  const collaborationOpportunities = Array.isArray(raw?.collaboration_opportunities)
+    ? raw.collaboration_opportunities.map((c: unknown) => String(c)).filter(Boolean)
+    : undefined;
+
+  const rawDiff = raw?.question_difficulty;
+  const questionDifficulty = rawDiff
+    ? {
+        easy: Math.max(0, Math.round(Number(rawDiff.easy) || 0)),
+        medium: Math.max(0, Math.round(Number(rawDiff.medium) || 0)),
+        hard: Math.max(0, Math.round(Number(rawDiff.hard) || 0)),
+      }
+    : undefined;
+
+  const vcInvestmentProbability =
+    typeof raw?.vc_investment_probability === "number"
+      ? Math.min(100, Math.max(0, Math.round(raw.vc_investment_probability)))
+      : undefined;
+
+  const competitors = Array.isArray(raw?.competitors)
+    ? raw.competitors
+        .filter((c: any) => c && typeof c.name === "string")
+        .map((c: any) => ({
+          name: String(c.name),
+          similarity: Math.min(100, Math.max(0, Math.round(Number(c.similarity) || 0))),
+          strength: String(c.strength || ""),
+          weakness: String(c.weakness || ""),
+          size: String(c.size || "N/A"),
+        }))
+    : undefined;
+
+  const companiesToStudy = Array.isArray(raw?.companies_to_study)
+    ? raw.companies_to_study
+        .filter((c: any) => c && typeof c.name === "string")
+        .map((c: any) => ({ name: String(c.name), why: String(c.why || "") }))
+    : undefined;
+
+  const topPriorities = Array.isArray(raw?.top_priorities)
+    ? raw.top_priorities
+        .filter((p: any) => p && typeof p.title === "string")
+        .map((p: any) => ({
+          title: String(p.title),
+          desc: String(p.desc || ""),
+          priority: String(p.priority || "Medium Priority"),
+          impact: String(p.impact || "High"),
+        }))
+    : undefined;
+
+  const rawFramework = raw?.answer_framework;
+  const answerFramework = rawFramework && typeof rawFramework.question === "string"
+    ? {
+        question: String(rawFramework.question),
+        steps: Array.isArray(rawFramework.steps)
+          ? rawFramework.steps.map((s: any) => ({ label: String(s.label || ""), text: String(s.text || "") }))
+          : [],
+      }
+    : undefined;
+
+  const categoryMatrix = Array.isArray(raw?.category_matrix)
+    ? raw.category_matrix
+        .filter((r: any) => r && typeof r.category === "string")
+        .map((r: any) => ({
+          category: String(r.category),
+          went_well: String(r.went_well || ""),
+          needs_improvement: String(r.needs_improvement || ""),
+          impact: String(r.impact || "Moderate"),
+        }))
+    : undefined;
+
+  const confidenceTimeline = Array.isArray(raw?.confidence_timeline)
+    ? raw.confidence_timeline
+        .filter((p: any) => p && typeof p.time === "string")
+        .map((p: any) => ({
+          time: String(p.time),
+          value: Math.min(100, Math.max(0, Math.round(Number(p.value) || 50))),
+        }))
+    : undefined;
+
+  const founderPercentile =
+    typeof raw?.founder_percentile === "number"
+      ? Math.min(100, Math.max(1, Math.round(raw.founder_percentile)))
+      : undefined;
+
   return {
     summary: String(raw?.summary || "Evaluation completed."),
     scores: {
@@ -73,6 +246,22 @@ function validateEvaluationReport(raw: any): EvaluationReport {
     next_steps: nextSteps,
     sentiments,
     evaluationStatus: "complete",
+    topic_coverage: topicCoverage,
+    transcript_summary: transcriptSummary,
+    questions_to_prepare: questionsToPrepare,
+    competitive_landscape: competitiveLandscape,
+    practice_drills: practiceDrills,
+    market_gaps: marketGaps,
+    collaboration_opportunities: collaborationOpportunities,
+    question_difficulty: questionDifficulty,
+    vc_investment_probability: vcInvestmentProbability,
+    competitors,
+    companies_to_study: companiesToStudy,
+    top_priorities: topPriorities,
+    answer_framework: answerFramework,
+    category_matrix: categoryMatrix,
+    confidence_timeline: confidenceTimeline,
+    founder_percentile: founderPercentile,
   };
 }
 
@@ -315,7 +504,7 @@ Return this exact JSON structure:
   "next_steps": [ { "title": "Practice action title", "desc": "Short actionable coaching instruction", "priority": "High Priority" } ],
   "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ]
 }`
-    : `You are an expert pitch evaluator. Analyze this investor pitch conversation and return ONLY valid JSON.
+    : `You are an expert pitch evaluator and market intelligence analyst. Analyze this investor pitch conversation and return ONLY valid JSON.
 
 BUSINESS: ${businessName}
 ${deckSection}
@@ -334,6 +523,26 @@ EVALUATION RULES:
 - Keep summary to 2-3 sentences. Strengths/risks must reference real content.
 - Include one sentiment quote each for Marcus, Sarah, and Chen.
 
+ADDITIONAL ANALYSIS (provide these for the report):
+- topic_coverage: Estimate how well the founder covered each key pitch topic as a percentage (0-100). Topics: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details.
+- transcript_summary: Write a 3-5 sentence summary of what happened during the pitch session, what was discussed, what was missed.
+- questions_to_prepare: List 6 tough investor questions the founder should practice answering based on weak areas from this session.
+- competitive_landscape.swot: Based on the business described, provide a SWOT analysis (4 items per category).
+- competitive_landscape.strategic_recommendation: A 2-3 sentence strategic recommendation based on competitive positioning.
+- competitive_landscape.key_focus_areas: 4 key areas the founder should focus on.
+- practice_drills: 4 practice drills with title, desc, reps, and time.
+- market_gaps: Based on this specific business and industry, identify 3-4 key market gaps that competitors are NOT addressing. For each: title (3-5 words) and desc (one sentence specific to this business).
+- collaboration_opportunities: List 4 specific strategic collaboration opportunities to accelerate growth for this business. Be specific to the industry and model, not generic.
+- question_difficulty: Count the investor questions from this session as easy (intro/clarification), medium (business model/market), hard (tough financial/competitive). Return {easy, medium, hard} as integer counts.
+- vc_investment_probability: Estimate probability (0-100) that this pitch would receive a follow-up meeting from a typical early-stage VC, based on pitch quality, market opportunity, and traction evidence shown.
+- competitors: Identify 4 REAL competitors in this founder's specific industry and space (not generic tools). For each: name (real company), similarity (0-100 to this business), strength (one key advantage), weakness (one genuine gap), size (estimated market size or ARR e.g. "$10M+").
+- companies_to_study: List 4 companies this founder should study for inspiration or benchmarking — not necessarily direct competitors. Specific to their industry. For each: name, why (one sentence tailored to this business and what they can learn).
+- top_priorities: Based on weaknesses found in THIS pitch, list exactly 5 specific priority improvements. For each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority" or "Medium Priority"), impact ("Very High", "High", or "Medium").
+- answer_framework: Pick the single hardest or most avoided investor question from this session. Build a 5-step answer framework for it. question: the exact question text, steps: [{label: short step name, text: how to answer that step}].
+- category_matrix: For each score category (Delivery, Clarity, Scalability, Readiness), write: category name, went_well (one specific sentence referencing what the founder actually did), needs_improvement (one specific sentence about a real gap), impact ("High", "Moderate", or "Low").
+- confidence_timeline: Estimate the founder's confidence/sentiment at 5 time intervals across the session based on how they spoke. Return [{time: "0:00", value: 85}, ...]. Values should fluctuate realistically — start point, after first hard question, during weakest moment, during recovery, at close.
+- founder_percentile: Estimate what percentile of early-stage founders this pitch falls in (1-100 integer). A value of 37 means this founder is in the bottom 37% — top 63% of founders did better.
+
 Return this exact JSON structure:
 {
   "summary": "2-3 sentence executive summary",
@@ -341,7 +550,27 @@ Return this exact JSON structure:
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
   "next_steps": [ { "title": "Action title", "desc": "Short actionable description", "priority": "High Priority" } ],
-  "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ]
+  "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ],
+  "topic_coverage": [ { "topic": "Problem Definition", "percentage": 90 }, { "topic": "Solution Overview", "percentage": 80 }, { "topic": "Market Size", "percentage": 30 }, { "topic": "Business Model", "percentage": 20 }, { "topic": "Go-to-Market", "percentage": 10 }, { "topic": "Traction", "percentage": 0 }, { "topic": "Team", "percentage": 0 }, { "topic": "Financials", "percentage": 0 }, { "topic": "Technical Details", "percentage": 5 } ],
+  "transcript_summary": "3-5 sentence summary of the session",
+  "questions_to_prepare": ["Question 1", "Question 2", "Question 3", "Question 4", "Question 5", "Question 6"],
+  "competitive_landscape": {
+    "swot": { "strengths": ["s1","s2","s3","s4"], "weaknesses": ["w1","w2","w3","w4"], "opportunities": ["o1","o2","o3","o4"], "threats": ["t1","t2","t3","t4"] },
+    "strategic_recommendation": "2-3 sentence strategic recommendation",
+    "key_focus_areas": ["Focus 1", "Focus 2", "Focus 3", "Focus 4"]
+  },
+  "practice_drills": [ { "title": "Drill name", "desc": "What to practice", "reps": "3 Reps", "time": "5 min" } ],
+  "market_gaps": [ { "title": "Specific Gap Title", "desc": "One sentence about why this is a gap for this business." } ],
+  "collaboration_opportunities": ["Specific opportunity 1", "Specific opportunity 2", "Specific opportunity 3", "Specific opportunity 4"],
+  "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
+  "vc_investment_probability": 25,
+  "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "$10M+" } ],
+  "companies_to_study": [ { "name": "Company Name", "why": "One sentence specific to why this founder should study them." } ],
+  "top_priorities": [ { "title": "Priority Title 3-5 words", "desc": "Specific actionable sentence citing this pitch", "priority": "High Priority", "impact": "Very High" } ],
+  "answer_framework": { "question": "Hardest question from this session", "steps": [ { "label": "Step Name", "text": "How to answer this step" } ] },
+  "category_matrix": [ { "category": "Delivery", "went_well": "Specific sentence about what was good", "needs_improvement": "Specific sentence about the gap", "impact": "Moderate" } ],
+  "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ],
+  "founder_percentile": 37
 }`;
 
   const callOpenAI = async (attempt: number = 1): Promise<any> => {
@@ -351,7 +580,7 @@ Return this exact JSON structure:
         model: config.azureOpenAiDeployment || "gpt-4o",
         messages: [{ role: "user", content: evaluationPrompt }],
         temperature: 0.15,
-        max_tokens: 1536,
+        max_tokens: 4096,
         response_format: { type: "json_object" }
       });
 
