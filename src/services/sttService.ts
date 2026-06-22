@@ -32,7 +32,7 @@ export function createStreamingRecognizer(
   // Slightly longer end-of-utterance silence tolerance for pitch speech
   speechConfig.setProperty(
     sdk.PropertyId.SpeechServiceConnection_EndSilenceTimeoutMs,
-    "800",
+    "300",
   );
 
   const format = sdk.AudioStreamFormat.getWaveFormatPCM(16000, 16, 1);
@@ -51,6 +51,7 @@ export function createStreamingRecognizer(
   };
 
   recognizer.recognized = (_s, e) => {
+    console.log("FINAL:", Date.now(), e.result.text);
     if (e.result.reason === sdk.ResultReason.RecognizedSpeech) {
       const text = e.result.text?.trim();
       if (text) {
