@@ -1,10 +1,24 @@
 import { WebSocket, WebSocketServer } from "ws";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
-import { evaluatePitch, getMasterPrompt, generatePanelResponse, streamPanelResponse, summarizeVoiceInput } from "../services/aiService.ts";
+import {
+  evaluatePitch,
+  getMasterPrompt,
+  generatePanelResponse,
+  streamPanelResponse,
+  summarizeVoiceInput,
+} from "../services/aiService.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
-import { synthesizeSpeech, isTtsConfigured, resolveVoiceName } from "../services/ttsService.ts";
-import { createStreamingRecognizer, hasAzureSttConfig, StreamingRecognizer } from "../services/sttService.ts";
+import {
+  synthesizeSpeech,
+  isTtsConfigured,
+  resolveVoiceName,
+} from "../services/ttsService.ts";
+import {
+  createStreamingRecognizer,
+  hasAzureSttConfig,
+  StreamingRecognizer,
+} from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
 import crypto from "crypto";
 
@@ -57,7 +71,10 @@ function buildUserTurnInput(text: string, timeLeft?: number): string {
   return `[PITCH TIME REMAINING: ${formatTimeLeft(timeLeft)}]\n${text}`;
 }
 
-function parseSpeakerResponse(aiResponse: string, isCoach: boolean): { speaker: string; spokenText: string } {
+function parseSpeakerResponse(
+  aiResponse: string,
+  isCoach: boolean,
+): { speaker: string; spokenText: string } {
   let speaker = isCoach ? "Riley" : "Marcus";
   let spokenText = aiResponse.trim();
 
@@ -65,7 +82,8 @@ function parseSpeakerResponse(aiResponse: string, isCoach: boolean): { speaker: 
   if (colonIndex !== -1 && colonIndex < 24) {
     const candidate = spokenText.substring(0, colonIndex).trim();
     if (/^[A-Za-z][A-Za-z\s'-]{0,20}$/.test(candidate)) {
-      speaker = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
+      speaker =
+        candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
       spokenText = spokenText.substring(colonIndex + 1).trim();
     }
   }
@@ -94,7 +112,10 @@ function shouldRunEvaluation(
   durationSec: number,
 ): boolean {
   if (userTurns.length < 1) return false;
-  return totalUserTextLength >= MIN_EVAL_USER_CHARS || durationSec >= MIN_EVAL_DURATION_SEC;
+  return (
+    totalUserTextLength >= MIN_EVAL_USER_CHARS ||
+    durationSec >= MIN_EVAL_DURATION_SEC
+  );
 }
 
 type QueuedTurn = {
@@ -133,7 +154,9 @@ export function initRestSocket(wss: WebSocketServer) {
     let initialDurationSeconds = 15 * 60;
     let sessionEnded = false;
 
-    console.log("✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)");
+    console.log(
+      "✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)",
+    );
 
     if (!hasOpenAiConfig()) {
       console.error("🚨 CRITICAL: AI provider env vars are missing");
@@ -146,7 +169,9 @@ export function initRestSocket(wss: WebSocketServer) {
     }
 
     if (!hasAzureTtsConfig()) {
-      console.error("🚨 CRITICAL: Azure TTS env vars are missing — voice output disabled");
+      console.error(
+        "🚨 CRITICAL: Azure TTS env vars are missing — voice output disabled",
+      );
       sendJson(ws, {
         type: "error",
         message:
@@ -180,36 +205,57 @@ export function initRestSocket(wss: WebSocketServer) {
         // Removed hardcoded greeting block to let it fall through to streaming pipeline
 
         if (turn.isVerdict) {
-          const aiResponse = await generatePanelResponse(userInput, conversationHistory, masterPrompt);
+          const aiResponse = await generatePanelResponse(
+            userInput,
+            conversationHistory,
+            masterPrompt,
+          );
           conversationHistory.push({ role: "user", text: userInput });
           conversationHistory.push({ role: "assistant", text: aiResponse });
 
-          const panelists = turn.panelists || [{name: "Marcus"}, {name: "Sarah"}, {name: "Chen"}];
+          const panelists = turn.panelists || [
+            { name: "Marcus" },
+            { name: "Sarah" },
+            { name: "Chen" },
+          ];
           const panelistNames = panelists.map((p: any) => p.name);
 
           // In verdict mode, we need to extract each panelist's verdict and send them sequentially
           for (const pName of panelistNames) {
             let panelistText = "";
-            const nameRegex = new RegExp(`${pName}[:\\s]+(.+?)(?=(?:${panelistNames.join('|')})[:\\s]|$)`, 'is');
+            const nameRegex = new RegExp(
+              `${pName}[:\\s]+(.+?)(?=(?:${panelistNames.join("|")})[:\\s]|$)`,
+              "is",
+            );
             const nameMatch = aiResponse.match(nameRegex);
-            
+
             if (nameMatch) {
               panelistText = nameMatch[1].trim();
             } else {
-               if (panelists.length === 1) {
-                  panelistText = aiResponse.replace(/^(Riley|Marcus|Coach)[\s:]+/i, '').trim();
-               } else {
-                  continue;
-               }
+              if (panelists.length === 1) {
+                panelistText = aiResponse
+                  .replace(/^(Riley|Marcus|Coach)[\s:]+/i, "")
+                  .trim();
+              } else {
+                continue;
+              }
             }
 
             panelistText = sanitizeAiSpeech(panelistText) || panelistText;
 
             const lowerText = panelistText.toLowerCase();
             let verdictVerdict: "invest" | "pass" | "maybe" = "maybe";
-            if (/\b(invest|i'm in|i am in|fund|back this|green light)\b/i.test(lowerText)) {
+            if (
+              /\b(invest|i'm in|i am in|fund|back this|green light)\b/i.test(
+                lowerText,
+              )
+            ) {
               verdictVerdict = "invest";
-            } else if (/\b(pass|i'm out|i am out|decline|not invest|no deal|walk away)\b/i.test(lowerText)) {
+            } else if (
+              /\b(pass|i'm out|i am out|decline|not invest|no deal|walk away)\b/i.test(
+                lowerText,
+              )
+            ) {
               verdictVerdict = "pass";
             }
 
@@ -218,24 +264,24 @@ export function initRestSocket(wss: WebSocketServer) {
               type: "verdict_message",
               speaker: pName,
               text: panelistText.substring(0, 300),
-              verdict: verdictVerdict
+              verdict: verdictVerdict,
             });
 
             // Synthesize audio for this panelist's verdict
             if (isTtsConfigured() && panelistText.trim()) {
-               try {
-                 const vName = resolveVoiceName(pName);
-                 const buf = await synthesizeSpeech(panelistText, vName);
-                 const base64Audio = Buffer.from(buf).toString("base64");
-                 // DO NOT pass `text: panelistText` here to avoid duplicating the verdict message!
-                 sendJson(ws, {
-                   type: "audio",
-                   data: base64Audio,
-                   speaker: pName,
-                 });
-               } catch(e) {
-                 console.error("Verdict TTS error:", e);
-               }
+              try {
+                const vName = resolveVoiceName(pName);
+                const buf = await synthesizeSpeech(panelistText, vName);
+                const base64Audio = Buffer.from(buf).toString("base64");
+                // DO NOT pass `text: panelistText` here to avoid duplicating the verdict message!
+                sendJson(ws, {
+                  type: "audio",
+                  data: base64Audio,
+                  speaker: pName,
+                });
+              } catch (e) {
+                console.error("Verdict TTS error:", e);
+              }
             }
           }
           sendJson(ws, { type: "verdict_complete" });
@@ -261,7 +307,11 @@ export function initRestSocket(wss: WebSocketServer) {
           userInputToUse = "Hello, I am ready.";
         }
 
-        const stream = streamPanelResponse(userInputToUse, turn.isGreeting ? [] : conversationHistory, promptToUse);
+        const stream = streamPanelResponse(
+          userInputToUse,
+          turn.isGreeting ? [] : conversationHistory,
+          promptToUse,
+        );
 
         for await (const token of stream) {
           currentSentenceBuffer += token;
@@ -270,88 +320,112 @@ export function initRestSocket(wss: WebSocketServer) {
           if (isFirstChunk && currentSentenceBuffer.length > 5) {
             const colonIndex = currentSentenceBuffer.indexOf(":");
             if (colonIndex !== -1 && colonIndex < 24) {
-              const candidate = currentSentenceBuffer.substring(0, colonIndex).trim();
+              const candidate = currentSentenceBuffer
+                .substring(0, colonIndex)
+                .trim();
               if (/^[A-Za-z][A-Za-z\s'-]{0,20}$/.test(candidate)) {
-                activeSpeaker = candidate.charAt(0).toUpperCase() + candidate.slice(1).toLowerCase();
+                activeSpeaker =
+                  candidate.charAt(0).toUpperCase() +
+                  candidate.slice(1).toLowerCase();
                 activeVoiceName = resolveVoiceName(activeSpeaker);
                 // Strip the prefix
-                currentSentenceBuffer = currentSentenceBuffer.substring(colonIndex + 1).trimStart();
+                currentSentenceBuffer = currentSentenceBuffer
+                  .substring(colonIndex + 1)
+                  .trimStart();
               }
               isFirstChunk = false;
             } else if (currentSentenceBuffer.length > 25) {
-               // Give up on finding a colon if text gets too long
-               isFirstChunk = false;
+              // Give up on finding a colon if text gets too long
+              isFirstChunk = false;
             }
           }
 
           // 2. Look for sentence boundaries to chunk audio seamlessly
-          const boundaryMatch = currentSentenceBuffer.match(/([.!?]+[\"']?(?:\s+|\n+))/);
+          const boundaryMatch = currentSentenceBuffer.match(
+            /([.!?]+[\"']?(?:\s+|\n+))/,
+          );
           if (!isFirstChunk && boundaryMatch) {
-             const boundaryIndex = boundaryMatch.index! + boundaryMatch[0].length;
-             const sentence = currentSentenceBuffer.substring(0, boundaryIndex).trim();
-             currentSentenceBuffer = currentSentenceBuffer.substring(boundaryIndex).trimStart();
+            const boundaryIndex =
+              boundaryMatch.index! + boundaryMatch[0].length;
+            const sentence = currentSentenceBuffer
+              .substring(0, boundaryIndex)
+              .trim();
+            currentSentenceBuffer = currentSentenceBuffer
+              .substring(boundaryIndex)
+              .trimStart();
 
-             if (sentence.length > 0) {
-               const cleanSentence = sanitizeAiSpeech(sentence) || sentence;
-               fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
-               chunksProcessed++;
+            if (sentence.length > 0) {
+              const cleanSentence = sanitizeAiSpeech(sentence) || sentence;
+              fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
+              chunksProcessed++;
 
-               if (isTtsConfigured()) {
-                 const currentVoice = activeVoiceName; 
-                 const currentText = cleanSentence;
-                 const currentSpeaker = activeSpeaker;
-                 
-                 // Chain TTS calls so audio chunks are always sent in the exact correct order
-                 ttsPromiseChain = ttsPromiseChain.then(async () => {
-                   try {
-                     const buf = await synthesizeSpeech(currentText, currentVoice);
-                     const base64Audio = Buffer.from(buf).toString("base64");
-                     sendJson(ws, {
-                       type: "audio",
-                       data: base64Audio,
-                       text: currentText,
-                       speaker: currentSpeaker,
-                     });
-                   } catch(e) {
-                     console.error("TTS Stream Error:", e);
-                   }
-                 });
-               } else {
-                 sendJson(ws, {
-                   type: "transcript",
-                   text: cleanSentence,
-                   speaker: activeSpeaker,
-                 });
-               }
-             }
+              if (isTtsConfigured()) {
+                const currentVoice = activeVoiceName;
+                const currentText = cleanSentence;
+                const currentSpeaker = activeSpeaker;
+
+                // Chain TTS calls so audio chunks are always sent in the exact correct order
+                ttsPromiseChain = ttsPromiseChain.then(async () => {
+                  try {
+                    const buf = await synthesizeSpeech(
+                      currentText,
+                      currentVoice,
+                    );
+                    const base64Audio = Buffer.from(buf).toString("base64");
+                    sendJson(ws, {
+                      type: "audio",
+                      data: base64Audio,
+                      text: currentText,
+                      speaker: currentSpeaker,
+                    });
+                  } catch (e) {
+                    console.error("TTS Stream Error:", e);
+                  }
+                });
+              } else {
+                sendJson(ws, {
+                  type: "transcript",
+                  text: cleanSentence,
+                  speaker: activeSpeaker,
+                });
+              }
+            }
           }
         }
 
         // 3. Process the final remaining chunk in the buffer
         if (currentSentenceBuffer.trim().length > 0) {
-           const finalSentence = currentSentenceBuffer.trim();
-           const cleanSentence = sanitizeAiSpeech(finalSentence) || finalSentence;
-           fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
-           chunksProcessed++;
+          const finalSentence = currentSentenceBuffer.trim();
+          const cleanSentence =
+            sanitizeAiSpeech(finalSentence) || finalSentence;
+          fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
+          chunksProcessed++;
 
-           if (isTtsConfigured()) {
-             ttsPromiseChain = ttsPromiseChain.then(async () => {
-               try {
-                 const buf = await synthesizeSpeech(cleanSentence, activeVoiceName);
-                 const base64Audio = Buffer.from(buf).toString("base64");
-                 sendJson(ws, {
-                   type: "audio",
-                   data: base64Audio,
-                   text: cleanSentence,
-                   speaker: activeSpeaker,
-                 });
-               } catch(e) {
-                 console.error("Final TTS Error:", e);
-               }
-             });
-           } else {
-             sendJson(ws, { type: "transcript", text: cleanSentence, speaker: activeSpeaker });
-           }
+          if (isTtsConfigured()) {
+            ttsPromiseChain = ttsPromiseChain.then(async () => {
+              try {
+                const buf = await synthesizeSpeech(
+                  cleanSentence,
+                  activeVoiceName,
+                );
+                const base64Audio = Buffer.from(buf).toString("base64");
+                sendJson(ws, {
+                  type: "audio",
+                  data: base64Audio,
+                  text: cleanSentence,
+                  speaker: activeSpeaker,
+                });
+              } catch (e) {
+                console.error("Final TTS Error:", e);
+              }
+            });
+          } else {
+            sendJson(ws, {
+              type: "transcript",
+              text: cleanSentence,
+              speaker: activeSpeaker,
+            });
+          }
         }
 
         // 4. Wait for the sequential TTS delivery pipeline to completely finish
@@ -363,7 +437,11 @@ export function initRestSocket(wss: WebSocketServer) {
         }
         conversationHistory.push({ role: "assistant", text: fullSpokenText });
         if (fullSpokenText.trim()) {
-           fullTranscript.push({ type: "model", speaker: activeSpeaker, text: fullSpokenText });
+          fullTranscript.push({
+            type: "model",
+            speaker: activeSpeaker,
+            text: fullSpokenText,
+          });
         }
 
         sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
@@ -399,7 +477,13 @@ export function initRestSocket(wss: WebSocketServer) {
       void drainTurnQueue();
     };
 
-    ws.on("message", async (message) => {
+    ws.on("message", async (message, isBinary) => {
+      if (isBinary) {
+        if (sttRecognizer) {
+          sttRecognizer.pushAudio(message as Buffer);
+        }
+        return;
+      }
       try {
         const data = JSON.parse(message.toString());
 
@@ -411,7 +495,10 @@ export function initRestSocket(wss: WebSocketServer) {
           currentVideoUrl = data.url;
           if (sessionId && config.supabaseUrl && config.supabaseAnonKey) {
             try {
-              await supabase.from("sessions").update({ video_url: currentVideoUrl }).eq("id", sessionId);
+              await supabase
+                .from("sessions")
+                .update({ video_url: currentVideoUrl })
+                .eq("id", sessionId);
             } catch (e) {
               console.error("Failed to async update video URL:", e);
             }
@@ -430,47 +517,66 @@ export function initRestSocket(wss: WebSocketServer) {
           console.log("🟢 Setup complete — triggering pitch introduction...");
           enqueueTurn({ text: "", isGreeting: true });
 
-          resolveDeckText(clientConfig).then(text => {
-            resolvedDeckText = text;
-            const enrichedConfig = { ...clientConfig, resolvedDeckText };
-            masterPrompt = getMasterPrompt(isCoachMode, currentBusinessName, enrichedConfig);
-          }).catch(err => console.error("Error resolving deck text:", err));
+          resolveDeckText(clientConfig)
+            .then((text) => {
+              resolvedDeckText = text;
+              const enrichedConfig = { ...clientConfig, resolvedDeckText };
+              masterPrompt = getMasterPrompt(
+                isCoachMode,
+                currentBusinessName,
+                enrichedConfig,
+              );
+            })
+            .catch((err) => console.error("Error resolving deck text:", err));
 
           if (hasAzureSttConfig()) {
-            sttRecognizer = createStreamingRecognizer((text) => {
-              if (sessionEnded) return;
+            sttRecognizer = createStreamingRecognizer(
+              (text) => {
+                if (sessionEnded) return;
 
-              lastUserActivityTime = Date.now();
-              hasNudged = false;
+                lastUserActivityTime = Date.now();
+                hasNudged = false;
 
-              for (let i = turnQueue.length - 1; i >= 0; i--) {
-                if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
-              }
+                for (let i = turnQueue.length - 1; i >= 0; i--) {
+                  if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
+                }
 
-              enqueueTurn({ text, inputMethod: "voice" });
+                enqueueTurn({ text, inputMethod: "voice" });
 
-              summarizeVoiceInput(text).then(summary => {
-                fullTranscript.push({ type: "user", text: summary, inputMethod: "voice", fullText: text });
-                sendJson(ws, {
-                  type: "chat_message",
-                  speaker: "user",
-                  text: summary,
-                  inputMethod: "voice",
-                });
-              }).catch(err => console.error("Summarization error:", err));
+                summarizeVoiceInput(text)
+                  .then((summary) => {
+                    fullTranscript.push({
+                      type: "user",
+                      text: summary,
+                      inputMethod: "voice",
+                      fullText: text,
+                    });
+                    sendJson(ws, {
+                      type: "chat_message",
+                      speaker: "user",
+                      text: summary,
+                      inputMethod: "voice",
+                    });
+                  })
+                  .catch((err) => console.error("Summarization error:", err));
               },
               (partialText) => {
                 if (sessionEnded) return;
                 const now = Date.now();
                 // Avoid spamming stop_audio too fast
-                if (now - (sttRecognizer as any)._lastInterruption > 2000 || !(sttRecognizer as any)._lastInterruption) {
+                if (
+                  now - (sttRecognizer as any)._lastInterruption > 2000 ||
+                  !(sttRecognizer as any)._lastInterruption
+                ) {
                   (sttRecognizer as any)._lastInterruption = now;
                   sendJson(ws, { type: "stop_audio" });
                 }
-              }
+              },
             );
           } else {
-            console.warn("[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled");
+            console.warn(
+              "[stt] AZURE_SPEECH_KEY/REGION not set — voice input via server STT disabled",
+            );
           }
 
           // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
@@ -481,11 +587,16 @@ export function initRestSocket(wss: WebSocketServer) {
 
           idleCheckInterval = setInterval(() => {
             const idleMs = Date.now() - lastUserActivityTime;
-            const NUDGE_THRESHOLD = 60 * 1000;      // 60 seconds
-            const END_THRESHOLD = 5 * 60 * 1000;     // 5 minutes
+            const NUDGE_THRESHOLD = 60 * 1000; // 60 seconds
+            const END_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 
-            const elapsedSeconds = Math.floor((Date.now() - sessionStartTimestamp) / 1000);
-            const timeLeftSeconds = Math.max(0, initialDurationSeconds - elapsedSeconds);
+            const elapsedSeconds = Math.floor(
+              (Date.now() - sessionStartTimestamp) / 1000,
+            );
+            const timeLeftSeconds = Math.max(
+              0,
+              initialDurationSeconds - elapsedSeconds,
+            );
             const mins = Math.floor(timeLeftSeconds / 60);
             const secs = timeLeftSeconds % 60;
 
@@ -493,16 +604,19 @@ export function initRestSocket(wss: WebSocketServer) {
               console.log("⏱️ User idle for 5+ minutes. Auto-ending session.");
               sendJson(ws, {
                 type: "idle_end",
-                message: "Session ended due to inactivity. The panel noticed you've been silent for over 5 minutes."
+                message:
+                  "Session ended due to inactivity. The panel noticed you've been silent for over 5 minutes.",
               });
               if (idleCheckInterval) clearInterval(idleCheckInterval);
             } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
               hasNudged = true;
-              console.log("⏱️ User idle for 60+ seconds. Sending AI nudge with time context.");
+              console.log(
+                "⏱️ User idle for 60+ seconds. Sending AI nudge with time context.",
+              );
               enqueueTurn({
                 text: `[SYSTEM: The founder has been silent for 60 seconds. Pitch time remaining is ${mins} minutes and ${secs} seconds. Gently nudge them to continue their pitch, ask if they need help, or ask a specific follow-up question based on their pitch deck. Keep it conversational.]`,
                 inputMethod: "chat",
-                isNudge: true
+                isNudge: true,
               });
             }
           }, 5000);
@@ -540,28 +654,31 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
-          
+
           enqueueTurn({
             text: data.text,
-            timeLeft: typeof data.timeLeft === "number" ? data.timeLeft : undefined,
+            timeLeft:
+              typeof data.timeLeft === "number" ? data.timeLeft : undefined,
             inputMethod,
           });
 
           if (inputMethod === "voice") {
-            summarizeVoiceInput(data.text).then(summary => {
-              fullTranscript.push({
-                type: "user",
-                text: summary,
-                inputMethod,
-                fullText: data.text
-              });
-              sendJson(ws, {
-                type: "chat_message",
-                speaker: "user",
-                text: summary,
-                inputMethod,
-              });
-            }).catch(err => console.error("Summarization error:", err));
+            summarizeVoiceInput(data.text)
+              .then((summary) => {
+                fullTranscript.push({
+                  type: "user",
+                  text: summary,
+                  inputMethod,
+                  fullText: data.text,
+                });
+                sendJson(ws, {
+                  type: "chat_message",
+                  speaker: "user",
+                  text: summary,
+                  inputMethod,
+                });
+              })
+              .catch((err) => console.error("Summarization error:", err));
           } else {
             fullTranscript.push({
               type: "user",
@@ -581,14 +698,16 @@ export function initRestSocket(wss: WebSocketServer) {
           const panelists = data.panelists || [
             { name: "Marcus", role: "Lead Investor" },
             { name: "Sarah", role: "Financial Analyst" },
-            { name: "Chen", role: "Technical Partner" }
+            { name: "Chen", role: "Technical Partner" },
           ];
-          const panelistNames = panelists.map((p: any) => `${p.name} (${p.role})`).join(', ');
+          const panelistNames = panelists
+            .map((p: any) => `${p.name} (${p.role})`)
+            .join(", ");
 
           enqueueTurn({
             text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name, state INVEST or PASS, and give ONE reason in 1-2 sentences. Keep it brief. Do not ask any more questions. Start now.]`,
             isVerdict: true,
-            panelists: panelists
+            panelists: panelists,
           });
           return;
         }
@@ -605,7 +724,9 @@ export function initRestSocket(wss: WebSocketServer) {
             idleCheckInterval = null;
           }
           console.log("🏁 Session ended, starting evaluation...");
-          const frontendTranscript = Array.isArray(data.transcript) ? data.transcript : fullTranscript;
+          const frontendTranscript = Array.isArray(data.transcript)
+            ? data.transcript
+            : fullTranscript;
           const durationSec = Number(data.duration) || 0;
 
           let reportData: any = {
@@ -621,7 +742,9 @@ export function initRestSocket(wss: WebSocketServer) {
             evaluationStatus: "insufficient_data",
           };
 
-          const userTurns = frontendTranscript.filter((m: any) => m.type === "user");
+          const userTurns = frontendTranscript.filter(
+            (m: any) => m.type === "user",
+          );
           const totalUserTextLength = userTurns.reduce(
             (sum: number, m: any) => sum + (m.text || "").length,
             0,
@@ -634,7 +757,11 @@ export function initRestSocket(wss: WebSocketServer) {
               resolvedDeckText,
               sessionMode,
             );
-            reportData = { ...reportData, ...evaluated, evaluationStatus: "complete" };
+            reportData = {
+              ...reportData,
+              ...evaluated,
+              evaluationStatus: "complete",
+            };
             console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
           } catch (evalErr) {
             console.error("❌ Evaluation failed:", evalErr);
@@ -680,13 +807,21 @@ export function initRestSocket(wss: WebSocketServer) {
                 })
                 .then(({ error: cacheErr }) => {
                   if (cacheErr) {
-                    console.warn(`⚠️ Failed to cache background PDF for session ${dbData.id}:`, cacheErr.message);
+                    console.warn(
+                      `⚠️ Failed to cache background PDF for session ${dbData.id}:`,
+                      cacheErr.message,
+                    );
                   } else {
-                    console.log(`✅ Background PDF cached successfully for session ${dbData.id}`);
+                    console.log(
+                      `✅ Background PDF cached successfully for session ${dbData.id}`,
+                    );
                   }
                 })
                 .catch((err) => {
-                  console.error(`❌ Background PDF generation failed for session ${dbData.id}:`, err);
+                  console.error(
+                    `❌ Background PDF generation failed for session ${dbData.id}:`,
+                    err,
+                  );
                 });
             }
           } catch (dbErr) {
@@ -705,7 +840,12 @@ export function initRestSocket(wss: WebSocketServer) {
             });
           }
 
-          sendJson(ws, { type: "report", data: reportData, sessionId, shareId });
+          sendJson(ws, {
+            type: "report",
+            data: reportData,
+            sessionId,
+            shareId,
+          });
         }
       } catch {
         // Ignore non-JSON messages (legacy raw audio payloads)

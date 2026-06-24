@@ -35,6 +35,7 @@ async function resolveDeckText(clientConfig: any): Promise<string> {
 
 export function initLiveSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws) => {
+    let lastPcmTime = Date.now();
     let currentVideoUrl = "";
     let currentBusinessName = "Unknown Pitch";
     let currentUserId: number | null = null;
@@ -247,20 +248,23 @@ export function initLiveSocket(wss: WebSocketServer) {
     });
 
     ws.on("message", async (message, isBinary) => {
+      console.log("MESSAGE:", typeof message, isBinary, message.length);
+
       try {
         // Handle raw PCM audio
         if (isBinary) {
+          lastPcmTime = Date.now();
           lastUserActivityTime = Date.now();
           hasNudged = false;
-
           if (
             aiWs.readyState === WebSocket.OPEN &&
             hasSentSetup &&
             !verdictInProgress
           ) {
+            console.log("🎤 Backend received audio:", message);
+
             aiWs.send(message);
           }
-
           return;
         }
 
@@ -327,7 +331,7 @@ export function initLiveSocket(wss: WebSocketServer) {
 
           idleCheckInterval = setInterval(() => {
             const idleMs = Date.now() - lastUserActivityTime;
-            const NUDGE_THRESHOLD = 35 * 1000; // 35 seconds
+            const NUDGE_THRESHOLD = 90 * 1000; // 35 seconds
             const END_THRESHOLD = 3 * 60 * 1000; // 3 minutes
 
             const elapsedSeconds = Math.floor(
@@ -459,12 +463,11 @@ export function initLiveSocket(wss: WebSocketServer) {
             const secs = data.timeLeft % 60;
             textWithTime = `[PITCH TIME REMAINING: ${mins}m ${secs}s] ${data.text}`;
           }
-
           aiWs.send(
             JSON.stringify({
-              clientContent: {
-                turns: [{ role: "user", parts: [{ text: textWithTime }] }],
-                turnComplete: true,
+              realtimeInput: {
+                // ← GOOD: doesn't interrupt PCM stream
+                text: textWithTime,
               },
             }),
           );
