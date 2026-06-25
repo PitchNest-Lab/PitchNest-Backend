@@ -154,6 +154,16 @@ export function initRestSocket(wss: WebSocketServer) {
     let initialDurationSeconds = 15 * 60;
     let sessionEnded = false;
 
+    // Evaluation can be pre-started (in parallel with the verdict phase) so the
+    // report is ready by the time the panel finishes speaking. See the
+    // `prepare_evaluation` handler and `end_session` below.
+    let evaluationPromise: Promise<any> | null = null;
+
+    // Barge-in: aborts the in-flight AI turn (LLM generation + TTS streaming).
+    // Set when processing a standard turn; triggered by an `interrupt` message
+    // or an STT partial transcript. See processAiTurn and the message handler.
+    let currentTurnAbort: AbortController | null = null;
+
     console.log(
       "✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)",
     );
@@ -289,6 +299,10 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         // ── TURBO-STREAMING PIPELINE FOR STANDARD TURNS ──
+        // Fresh abort controller for this turn — barge-in cancels it.
+        const turnAbort = new AbortController();
+        currentTurnAbort = turnAbort;
+
         let currentSentenceBuffer = "";
         let isFirstChunk = true;
         let activeSpeaker = isCoachMode ? "Riley" : "Marcus";
@@ -311,9 +325,11 @@ export function initRestSocket(wss: WebSocketServer) {
           userInputToUse,
           turn.isGreeting ? [] : conversationHistory,
           promptToUse,
+          turnAbort.signal,
         );
 
         for await (const token of stream) {
+          if (turnAbort.signal.aborted) break;
           currentSentenceBuffer += token;
 
           // 1. On the very first burst, extract the speaker identity if it exists
@@ -366,11 +382,13 @@ export function initRestSocket(wss: WebSocketServer) {
 
                 // Chain TTS calls so audio chunks are always sent in the exact correct order
                 ttsPromiseChain = ttsPromiseChain.then(async () => {
+                  if (turnAbort.signal.aborted) return;
                   try {
                     const buf = await synthesizeSpeech(
                       currentText,
                       currentVoice,
                     );
+                    if (turnAbort.signal.aborted) return;
                     const base64Audio = Buffer.from(buf).toString("base64");
                     sendJson(ws, {
                       type: "audio",
@@ -393,8 +411,8 @@ export function initRestSocket(wss: WebSocketServer) {
           }
         }
 
-        // 3. Process the final remaining chunk in the buffer
-        if (currentSentenceBuffer.trim().length > 0) {
+        // 3. Process the final remaining chunk in the buffer (skip if barged in)
+        if (!turnAbort.signal.aborted && currentSentenceBuffer.trim().length > 0) {
           const finalSentence = currentSentenceBuffer.trim();
           const cleanSentence =
             sanitizeAiSpeech(finalSentence) || finalSentence;
@@ -403,11 +421,13 @@ export function initRestSocket(wss: WebSocketServer) {
 
           if (isTtsConfigured()) {
             ttsPromiseChain = ttsPromiseChain.then(async () => {
+              if (turnAbort.signal.aborted) return;
               try {
                 const buf = await synthesizeSpeech(
                   cleanSentence,
                   activeVoiceName,
                 );
+                if (turnAbort.signal.aborted) return;
                 const base64Audio = Buffer.from(buf).toString("base64");
                 sendJson(ws, {
                   type: "audio",
@@ -431,7 +451,11 @@ export function initRestSocket(wss: WebSocketServer) {
         // 4. Wait for the sequential TTS delivery pipeline to completely finish
         await ttsPromiseChain;
 
-        // 5. Update histories
+        const wasAborted = turnAbort.signal.aborted;
+        if (currentTurnAbort === turnAbort) currentTurnAbort = null;
+
+        // 5. Update histories (record whatever was actually spoken, even if the
+        // turn was cut short by a barge-in, so context stays coherent)
         if (!turn.isGreeting) {
           conversationHistory.push({ role: "user", text: userInput });
         }
@@ -444,8 +468,15 @@ export function initRestSocket(wss: WebSocketServer) {
           });
         }
 
-        sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
+        // Clear turn boundary marker so the client knows it's safe to resume
+        // sending audio for the next turn.
+        if (wasAborted) {
+          sendJson(ws, { type: "turn_aborted" });
+        } else {
+          sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
+        }
       } catch (err: any) {
+        if (currentTurnAbort) currentTurnAbort = null;
         console.error("❌ Error generating AI response:", err);
         sendJson(ws, {
           type: "error",
@@ -479,7 +510,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("message", async (message, isBinary) => {
       if (isBinary) {
-        if (sttRecognizer) {
+        if (sttRecognizer && !sessionEnded) {
           sttRecognizer.pushAudio(message as Buffer);
         }
         return;
@@ -488,6 +519,18 @@ export function initRestSocket(wss: WebSocketServer) {
         const data = JSON.parse(message.toString());
 
         if (sessionEnded && data.type !== "set_video_url") {
+          return;
+        }
+
+        // ── Barge-in: client detected the founder talking over the panel ──
+        // Abort the in-flight turn so the server stops generating + streaming
+        // audio (the client has already silenced local playback).
+        if (data.type === "interrupt") {
+          if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
+            currentTurnAbort.abort();
+          }
+          lastUserActivityTime = Date.now();
+          hasNudged = false;
           return;
         }
 
@@ -553,15 +596,20 @@ export function initRestSocket(wss: WebSocketServer) {
                     });
                     sendJson(ws, {
                       type: "chat_message",
-                      speaker: "user",
+                      role: "user",
                       text: summary,
                       inputMethod: "voice",
                     });
                   })
                   .catch((err) => console.error("Summarization error:", err));
               },
-              (partialText) => {
+              (_partialText) => {
                 if (sessionEnded) return;
+                // Barge-in via server STT: abort the in-flight turn so the
+                // server stops generating + streaming further audio.
+                if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
+                  currentTurnAbort.abort();
+                }
                 const now = Date.now();
                 // Avoid spamming stop_audio too fast
                 if (
@@ -673,7 +721,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 });
                 sendJson(ws, {
                   type: "chat_message",
-                  speaker: "user",
+                  role: "user",
                   text: summary,
                   inputMethod,
                 });
@@ -709,6 +757,35 @@ export function initRestSocket(wss: WebSocketServer) {
             isVerdict: true,
             panelists: panelists,
           });
+          return;
+        }
+
+        if (data.type === "prepare_evaluation") {
+          // Kick off the evaluation in the background the moment the user ends
+          // their pitch, so it runs in parallel with the verdict phase. By the
+          // time the panel finishes speaking, the report is usually ready.
+          if (!evaluationPromise && !sessionEnded) {
+            const t = Array.isArray(data.transcript)
+              ? data.transcript
+              : fullTranscript;
+            const hasUserContent = t.some(
+              (m: any) => m.type === "user" && (m.text || "").trim().length > 0,
+            );
+            if (hasUserContent) {
+              console.log(
+                "🧠 Pre-starting evaluation in background (parallel with verdicts)...",
+              );
+              evaluationPromise = evaluatePitch(
+                t,
+                currentBusinessName,
+                resolvedDeckText,
+                sessionMode,
+              ).catch((err) => {
+                console.error("❌ Background evaluation failed:", err);
+                return null;
+              });
+            }
+          }
           return;
         }
 
@@ -751,12 +828,17 @@ export function initRestSocket(wss: WebSocketServer) {
           );
 
           try {
-            const evaluated = await evaluatePitch(
-              frontendTranscript,
-              currentBusinessName,
-              resolvedDeckText,
-              sessionMode,
-            );
+            // Reuse the evaluation that was pre-started during the verdict
+            // phase if available; otherwise run it now.
+            let evaluated = evaluationPromise ? await evaluationPromise : null;
+            if (!evaluated) {
+              evaluated = await evaluatePitch(
+                frontendTranscript,
+                currentBusinessName,
+                resolvedDeckText,
+                sessionMode,
+              );
+            }
             reportData = {
               ...reportData,
               ...evaluated,

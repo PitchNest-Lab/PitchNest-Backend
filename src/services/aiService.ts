@@ -1,7 +1,7 @@
 import { config } from "../config/env.ts";
 
 /**
- * Interface representing standard evaluation metrics and sentiments returned by Gemini.
+ * Interface representing standard evaluation metrics and sentiments returned by the AI model.
  */
 export interface EvaluationReport {
   summary: string;
@@ -52,7 +52,9 @@ export interface EvaluationReport {
     strength: string;
     weakness: string;
     size: string;
+    estimated?: boolean;
   }>;
+  competitors_disclaimer?: string;
   companies_to_study?: Array<{ name: string; why: string }>;
   top_priorities?: Array<{
     title: string;
@@ -177,7 +179,14 @@ function validateEvaluationReport(raw: any): EvaluationReport {
           similarity: Math.min(100, Math.max(0, Math.round(Number(c.similarity) || 0))),
           strength: String(c.strength || ""),
           weakness: String(c.weakness || ""),
-          size: String(c.size || "N/A"),
+          // Figures are AI-estimated, not sourced — label them so they aren't
+          // mistaken for verified facts (see FIX 6A).
+          size: (() => {
+            const v = String(c.size || "").trim();
+            if (!v || v.toUpperCase() === "N/A") return "N/A";
+            return /est|approx|~/i.test(v) ? v : `Est. ${v}`;
+          })(),
+          estimated: true,
         }))
     : undefined;
 
@@ -256,6 +265,8 @@ function validateEvaluationReport(raw: any): EvaluationReport {
     question_difficulty: questionDifficulty,
     vc_investment_probability: vcInvestmentProbability,
     competitors,
+    competitors_disclaimer:
+      "Competitor similarity and market-size figures are AI-generated estimates, not verified data. Treat them as directional, not authoritative.",
     companies_to_study: companiesToStudy,
     top_priorities: topPriorities,
     answer_framework: answerFramework,
@@ -535,7 +546,7 @@ ADDITIONAL ANALYSIS (provide these for the report):
 - collaboration_opportunities: List 4 specific strategic collaboration opportunities to accelerate growth for this business. Be specific to the industry and model, not generic.
 - question_difficulty: Count the investor questions from this session as easy (intro/clarification), medium (business model/market), hard (tough financial/competitive). Return {easy, medium, hard} as integer counts.
 - vc_investment_probability: Estimate probability (0-100) that this pitch would receive a follow-up meeting from a typical early-stage VC, based on pitch quality, market opportunity, and traction evidence shown.
-- competitors: Identify 4 REAL competitors in this founder's specific industry and space (not generic tools). For each: name (real company), similarity (0-100 to this business), strength (one key advantage), weakness (one genuine gap), size (estimated market size or ARR e.g. "$10M+").
+- competitors: Identify 4 REAL competitors in this founder's specific industry and space (not generic tools). For each: name (real company), similarity (0-100 to this business), strength (one key advantage), weakness (one genuine gap), size. IMPORTANT: you do NOT have verified financials — express size as a HEDGED RANGE clearly marked as an estimate (e.g. "Est. ~$10M–$50M ARR" or "approx. mid-market"), never a single precise figure presented as fact. If you genuinely cannot estimate, use "N/A".
 - companies_to_study: List 4 companies this founder should study for inspiration or benchmarking — not necessarily direct competitors. Specific to their industry. For each: name, why (one sentence tailored to this business and what they can learn).
 - top_priorities: Based on weaknesses found in THIS pitch, list exactly 5 specific priority improvements. For each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority" or "Medium Priority"), impact ("Very High", "High", or "Medium").
 - answer_framework: Pick the single hardest or most avoided investor question from this session. Build a 5-step answer framework for it. question: the exact question text, steps: [{label: short step name, text: how to answer that step}].
@@ -665,10 +676,11 @@ export async function summarizeVoiceInput(text: string): Promise<string> {
 export async function* streamPanelResponse(
   userInput: string,
   history: any[],
-  systemInstruction: string
+  systemInstruction: string,
+  signal?: AbortSignal
 ): AsyncGenerator<string, void, unknown> {
   const openai = getOpenAIClient();
-  
+
   const messages: any[] = [
     { role: "system", content: systemInstruction },
     ...history.map(m => ({
@@ -679,21 +691,31 @@ export async function* streamPanelResponse(
   ];
 
   try {
-    const stream = await openai.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
-      messages: messages,
-      temperature: 0.7,
-      max_tokens: 320,
-      stream: true,
-    });
+    // Pass the abort signal so the LLM generation itself is cancelled on
+    // barge-in — we stop paying for tokens we'll throw away.
+    const stream = await openai.chat.completions.create(
+      {
+        model: config.azureOpenAiDeployment || "gpt-4o",
+        messages: messages,
+        temperature: 0.7,
+        max_tokens: 320,
+        stream: true,
+      },
+      { signal }
+    );
 
     for await (const chunk of stream) {
+      if (signal?.aborted) break;
       const text = chunk.choices[0]?.delta?.content || "";
       if (text) {
         yield text;
       }
     }
   } catch (err: any) {
+    // Barge-in aborts surface as AbortError — that's expected, not a failure.
+    if (signal?.aborted || err?.name === "AbortError") {
+      return;
+    }
     console.error("❌ OpenAI Panel Streaming Error:", err.message);
     throw err;
   }

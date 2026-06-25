@@ -13,21 +13,33 @@ import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.t
 
 const app = express();
 
+// Required for Render (and any reverse proxy) — lets Express see real client IPs
+// so express-rate-limit can correctly identify users via X-Forwarded-For.
+app.set("trust proxy", 1);
+
 // Global Middlewares — CORS restricted to allowed origins
+const isProduction = config.nodeEnv === "production";
+
+// In production, only the real frontend domain(s) are allowed. Localhost dev
+// origins are permitted only outside production.
 const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
   config.allowedOrigin,
+  'https://pitchnestapp.vercel.app',
+  ...(isProduction ? [] : ['http://localhost:5173', 'http://localhost:3000']),
 ].filter(Boolean);
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, etc.)
+    // Allow requests with no origin (curl, server-to-server, native clients).
     if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
-    } else {
+    } else if (isProduction) {
       console.warn(`⚠️ CORS blocked origin: ${origin}`);
-      callback(null, true); // Allow anyway in early stage — tighten later
+      callback(new Error("Not allowed by CORS"));
+    } else {
+      // Dev only: allow unknown origins to keep local tooling friction-free.
+      console.warn(`⚠️ CORS: allowing unlisted origin in dev: ${origin}`);
+      callback(null, true);
     }
   },
   credentials: true,

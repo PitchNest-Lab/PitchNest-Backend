@@ -12,7 +12,7 @@ const SPEAKER_PREFIX = /^(?:marcus|riley|sarah|chen|investor|founder|panelist):\
 
 /**
  * Strips meta-talk, markdown, stage directions, and other non-spoken content
- * from Gemini live audio transcription chunks.
+ * from the AI model's streamed response chunks.
  * Returns null when the entire chunk should be discarded.
  */
 export function sanitizeAiSpeech(rawText: string): string | null {
