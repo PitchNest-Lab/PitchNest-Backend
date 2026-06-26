@@ -74,6 +74,20 @@ function hedgeSize(v: unknown): string {
   return /est|approx|~/i.test(s) ? s : `Est. ${s}`;
 }
 
+// Compact form for the page-4 "Est. Size" column: the estimate caveat is carried
+// by the column header + disclaimer, so we strip the redundant "Est."/"approx."
+// prefix, the "~", and a trailing "ARR" to keep each cell on one line.
+function compactSize(v: unknown): string {
+  let s = String(v || "").trim();
+  if (!s || s.toUpperCase() === "N/A") return "N/A";
+  s = s
+    .replace(/^(?:est\.?|approx\.?|approximately|around|about)\s*/i, "")
+    .replace(/~\s*/g, "")
+    .replace(/\s*ARR\b/i, "")
+    .trim();
+  return s || "N/A";
+}
+
 function formatDate(dateStr?: string): string {
   if (!dateStr) return "Unknown Date";
   try {
@@ -882,7 +896,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.dark).text("EXECUTIVE SUMMARY");
       doc.y += 6;
       const rawSummary = report.summary || "This pitch was too short to generate a full evaluation. Please complete a session speaking for at least 2 minutes to get full VC grading and analytics.";
-      const summary = fitText(doc, rawSummary, 260, "Inter", 9, 8, 3.5);
+      // Use the full height available before Category Breakdown (~10 lines). A
+      // normal 2-3 sentence summary fits fully; only abusively long input is
+      // word-boundary truncated (never mid-word) by fitText.
+      const summary = fitText(doc, rawSummary, 260, "Inter", 9, 10, 3.5);
       doc.font("Inter").fontSize(9).fillColor(COLORS.text).text(summary, 50, doc.y, { width: 260, lineGap: 3.5 });
 
       // Right Column Overall Score Card — improved contrast
@@ -1269,7 +1286,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("DIRECT COMPETITORS", 50, 75);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("Real competitors in your industry identified by AI analysis (figures are AI estimates)", 50, 87);
 
-      const p4CompColW = [118, 50, 112, 155, 50];
+      const p4CompColW = [118, 50, 112, 132, 73];
       const p4CompHeaders = ["Company", "Similarity", "Strengths", "Weaknesses", "Est. Size"];
       let p4fty = 106;
 
@@ -1278,7 +1295,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // wrapping text but can never overflow the page.
       const p4Cells = competitorList.map((c: any) => ({
         strength: fitText(doc, c.strength, 104, "Inter", 6.5, 3, 1.5),
-        weakness: fitText(doc, c.weakness, 128, "Inter", 6.5, 3, 1.5),
+        weakness: fitText(doc, c.weakness, 104, "Inter", 6.5, 3, 1.5),
       }));
       const p4RowHeights = p4Cells.map((c) =>
         measureRowHeight(
@@ -1287,7 +1304,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
             { text: c.strength, fontSize: 6.5 },
             { text: c.weakness, fontSize: 6.5 },
           ],
-          [104, 128],
+          [104, 104],
           0,
           5,
           1.5,
@@ -1318,8 +1335,11 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.circle(240, p4RowY + 7, 4).fill(COLORS.emerald);
         doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(p4Cells[cIdx].strength, 248, p4RowY, { width: 104, lineGap: 1.5 });
         doc.circle(364, p4RowY + 7, 4).fill(COLORS.rose);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(p4Cells[cIdx].weakness, 372, p4RowY, { width: 128, lineGap: 1.5 });
-        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.dark).text(hedgeSize(c.size), 502, p4RowY + 3, { align: "right", width: 38 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(p4Cells[cIdx].weakness, 372, p4RowY, { width: 104, lineGap: 1.5 });
+        // Est. Size: the "Est." caveat lives in the column header + disclaimer, so
+        // the cell shows just the compact range (no per-row "Est." prefix or
+        // trailing "ARR") in a wider column that no longer wraps.
+        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.dark).text(compactSize(c.size), 482, p4RowY + 3, { align: "right", width: 58 });
         // Row divider between competitors
         if (cIdx < competitorList.length - 1) {
           doc.moveTo(60, p4RowY + rowH - 3).lineTo(535, p4RowY + rowH - 3).strokeColor(COLORS.border).lineWidth(0.25).stroke();

@@ -24,6 +24,9 @@ import crypto from "crypto";
 
 const MIN_EVAL_USER_CHARS = 150;
 const MIN_EVAL_DURATION_SEC = 60;
+// Below this Azure STT confidence (0..1) we treat a recognition as likely
+// garbled and ask the founder to repeat instead of answering it.
+const LOW_STT_CONFIDENCE = 0.4;
 
 async function resolveDeckText(clientConfig: any): Promise<string> {
   const deck = clientConfig?.selectedDeck;
@@ -574,7 +577,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
           if (hasAzureSttConfig()) {
             sttRecognizer = createStreamingRecognizer(
-              (text) => {
+              (text, confidence) => {
                 if (sessionEnded) return;
 
                 lastUserActivityTime = Date.now();
@@ -582,6 +585,23 @@ export function initRestSocket(wss: WebSocketServer) {
 
                 for (let i = turnQueue.length - 1; i >= 0; i--) {
                   if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
+                }
+
+                // Low-confidence recognitions are usually mis-transcriptions
+                // (background noise, clipped speech). Rather than have the panel
+                // confidently answer garbage like "Sorry, that wasn't a pitch",
+                // ask the founder to repeat — and do NOT record the garbled text
+                // in the transcript, so it can't pollute the evaluation.
+                if (confidence < LOW_STT_CONFIDENCE) {
+                  console.log(
+                    `[stt] low confidence (${confidence.toFixed(2)}), asking founder to repeat:`,
+                    text,
+                  );
+                  enqueueTurn({
+                    text: "[SYSTEM: The founder's last words came through garbled / could not be heard clearly. In ONE short, friendly sentence, ask them to repeat what they just said. Do NOT answer, evaluate, or guess at the unclear input.]",
+                    inputMethod: "voice",
+                  });
+                  return;
                 }
 
                 enqueueTurn({ text, inputMethod: "voice" });

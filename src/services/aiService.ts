@@ -599,8 +599,7 @@ export async function evaluatePitch(
 
   const isCoachOrSolo = mode === "coach" || mode === "solo";
 
-  const evaluationPrompt = isCoachOrSolo
-    ? `You are Riley, an elite startup pitch coach. Review this coaching session and write a comprehensive development report for your student. Return ONLY valid JSON.
+  const coachPrompt = `You are Riley, an elite startup pitch coach. Review this coaching session and write a comprehensive development report for your student. Return ONLY valid JSON.
 
 BUSINESS: ${businessName}
 ${deckSection}
@@ -629,45 +628,38 @@ Return this exact JSON structure:
   "risks": ["specific gap or weakness 1", "gap 2", "gap 3"],
   "next_steps": [ { "title": "Practice action title", "desc": "Short actionable coaching instruction", "priority": "High Priority" } ],
   "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ]
-}`
-    : `You are an expert pitch evaluator and market intelligence analyst. Analyze this investor pitch conversation and return ONLY valid JSON.
+}`;
 
-BUSINESS: ${businessName}
+  // ── Panel evaluation: split into 3 concurrent calls ──────────────────────
+  // Faster than one 4096-token monolith (the calls run in parallel), and a parse
+  // failure in one section no longer forces the entire report to regenerate.
+  const panelCtx = `BUSINESS: ${businessName}
 ${deckSection}
 TRANSCRIPT:
-${transcriptText}
+${transcriptText}`;
 
-EVALUATION RULES:
-- Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
-- IF THE FOUNDER WAS SILENT OR THE PITCH WAS TOO SHORT: Do not error out. Instead, provide low/fitting scores (e.g., 0-10) and use the summary to friendly critique the lack of material (e.g., "The system was listening, but you were mostly silent. Provide more detail next time.")
+  const sharedRules = `- NEVER invent a specific fundraising amount; only use a concrete raise figure if the founder explicitly stated it, otherwise say "your target raise".
+- Be specific — cite actual topics discussed, not generic advice. Cross-check against the deck when provided.`;
+
+  const corePrompt = `You are an expert pitch evaluator. Analyze this investor pitch and return ONLY valid JSON (the scored core of the report).
+
+${panelCtx}
+
+RULES:
+- Score each category (delivery, clarity, scalability, readiness) as integers 0-100.
+- IF THE FOUNDER WAS SILENT OR THE PITCH WAS TOO SHORT: do not error; give low/fitting scores (0-10) and a friendly summary noting the lack of material.
 - delivery = vocal confidence, pacing, conviction, handling pressure.
 - clarity = problem/solution narrative, structure, jargon control.
 - scalability = market size, growth model, unit economics, GTM scalability.
 - readiness = overall investability for the stated funding stage.
-- Cross-check transcript claims against deck content when deck is provided.
-- Be specific — cite actual topics discussed, not generic advice.
-- NEVER invent a specific fundraising amount. Only state a concrete raise/funding figure (e.g. "$2M seed") if the founder explicitly said it in the transcript. Otherwise always use generic wording like "your target raise" or "your funding ask". This applies to summary, questions_to_prepare, top_priorities, and answer_framework especially.
-- Keep summary to 2-3 sentences. Strengths/risks must reference real content.
-- Include one sentiment quote each for Marcus, Sarah, and Chen.
-
-ADDITIONAL ANALYSIS (provide these for the report):
-- topic_coverage: Estimate how well the founder covered each key pitch topic as a percentage (0-100). Topics: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details.
-- transcript_summary: Write a 3-5 sentence summary of what happened during the pitch session, what was discussed, what was missed.
-- questions_to_prepare: List 6 tough investor questions the founder should practice answering based on weak areas from this session.
-- competitive_landscape.swot: Based on the business described, provide a SWOT analysis (4 items per category).
-- competitive_landscape.strategic_recommendation: A 2-3 sentence strategic recommendation based on competitive positioning.
-- competitive_landscape.key_focus_areas: 4 key areas the founder should focus on.
-- practice_drills: 4 practice drills with title, desc, reps, and time.
-- market_gaps: Based on this specific business and industry, identify 3-4 key market gaps that competitors are NOT addressing. For each: title (3-5 words) and desc (one sentence specific to this business).
-- collaboration_opportunities: List 4 specific strategic collaboration opportunities to accelerate growth for this business. Be specific to the industry and model, not generic.
-- question_difficulty: Count the investor questions from this session as easy (intro/clarification), medium (business model/market), hard (tough financial/competitive). Return {easy, medium, hard} as integer counts.
-- vc_investment_probability: Estimate probability (0-100) that this pitch would receive a follow-up meeting from a typical early-stage VC, based on pitch quality, market opportunity, and traction evidence shown.
-- competitors: Identify 4 REAL competitors in this founder's specific industry and space (not generic tools). For each: name (real company), similarity (0-100 to this business), strength (one key advantage), weakness (one genuine gap), size. IMPORTANT: you do NOT have verified financials — express size as a HEDGED RANGE clearly marked as an estimate (e.g. "Est. ~$10M–$50M ARR" or "approx. mid-market"), never a single precise figure presented as fact. If you genuinely cannot estimate, use "N/A".
-- companies_to_study: List 4 companies this founder should study for inspiration or benchmarking — not necessarily direct competitors. Specific to their industry. For each: name, why (one sentence tailored to this business and what they can learn).
-- top_priorities: Based on weaknesses found in THIS pitch, list exactly 5 specific priority improvements. For each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority" or "Medium Priority"), impact ("Very High", "High", or "Medium").
-- answer_framework: Pick the single hardest or most avoided investor question from this session. Build a 5-step answer framework for it. question: the exact question text, steps: [{label: short step name, text: how to answer that step}].
-- category_matrix: For each score category (Delivery, Clarity, Scalability, Readiness), write: category name, went_well (one specific sentence referencing what the founder actually did), needs_improvement (one specific sentence about a real gap), impact ("High", "Moderate", or "Low").
-- confidence_timeline: Estimate the founder's confidence at 5 time intervals across the session based on how they spoke. Return [{time: "0:00", value: 85}, ...]. Values should fluctuate realistically — start point, after first hard question, during weakest moment, during recovery, at close. (This is a single confidence series — do NOT add a second metric.)
+- Keep summary to 2-3 sentences. Include one sentiment quote each for Marcus, Sarah, and Chen.
+- topic_coverage: percentage 0-100 for each topic: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details.
+- transcript_summary: 3-5 sentence summary of what was discussed and what was missed.
+- question_difficulty: integer counts {easy, medium, hard} of the panel's questions.
+- vc_investment_probability: 0-100 chance this pitch earns a VC follow-up meeting.
+- category_matrix: for Delivery, Clarity, Scalability, Readiness — went_well + needs_improvement (specific) + impact ("High"/"Moderate"/"Low").
+- confidence_timeline: 5 points fluctuating realistically (start, after first hard question, weakest moment, recovery, close).
+${sharedRules}
 
 Return this exact JSON structure:
 {
@@ -679,58 +671,127 @@ Return this exact JSON structure:
   "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ],
   "topic_coverage": [ { "topic": "Problem Definition", "percentage": 90 }, { "topic": "Solution Overview", "percentage": 80 }, { "topic": "Market Size", "percentage": 30 }, { "topic": "Business Model", "percentage": 20 }, { "topic": "Go-to-Market", "percentage": 10 }, { "topic": "Traction", "percentage": 0 }, { "topic": "Team", "percentage": 0 }, { "topic": "Financials", "percentage": 0 }, { "topic": "Technical Details", "percentage": 5 } ],
   "transcript_summary": "3-5 sentence summary of the session",
-  "questions_to_prepare": ["Question 1", "Question 2", "Question 3", "Question 4", "Question 5", "Question 6"],
+  "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
+  "vc_investment_probability": 25,
+  "category_matrix": [ { "category": "Delivery", "went_well": "Specific sentence", "needs_improvement": "Specific sentence", "impact": "Moderate" } ],
+  "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ]
+}`;
+
+  const intelPrompt = `You are a market intelligence analyst. Based on this pitch, return ONLY valid JSON with competitive analysis.
+
+${panelCtx}
+
+RULES:
+- competitors: 4 REAL competitors in this founder's specific space (not generic tools). Each: name (real company), similarity (0-100), strength, weakness, size. You do NOT have verified financials — express size as a HEDGED RANGE clearly marked as an estimate (e.g. "Est. ~$10M–$50M ARR" or "approx. mid-market"), never a single precise figure. Use "N/A" if you cannot estimate.
+- companies_to_study: 4 companies (not necessarily competitors) this founder should learn from, each with a one-sentence why tailored to this business.
+- market_gaps: 3-4 gaps competitors are NOT addressing. Each: title (3-5 words) + desc (one sentence specific to this business).
+- collaboration_opportunities: 4 specific strategic collaboration opportunities for this business.
+- competitive_landscape.swot: 4 items each for strengths, weaknesses, opportunities, threats.
+- competitive_landscape.strategic_recommendation: 2-3 sentences. key_focus_areas: 4 areas.
+${sharedRules}
+
+Return this exact JSON structure:
+{
+  "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "Est. ~$10M–$50M ARR" } ],
+  "companies_to_study": [ { "name": "Company Name", "why": "One sentence specific to this founder." } ],
+  "market_gaps": [ { "title": "Specific Gap Title", "desc": "One sentence about why this is a gap." } ],
+  "collaboration_opportunities": ["Opportunity 1", "Opportunity 2", "Opportunity 3", "Opportunity 4"],
   "competitive_landscape": {
     "swot": { "strengths": ["s1","s2","s3","s4"], "weaknesses": ["w1","w2","w3","w4"], "opportunities": ["o1","o2","o3","o4"], "threats": ["t1","t2","t3","t4"] },
     "strategic_recommendation": "2-3 sentence strategic recommendation",
     "key_focus_areas": ["Focus 1", "Focus 2", "Focus 3", "Focus 4"]
-  },
-  "practice_drills": [ { "title": "Drill name", "desc": "What to practice", "reps": "3 Reps", "time": "5 min" } ],
-  "market_gaps": [ { "title": "Specific Gap Title", "desc": "One sentence about why this is a gap for this business." } ],
-  "collaboration_opportunities": ["Specific opportunity 1", "Specific opportunity 2", "Specific opportunity 3", "Specific opportunity 4"],
-  "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
-  "vc_investment_probability": 25,
-  "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "Est. ~$10M–$50M ARR" } ],
-  "companies_to_study": [ { "name": "Company Name", "why": "One sentence specific to why this founder should study them." } ],
-  "top_priorities": [ { "title": "Priority Title 3-5 words", "desc": "Specific actionable sentence citing this pitch", "priority": "High Priority", "impact": "Very High" } ],
-  "answer_framework": { "question": "Hardest question from this session", "steps": [ { "label": "Step Name", "text": "How to answer this step" } ] },
-  "category_matrix": [ { "category": "Delivery", "went_well": "Specific sentence about what was good", "needs_improvement": "Specific sentence about the gap", "impact": "Moderate" } ],
-  "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ]
+  }
 }`;
 
-  const callOpenAI = async (attempt: number = 1): Promise<any> => {
-    try {
-      const openai = getOpenAIClient();
-      const response = await openai.chat.completions.create({
-        model: config.azureOpenAiDeployment || "gpt-4o",
-        messages: [{ role: "user", content: evaluationPrompt }],
-        temperature: 0.15,
-        max_tokens: 4096,
-        response_format: { type: "json_object" }
-      });
+  const planPrompt = `You are an elite pitch coach. Based on this pitch's weak areas, return ONLY valid JSON with a preparation plan.
 
-      const rawText = response.choices[0]?.message?.content || "";
-      
-      if (!rawText || rawText.trim().length === 0) {
-        console.warn(`⚠️ OpenAI returned empty response (attempt ${attempt})`);
-        if (attempt < 3) return callOpenAI(attempt + 1);
-        throw new Error("OpenAI returned empty evaluation after 3 attempts.");
+${panelCtx}
+
+RULES:
+- questions_to_prepare: 6 tough investor questions to practice, based on weak areas from this session.
+- top_priorities: exactly 5 priority improvements. Each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority"/"Medium Priority"), impact ("Very High"/"High"/"Medium").
+- answer_framework: pick the single hardest/most-avoided question from this session; build a 5-step answer framework. question = exact text; steps = [{label, text}].
+- practice_drills: 4 drills with title, desc, reps, time.
+${sharedRules}
+
+Return this exact JSON structure:
+{
+  "questions_to_prepare": ["Question 1", "Question 2", "Question 3", "Question 4", "Question 5", "Question 6"],
+  "top_priorities": [ { "title": "Priority Title 3-5 words", "desc": "Specific actionable sentence citing this pitch", "priority": "High Priority", "impact": "Very High" } ],
+  "answer_framework": { "question": "Hardest question from this session", "steps": [ { "label": "Step Name", "text": "How to answer this step" } ] },
+  "practice_drills": [ { "title": "Drill name", "desc": "What to practice", "reps": "3 Reps", "time": "5 min" } ]
+}`;
+
+  // One JSON call with a single fast retry. Before regenerating, we try to
+  // repair the response (strip code fences / surrounding prose) so a minor
+  // formatting hiccup doesn't cost a whole extra round-trip.
+  const callJSON = async (prompt: string, maxTokens: number, label: string): Promise<any> => {
+    const openai = getOpenAIClient();
+    let lastErr: any;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await openai.chat.completions.create({
+          model: config.azureOpenAiDeployment || "gpt-4o",
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.15,
+          max_tokens: maxTokens,
+          response_format: { type: "json_object" },
+        });
+        const rawText = response.choices[0]?.message?.content?.trim() || "";
+        if (!rawText) throw new Error("empty response");
+        return parseJsonLoose(rawText);
+      } catch (err: any) {
+        lastErr = err;
+        console.error(`❌ Evaluation call "${label}" failed (attempt ${attempt}):`, err.message);
       }
-
-      return JSON.parse(rawText);
-    } catch (err: any) {
-      console.error(`❌ OpenAI API Error on evaluation (attempt ${attempt}):`, err.message);
-      if (attempt < 3) return callOpenAI(attempt + 1);
-      throw err;
     }
+    throw lastErr;
   };
 
-  const parsed = await callOpenAI();
-  // Safety net: rewrite any specific raise/funding figure the model invented but
-  // the founder never actually stated (see scrubUnstatedRaiseFigures).
   const stated = extractStatedFigures(transcriptText);
-  const cleaned = scrubReportRaiseFigures(parsed, stated);
-  return validateEvaluationReport(cleaned);
+  const finalize = (raw: any) =>
+    validateEvaluationReport(scrubReportRaiseFigures(raw, stated));
+
+  if (isCoachOrSolo) {
+    return finalize(await callJSON(coachPrompt, 2048, "coach"));
+  }
+
+  // Run the three panel sections concurrently. The core (scored) section is
+  // required — if it fails we surface the error so the caller can mark the
+  // session as failed. The market-intel and action-plan sections degrade
+  // gracefully: a failure leaves those fields absent and the PDF falls back to
+  // its defaults rather than failing the whole report.
+  const [core, intel, plan] = await Promise.all([
+    callJSON(corePrompt, 2048, "core"),
+    callJSON(intelPrompt, 1600, "intel").catch(() => ({})),
+    callJSON(planPrompt, 1400, "plan").catch(() => ({})),
+  ]);
+
+  return finalize({ ...core, ...intel, ...plan });
+}
+
+// Tolerant JSON parser: handles a clean object, a ```json fenced block, or an
+// object embedded in surrounding prose, so a small formatting slip doesn't force
+// a full regeneration.
+function parseJsonLoose(text: string): any {
+  try {
+    return JSON.parse(text);
+  } catch {
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1].trim());
+      } catch {
+        /* fall through */
+      }
+    }
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+      return JSON.parse(text.slice(start, end + 1));
+    }
+    throw new Error("Unparseable JSON response");
+  }
 }
 
 /**
