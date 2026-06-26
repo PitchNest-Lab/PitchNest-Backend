@@ -1,6 +1,7 @@
 import PDFDocument from "pdfkit";
 import path from "path";
 import { fileURLToPath } from "url";
+import { computeFounderPercentile, AVERAGE_FOUNDER_SCORE } from "./aiService.ts";
 
 type PDFDoc = InstanceType<typeof PDFDocument>;
 
@@ -65,6 +66,14 @@ function getScoreAccentColor(score: number): string {
   return COLORS.rose;
 }
 
+// Competitor sizes are AI estimates — never render a bare precise figure as
+// fact. Mirrors the guard in aiService.validateEvaluationReport (belt-and-suspenders).
+function hedgeSize(v: unknown): string {
+  const s = String(v || "").trim();
+  if (!s || s.toUpperCase() === "N/A") return "N/A";
+  return /est|approx|~/i.test(s) ? s : `Est. ${s}`;
+}
+
 function formatDate(dateStr?: string): string {
   if (!dateStr) return "Unknown Date";
   try {
@@ -76,6 +85,101 @@ function formatDate(dateStr?: string): string {
   } catch {
     return "Unknown Date";
   }
+}
+
+// ── Pattern B: word-boundary truncation ──────────────────────────────────────
+// One shared truncator: never cuts mid-word, appends a single standard ellipsis,
+// and verifies the result fits within `width` × `maxLines` using heightOfString.
+// Prefer raising maxLines/width so full text fits; only truncate when needed.
+const ELLIPSIS = "…";
+function fitText(
+  doc: PDFDoc,
+  text: string,
+  width: number,
+  font: string,
+  fontSize: number,
+  maxLines: number,
+  lineGap = 0,
+): string {
+  if (!text) return "";
+  doc.font(font).fontSize(fontSize);
+  const lineH = doc.currentLineHeight();
+  const maxHeight = maxLines * lineH + Math.max(0, maxLines - 1) * lineGap + 0.5;
+  if (doc.heightOfString(text, { width, lineGap }) <= maxHeight) return text;
+
+  const words = text.split(/\s+/);
+  let result = "";
+  for (let i = 0; i < words.length; i++) {
+    const candidate = (result ? result + " " : "") + words[i];
+    if (doc.heightOfString(candidate + ELLIPSIS, { width, lineGap }) > maxHeight) break;
+    result = candidate;
+  }
+  result = result.replace(/[\s,.;:—-]+$/, "");
+  return result ? result + ELLIPSIS : (words[0] || "") + ELLIPSIS;
+}
+
+// ── Pattern A: dynamic row heights ───────────────────────────────────────────
+// Measure a row's height as the tallest cell, so wrapping text never overlaps
+// the next element. Shared by the page-3 matrix and page-4 competitor table so
+// their height logic can't diverge.
+interface RowCell {
+  text: string;
+  font?: string;
+  fontSize?: number;
+  color?: string;
+  align?: "left" | "right" | "center";
+}
+function measureRowHeight(
+  doc: PDFDoc,
+  cells: RowCell[],
+  colWidths: number[],
+  padX: number,
+  padY: number,
+  lineGap: number,
+  minHeight = 0,
+): number {
+  let contentH = 0;
+  cells.forEach((cell, i) => {
+    const w = colWidths[i] - padX * 2;
+    doc.font(cell.font || "Inter").fontSize(cell.fontSize ?? 7.5);
+    const h = doc.heightOfString(cell.text || "", { width: w, lineGap });
+    if (h > contentH) contentH = h;
+  });
+  return Math.max(minHeight, contentH + padY * 2);
+}
+function drawTableRow(
+  doc: PDFDoc,
+  x: number,
+  y: number,
+  colWidths: number[],
+  cells: RowCell[],
+  opts: { padX?: number; padY?: number; fill?: string; border?: string; minHeight?: number; lineGap?: number } = {},
+): number {
+  const padX = opts.padX ?? 5;
+  const padY = opts.padY ?? 6;
+  const lineGap = opts.lineGap ?? 1.5;
+  const totalWidth = colWidths.reduce((a, b) => a + b, 0);
+  const rowH = measureRowHeight(doc, cells, colWidths, padX, padY, lineGap, opts.minHeight ?? 0);
+
+  if (opts.fill || opts.border) {
+    doc.rect(x, y, totalWidth, rowH).lineWidth(0.5);
+    if (opts.fill && opts.border) doc.fillAndStroke(opts.fill, opts.border);
+    else if (opts.fill) doc.fill(opts.fill);
+    else doc.strokeColor(opts.border!).stroke();
+  }
+
+  let cx = x;
+  cells.forEach((cell, i) => {
+    const w = colWidths[i];
+    doc
+      .font(cell.font || "Inter")
+      .fontSize(cell.fontSize ?? 7.5)
+      .fillColor(cell.color || COLORS.text)
+      .text(cell.text || "", cx + padX, y + padY, { width: w - padX * 2, align: cell.align || "left", lineGap });
+    cx += w;
+  });
+
+  return y + rowH;
 }
 
 // ── Vector Icon Drawing System ───────────────────────────────────────────────
@@ -267,7 +371,9 @@ function drawFooter(doc: PDFDoc, pageNum: number, totalPages: number) {
 
 // ── Vector Charts ────────────────────────────────────────────────────────────
 function drawRadarChart(doc: PDFDoc, cx: number, cy: number, radius: number, scores: { [key: string]: number }) {
-  const axes = ["Delivery", "Clarity", "Scalability", "Readiness", "Market Potential"];
+  // Exactly the four scored categories — no unscored 5th axis (keeps the radar
+  // consistent with the Category Breakdown bars).
+  const axes = ["Delivery", "Clarity", "Scalability", "Readiness"];
   const numAxes = axes.length;
 
   doc.strokeColor(COLORS.border).lineWidth(0.75);
@@ -360,14 +466,21 @@ function drawDonutChart(doc: PDFDoc, cx: number, cy: number, radius: number, seg
   }
 }
 
-function drawLineChart(doc: PDFDoc, x: number, y: number, w: number, h: number, points: { xVal: string; yVal: number }[], yMax = 100, color = COLORS.primary) {
+function drawLineChart(doc: PDFDoc, x: number, y: number, w: number, h: number, points: { xVal: string; yVal: number }[], yMax = 100, color = COLORS.primary, opts: { yAxis?: boolean } = {}) {
   doc.strokeColor(COLORS.border).lineWidth(1);
   doc.rect(x, y, w, h).stroke();
 
   const gridSteps = 4;
-  for (let i = 1; i < gridSteps; i++) {
+  for (let i = 0; i <= gridSteps; i++) {
     const gy = y + (i / gridSteps) * h;
-    doc.moveTo(x, gy).lineTo(x + w, gy).dash(2, { space: 2 }).strokeColor(COLORS.border).stroke();
+    if (i > 0 && i < gridSteps) {
+      doc.moveTo(x, gy).lineTo(x + w, gy).dash(2, { space: 2 }).strokeColor(COLORS.border).stroke();
+    }
+    // Y-axis scale labels (yMax at top → 0 at bottom)
+    if (opts.yAxis) {
+      const val = Math.round(yMax - (i / gridSteps) * yMax);
+      doc.font("Inter").fontSize(5.5).fillColor(COLORS.textLight).text(`${val}`, x - 20, gy - 3, { width: 16, align: "right" });
+    }
   }
   doc.undash();
 
@@ -476,7 +589,6 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         clarity: clamp(rawScores.clarity),
         scalability: clamp(rawScores.scalability),
         readiness: clamp(rawScores.readiness),
-        marketpotential: clamp(rawScores.marketpotential || rawScores.readiness || 50),
       };
       const overallScore = Math.round(
         (scores.delivery + scores.clarity + scores.scalability + scores.readiness) / 4,
@@ -620,9 +732,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const competitorList = Array.isArray(report.competitors) && report.competitors.length > 0
         ? report.competitors.slice(0, 4)
         : [
-            { name: "Competitor A", similarity: 80, strength: "Strong brand presence", weakness: "Limited geographic focus", size: "$15M+" },
-            { name: "Competitor B", similarity: 72, strength: "Great UX and onboarding", weakness: "Higher price point", size: "$10M+" },
-            { name: "Competitor C", similarity: 65, strength: "Large user base", weakness: "No AI features", size: "$25M+" },
+            { name: "Competitor A", similarity: 80, strength: "Strong brand presence", weakness: "Limited geographic focus", size: "Est. ~$15M" },
+            { name: "Competitor B", similarity: 72, strength: "Great UX and onboarding", weakness: "Higher price point", size: "Est. ~$10M" },
+            { name: "Competitor C", similarity: 65, strength: "Large user base", weakness: "No AI features", size: "Est. ~$25M" },
             { name: "Competitor D", similarity: 55, strength: "Backed by top VCs", weakness: "Poor customer support", size: "N/A" },
           ];
 
@@ -675,9 +787,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
             { xVal: "6:00", yVal: 55 },
           ];
 
-      const founderPercentile = typeof report.founder_percentile === "number"
-        ? report.founder_percentile
-        : isInsufficient ? 5 : 37;
+      // Derived from the SAME overall score shown on the page, so the percentile
+      // is identical on p1 and p3 and can never read above-average for a
+      // below-average score. Phrased everywhere as "scored higher than X%".
+      const founderPercentile = isInsufficient ? 0 : computeFounderPercentile(overallScore);
 
       // =======================================================================
       // PAGE 1 — EXECUTIVE SUMMARY
@@ -709,7 +822,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.dark).text("EXECUTIVE SUMMARY");
       doc.y += 6;
       const rawSummary = report.summary || "This pitch was too short to generate a full evaluation. Please complete a session speaking for at least 2 minutes to get full VC grading and analytics.";
-      const summary = rawSummary.length > 300 ? rawSummary.substring(0, 297) + "..." : rawSummary;
+      const summary = fitText(doc, rawSummary, 260, "Inter", 9, 8, 3.5);
       doc.font("Inter").fontSize(9).fillColor(COLORS.text).text(summary, 50, doc.y, { width: 260, lineGap: 3.5 });
 
       // Right Column Overall Score Card — improved contrast
@@ -722,13 +835,13 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter-Bold").fontSize(42).fillColor(scoreDisplayColor).text(isInsufficient ? "N/A" : `${overallScore}`, 350, 175);
       doc.font("Inter").fontSize(11).fillColor(COLORS.textLight).text("/ 100", 415, 201);
 
-      // Progress bar with score-appropriate color
-      doc.roundedRect(350, 230, 175, 6, 3).fill("#1e293b");
+      // Progress bar — lighter track for visibility on the navy panel, with a subtle border
+      doc.roundedRect(350, 230, 175, 6, 3).fillAndStroke("#475569", "#64748b");
       if (!isInsufficient) {
         doc.roundedRect(350, 230, Math.max(10, (overallScore / 100) * 175), 6, 3).fill(scoreAccentColor);
       }
       doc.font("Inter").fontSize(9).fillColor("#94a3b8").text("You scored higher than", 350, 255);
-      doc.font("Inter-Bold").fontSize(18).fillColor(scoreAccentColor).text(isInsufficient ? "0%" : `${Math.round(overallScore * 0.48)}%`, 350, 270);
+      doc.font("Inter-Bold").fontSize(18).fillColor(scoreAccentColor).text(isInsufficient ? "0%" : `${founderPercentile}%`, 350, 270);
       doc.font("Inter").fontSize(8).fillColor("#94a3b8").text("of early-stage founders on PitchNest", 350, 292);
 
       // Category Scores
@@ -768,7 +881,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.circle(sentX + 25, 630, 14).fill(COLORS.border);
         doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.primary).text(s.persona.substring(0, 1), sentX + 22, 626);
         doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text(s.persona, sentX + 48, 622, { width: 95 });
-        const cappedQuote = s.quote.length > 140 ? s.quote.substring(0, 137) + "..." : s.quote;
+        const cappedQuote = fitText(doc, s.quote, 116, "Helvetica-Oblique", 8, 6, 3);
         doc.font("Helvetica-Oblique").fontSize(8).fillColor(COLORS.text).text(`"${cappedQuote}"`, sentX + 15, 655, { width: 120, lineGap: 3 });
         sentX += 172;
       });
@@ -783,31 +896,39 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.rect(50, 80, 235, 220).lineWidth(1).fillAndStroke(COLORS.bgLight, COLORS.border);
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.emerald).text("KEY STRENGTHS", 65, 95);
       let sY = 120;
+      // Pattern A + B: each item is capped at 4 lines and advances by its
+      // measured height, so longer copy stacks cleanly instead of overlapping.
       strengths.slice(0, 3).forEach((s) => {
+        const sText = fitText(doc, s, 190, "Inter", 8.5, 4, 2.5);
         drawIcon(doc, "checkmark", 62, sY - 2, 12, COLORS.emerald);
-        doc.font("Inter").fontSize(8.5).fillColor(COLORS.text).text(s, 80, sY, { width: 190, lineGap: 2.5 });
-        sY += 50;
+        doc.font("Inter").fontSize(8.5).fillColor(COLORS.text).text(sText, 80, sY, { width: 190, lineGap: 2.5 });
+        sY += Math.max(40, doc.heightOfString(sText, { width: 190, lineGap: 2.5 }) + 12);
       });
 
       doc.rect(300, 80, 245, 220).lineWidth(1).fillAndStroke(COLORS.roseBg, COLORS.border);
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.rose).text("CRITICAL RISKS", 315, 95);
       let rY = 120;
       risks.slice(0, 3).forEach((r) => {
+        const rText = fitText(doc, r, 200, "Inter", 8.5, 4, 2.5);
         drawIcon(doc, "shield", 312, rY - 2, 12, COLORS.rose);
-        doc.font("Inter").fontSize(8.5).fillColor(COLORS.text).text(r, 330, rY, { width: 200, lineGap: 2.5 });
-        rY += 50;
+        doc.font("Inter").fontSize(8.5).fillColor(COLORS.text).text(rText, 330, rY, { width: 200, lineGap: 2.5 });
+        rY += Math.max(40, doc.heightOfString(rText, { width: 200, lineGap: 2.5 }) + 12);
       });
 
       // Actionable Next Steps
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("ACTIONABLE NEXT STEPS", 50, 320);
       let stepY = 340;
+      // Pattern A: row grows to fit a wrapping description (was fixed 52/60).
       nextSteps.slice(0, 3).forEach((step, idx) => {
-        doc.rect(50, stepY, 280, 52).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
-        doc.circle(70, stepY + 26, 12).fill(COLORS.primary);
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + 22, { align: "center", width: 6 });
+        const descText = fitText(doc, step.desc || "", 155, "Inter", 7.5, 3, 0);
+        const descH = doc.heightOfString(descText, { width: 155 });
+        const rowH = Math.max(52, 24 + descH + 12);
+        doc.rect(50, stepY, 280, rowH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+        doc.circle(70, stepY + rowH / 2, 12).fill(COLORS.primary);
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + rowH / 2 - 4, { align: "center", width: 6 });
 
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(step.title, 92, stepY + 10);
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(step.desc || "", 92, stepY + 24, { width: 155 });
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(step.title, 92, stepY + 10, { width: 155 });
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 155 });
 
         // Priority tag — High Priority: red bg, white text
         const isHighPriority = (step.priority || "").toLowerCase().includes("high");
@@ -819,7 +940,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
           doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 13, { align: "center", width: 65 });
         }
 
-        stepY += 60;
+        stepY += rowH + 8;
       });
 
       // Investment Gauge Card
@@ -923,9 +1044,14 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         statX += 101;
       });
 
-      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("CONFIDENCE & SENTIMENT OVER TIME", 50, 180);
-      drawLineChart(doc, 50, 200, 270, 110, timelinePoints, 100, COLORS.primary);
-      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Time (minutes)", 50, 318, { width: 270, align: "center" });
+      // Single series only — title matches what is actually plotted, with a Y
+      // scale and a one-entry legend.
+      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("CONFIDENCE OVER TIME", 50, 180);
+      doc.rect(232, 182, 10, 3).fill(COLORS.primary);
+      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Confidence", 246, 180);
+      drawLineChart(doc, 72, 200, 248, 110, timelinePoints, 100, COLORS.primary, { yAxis: true });
+      // Axis title placed BELOW the x tick row (ticks render at y+h+5)
+      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Time (minutes)", 72, 326, { width: 248, align: "center" });
 
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("QUESTION DIFFICULTY BREAKDOWN", 345, 180);
       const difficultySects = [
@@ -951,20 +1077,31 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Poorly Answered or Avoided", 468, diffLegendY + 50, { width: 80 });
 
       doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text("TOUGHEST QUESTIONS", 345, 305);
-      const toughQ1 = questionsToPrepare[0] || "How did you calculate your total addressable market?";
-      const toughQ2 = questionsToPrepare[1] || "What are your unit economics and pricing model?";
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(`1. ${toughQ1}`, 345, 320, { width: 195, lineGap: 1.5 });
-      const q1Bottom = doc.y + 3;
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(`2. ${toughQ2}`, 345, Math.max(q1Bottom, 348), { width: 195, lineGap: 1.5 });
+      // Show exactly as many questions as the "Hard (n)" count so the count and
+      // the listed items always agree. Each item advances by its measured height.
+      const toughDefaults = [
+        "How did you calculate your total addressable market?",
+        "What are your unit economics and pricing model?",
+        "What makes your product defensible against competitors?",
+      ];
+      const toughSource = questionsToPrepare.length > 0 ? questionsToPrepare : toughDefaults;
+      const nTough = Math.min(Math.max(questionDifficulty.hard, 1), toughSource.length);
+      let toughY = 320;
+      for (let i = 0; i < nTough; i++) {
+        const qText = fitText(doc, `${i + 1}. ${toughSource[i]}`, 195, "Inter", 7.5, 2, 1.5);
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(qText, 345, toughY, { width: 195, lineGap: 1.5 });
+        toughY += doc.heightOfString(qText, { width: 195, lineGap: 1.5 }) + 5;
+      }
 
-      // Detailed Category Matrix
-      doc.y = 350;
+      // Detailed Category Matrix — start below BOTH the donut/legend and the
+      // toughest-questions list so neither can overlap it.
+      doc.y = Math.max(350, toughY + 6);
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("DETAILED CATEGORY MATRIX", 50, doc.y);
 
       const tableHeaders = ["Category", "Score", "What Went Well", "What Needs Improvement", "Impact"];
       const colWidths = [85, 45, 140, 160, 60];
 
-      let ty = 370;
+      let ty = Math.max(370, doc.y + 16);
       doc.rect(50, ty, 495, 18).fill(COLORS.primary);
       let tx = 55;
       tableHeaders.forEach((th, idx) => {
@@ -977,16 +1114,26 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         Delivery: scores.delivery, Clarity: scores.clarity,
         Scalability: scores.scalability, Readiness: scores.readiness
       };
+      // Pattern A: each row grows to fit its tallest cell (shared drawTableRow)
       categoryMatrixRows.forEach((row, rowIdx) => {
         const catScore = catScoreMap[row.category] ?? 0;
-        const cells = [row.category, `${catScore}/100`, row.went_well, row.needs_improvement, row.impact];
-        doc.rect(50, ty, 495, 30).lineWidth(0.5).fillAndStroke(rowIdx % 2 === 0 ? COLORS.bgLight : COLORS.white, COLORS.border);
-        tx = 55;
-        cells.forEach((cell, idx) => {
-          doc.font(idx < 2 ? "Inter-Bold" : "Inter").fontSize(7.5).fillColor(COLORS.text).text(cell, tx, ty + 8, { width: colWidths[idx] - 10 });
-          tx += colWidths[idx];
+        // Cap the prose cells at 3 lines (Pattern B) so a row grows for normal
+        // wrapping but can't blow the table past the page.
+        const cells: RowCell[] = [
+          { text: row.category, font: "Inter-Bold" },
+          { text: `${catScore}/100`, font: "Inter-Bold" },
+          { text: fitText(doc, row.went_well, 130, "Inter", 7.5, 3, 1.5) },
+          { text: fitText(doc, row.needs_improvement, 150, "Inter", 7.5, 3, 1.5) },
+          { text: row.impact },
+        ];
+        ty = drawTableRow(doc, 50, ty, colWidths, cells, {
+          fill: rowIdx % 2 === 0 ? COLORS.bgLight : COLORS.white,
+          border: COLORS.border,
+          padX: 5,
+          padY: 8,
+          lineGap: 1.5,
+          minHeight: 30,
         });
-        ty += 30;
       });
 
       // Founder Benchmarking — Improved layout
@@ -999,7 +1146,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Gauge on left
       const benchGaugeY = ty + 95;
       drawHalfGaugeChart(doc, 125, benchGaugeY, 45, isInsufficient ? 0 : founderPercentile, "", COLORS.primary, 8, COLORS.dark);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("You are in the top", 85, benchGaugeY - 28, { width: 80, align: "center" });
+      doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("You scored higher than", 80, benchGaugeY - 28, { width: 90, align: "center" });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("of early-stage founders\non PitchNest", 80, benchGaugeY + 8, { width: 90, align: "center" });
       doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.dark).text("0%", 70, benchGaugeY + 2);
       doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.dark).text("100%", 165, benchGaugeY + 2);
@@ -1013,7 +1160,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Horizontal bars on right
       const benchmarkData = [
         { label: "Your Overall Score", val: isInsufficient ? 0 : overallScore, color: COLORS.primary },
-        { label: "Average Score (All Founders)", val: 42, color: COLORS.textLight },
+        { label: "Average Score (All Founders)", val: AVERAGE_FOUNDER_SCORE, color: COLORS.textLight },
         { label: "Top 25% Founders", val: 68, color: COLORS.textLight },
         { label: "Top 10% Founders", val: 80, color: COLORS.textLight }
       ];
@@ -1029,13 +1176,13 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         barY += 15;
       });
 
-      // Percentile Card
+      // Percentile Card — same single percentile value/phrasing as page 1
       doc.roundedRect(465, ty + 45, 65, 80, 6).lineWidth(0.5).fillAndStroke(COLORS.white, COLORS.border);
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Percentile Rank", 465, ty + 55, { width: 65, align: "center" });
       drawIcon(doc, "bar_chart", 488, ty + 70, 16, COLORS.primary);
-      const topPct = isInsufficient ? 5 : founderPercentile;
-      doc.font("Inter-Bold").fontSize(14).fillColor(COLORS.primaryDark).text(`Top ${topPct}%`, 465, ty + 95, { width: 65, align: "center" });
-      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("Percentile", 465, ty + 110, { width: 65, align: "center" });
+      const topPct = isInsufficient ? 0 : founderPercentile;
+      doc.font("Inter-Bold").fontSize(14).fillColor(COLORS.primaryDark).text(`${topPct}%`, 465, ty + 92, { width: 65, align: "center" });
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("scored higher than", 465, ty + 108, { width: 65, align: "center" });
 
       // =======================================================================
       // PAGE 4 — COMPETITIVE LANDSCAPE
@@ -1045,12 +1192,37 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       // ── Direct Competitors — full-width table ─────────────────────────────
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("DIRECT COMPETITORS", 50, 75);
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("Real competitors in your industry identified by AI analysis", 50, 87);
-      doc.roundedRect(50, 96, 495, 192, 8).strokeColor(COLORS.border).lineWidth(1).stroke();
+      doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("Real competitors in your industry identified by AI analysis (figures are AI estimates)", 50, 87);
 
       const p4CompColW = [118, 50, 112, 155, 50];
       const p4CompHeaders = ["Company", "Similarity", "Strengths", "Weaknesses", "Est. Size"];
       let p4fty = 106;
+
+      // Pattern A + B: cap each prose cell at 3 lines, then pre-measure each row
+      // (tallest of strength/weakness) so both the box and the rows grow with
+      // wrapping text but can never overflow the page.
+      const p4Cells = competitorList.map((c: any) => ({
+        strength: fitText(doc, c.strength, 104, "Inter", 6.5, 3, 1.5),
+        weakness: fitText(doc, c.weakness, 128, "Inter", 6.5, 3, 1.5),
+      }));
+      const p4RowHeights = p4Cells.map((c) =>
+        measureRowHeight(
+          doc,
+          [
+            { text: c.strength, fontSize: 6.5 },
+            { text: c.weakness, fontSize: 6.5 },
+          ],
+          [104, 128],
+          0,
+          5,
+          1.5,
+          22,
+        ),
+      );
+      const p4RowsTotal = p4RowHeights.reduce((a: number, b: number) => a + b, 0);
+      const p4BoxH = p4fty + 15 - 96 + p4RowsTotal + 6;
+      doc.roundedRect(50, 96, 495, p4BoxH, 8).strokeColor(COLORS.border).lineWidth(1).stroke();
+
       let p4ftx = 60;
       p4CompHeaders.forEach((ch, idx) => {
         doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.textLight).text(ch, p4ftx, p4fty);
@@ -1060,7 +1232,8 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       const p4BgColors = ["#4C6FD1", COLORS.emerald, "#3b82f6", "#374151"];
       let p4RowY = p4fty + 15;
-      competitorList.forEach((c, cIdx) => {
+      competitorList.forEach((c: any, cIdx: number) => {
+        const rowH = p4RowHeights[cIdx];
         const p4Char = c.name.charAt(0).toUpperCase();
         const p4Bg = p4BgColors[cIdx % p4BgColors.length];
         doc.roundedRect(60, p4RowY, 15, 15, 3).fill(p4Bg);
@@ -1068,17 +1241,21 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.dark).text(c.name, 80, p4RowY, { width: 92 });
         doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primary).text(`${c.similarity}%`, 184, p4RowY + 3);
         doc.circle(240, p4RowY + 7, 4).fill(COLORS.emerald);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(c.strength, 248, p4RowY, { width: 104, lineGap: 1.5 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(p4Cells[cIdx].strength, 248, p4RowY, { width: 104, lineGap: 1.5 });
         doc.circle(364, p4RowY + 7, 4).fill(COLORS.rose);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(c.weakness, 372, p4RowY, { width: 128, lineGap: 1.5 });
-        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.dark).text(c.size, 502, p4RowY + 3, { align: "right", width: 38 });
-        p4RowY += 35;
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(p4Cells[cIdx].weakness, 372, p4RowY, { width: 128, lineGap: 1.5 });
+        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.dark).text(hedgeSize(c.size), 502, p4RowY + 3, { align: "right", width: 38 });
+        // Row divider between competitors
+        if (cIdx < competitorList.length - 1) {
+          doc.moveTo(60, p4RowY + rowH - 3).lineTo(535, p4RowY + rowH - 3).strokeColor(COLORS.border).lineWidth(0.25).stroke();
+        }
+        p4RowY += rowH;
       });
 
       // Key takeaway strip
       const p4KtY = p4RowY + 2;
       doc.roundedRect(56, p4KtY, 483, 22, 5).lineWidth(0.5).fillAndStroke("#eff6ff", "#bfdbfe");
-      const p4KtText = strategicRecommendation.length > 185 ? strategicRecommendation.substring(0, 182) + "..." : strategicRecommendation;
+      const p4KtText = fitText(doc, strategicRecommendation, 380, "Inter", 7, 1);
       doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.primary).text("Key Takeaway: ", 72, p4KtY + 6, { continued: true });
       doc.font("Inter").fontSize(7).fillColor(COLORS.dark).text(p4KtText, { width: 435, lineBreak: false });
 
@@ -1092,17 +1269,21 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { label: "OPPORTUNITIES", color: COLORS.primary, bg: COLORS.indigoBg, border: "#bfdbfe", items: swotData.opportunities },
         { label: "THREATS", color: COLORS.amber, bg: COLORS.amberBg, border: COLORS.amberBorder, items: swotData.threats }
       ];
-      const p4SwotQH = 88;
+      const p4SwotQH = 100;
       p4SwotItems.forEach((s, idx) => {
         const p4sx = idx % 2 === 0 ? 50 : 300;
         const p4sy = p4SwotTopY + 14 + (idx < 2 ? 0 : p4SwotQH + 8);
         doc.roundedRect(p4sx, p4sy, 245, p4SwotQH, 6).lineWidth(0.75).fillAndStroke(s.bg, s.border);
         doc.font("Inter-Bold").fontSize(8).fillColor(s.color).text(s.label, p4sx + 10, p4sy + 8);
         let p4ItemY = p4sy + 22;
+        // Pattern A: advance by each item's measured height (max 2 lines) so a
+        // wrapping bullet never overlaps the next.
         s.items.slice(0, 4).forEach((item: string) => {
+          const itemText = fitText(doc, item, 211, "Inter", 6.5, 2, 1.5);
           doc.circle(p4sx + 14, p4ItemY + 3.5, 2.5).fill(s.color);
-          doc.font("Inter").fontSize(6.5).fillColor(COLORS.text).text(item, p4sx + 22, p4ItemY, { width: 215, lineGap: 1.5 });
-          p4ItemY += 14;
+          doc.font("Inter").fontSize(6.5).fillColor(COLORS.text).text(itemText, p4sx + 22, p4ItemY, { width: 211, lineGap: 1.5 });
+          const ih = doc.heightOfString(itemText, { width: 211, lineGap: 1.5 });
+          p4ItemY += Math.max(14, ih + 4);
         });
       });
 
@@ -1120,8 +1301,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         const pos = p4MapPositions[ci] || [0, 0];
         p4ScatterPoints.push({ name: c.name, xVal: pos[0], yVal: pos[1], color: p4BgColors[ci % p4BgColors.length] });
       });
-      drawScatterPlot(doc, 60, p4MapY + 34, 475, 106, p4ScatterPoints);
-      doc.font("Inter").fontSize(5.5).fillColor(COLORS.textLight).text("← Lower AI/Innovation Capability | Higher AI/Innovation Capability →", 60, p4MapY + 26, { width: 475, align: "center" });
+      drawScatterPlot(doc, 75, p4MapY + 34, 460, 100, p4ScatterPoints);
+      // X-axis label on the axis line (bottom of the plot), not floating above it
+      doc.font("Inter").fontSize(5.5).fillColor(COLORS.textLight).text("← Lower AI / Innovation Capability  |  Higher AI / Innovation Capability →", 75, p4MapY + 138, { width: 460, align: "center" });
+      // Y-axis label, rotated along the left edge
+      doc.save();
+      doc.translate(66, p4MapY + 84);
+      doc.rotate(-90);
+      doc.font("Inter").fontSize(5.5).fillColor(COLORS.textLight).text("← Lower Market Presence  |  Higher →", -50, -3, { width: 100, align: "center" });
+      doc.restore();
 
       // =======================================================================
       // PAGE 5 — MARKET INTELLIGENCE
@@ -1135,10 +1323,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.roundedRect(50, 90, 495, 110, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
 
       const topicDonutSegments = topicCoverage.map(t => ({ value: t.percentage, color: t.color }));
-      const totalCoverage = topicCoverage.length > 0
-        ? Math.round(topicCoverage.reduce((s, t) => s + t.percentage, 0) / topicCoverage.length)
-        : 0;
+      // Center = mean of the listed topic percentages (computed server-side, with
+      // a local fallback). Labeled so it's clear what the number represents.
+      const totalCoverage = typeof report.topic_coverage_overall === "number"
+        ? report.topic_coverage_overall
+        : topicCoverage.length > 0
+          ? Math.round(topicCoverage.reduce((s, t) => s + t.percentage, 0) / topicCoverage.length)
+          : 0;
       drawDonutChart(doc, 448, 147, 35, topicDonutSegments, `${totalCoverage}%`);
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("Overall coverage", 413, 187, { width: 70, align: "center" });
 
       let tLegY = 103;
       topicCoverage.slice(0, 6).forEach((t) => {
@@ -1151,7 +1344,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // ── AI Summary (y=208–278) ─────────────────────────────────────────────
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("AI SUMMARY OF TRANSCRIPT", 50, 208);
       doc.roundedRect(50, 221, 495, 55, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
-      const summaryTextP5 = transcriptSummary.length > 380 ? transcriptSummary.substring(0, 377) + "..." : transcriptSummary;
+      const summaryTextP5 = fitText(doc, transcriptSummary, 475, "Inter", 7.5, 4, 2);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(summaryTextP5, 60, 228, { width: 475, lineGap: 2 });
 
       // ── 2-Column: Market Gap (left, x=50) | Companies to Study (right, x=295) ──
@@ -1164,24 +1357,34 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       const p5Gaps = marketGaps;
       let mgGapY = 309;
+      // Pattern A + B: each gap advances by its measured height; text fits on
+      // word boundaries instead of clipping mid-word.
       p5Gaps.forEach((g) => {
         doc.circle(61, mgGapY + 7, 8).fill(COLORS.indigoBg);
-        doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text(g.title.substring(0, 1), 54, mgGapY + 4, { align: "center", width: 14 });
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(g.title, 74, mgGapY, { width: 210, lineBreak: false });
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(g.desc, 74, mgGapY + 10, { width: 210, lineBreak: false });
-        mgGapY += 26;
+        doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text((g.title || "?").charAt(0).toUpperCase(), 54, mgGapY + 4, { align: "center", width: 14 });
+        const gTitle = fitText(doc, g.title, 210, "Inter-Bold", 7.5, 1);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(gTitle, 74, mgGapY, { width: 210 });
+        const gDesc = fitText(doc, g.desc, 210, "Inter", 6.5, 2, 1.5);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(gDesc, 74, mgGapY + 10, { width: 210, lineGap: 1.5 });
+        const dh = doc.heightOfString(gDesc, { width: 210, lineGap: 1.5 });
+        mgGapY += Math.max(26, 10 + dh + 6);
       });
 
       const p5StudyColors = ["#4C6FD1", "#06b6d4", "#f59e0b", "#3b82f6"];
       let p5StudyY = 314;
+      // Pattern A: advance by measured height so a company's description can
+      // never overlap the next company's title.
       studiesToShow.forEach((s, sIdx) => {
         const p5Char = s.name.charAt(0).toUpperCase();
         const p5Bg = p5StudyColors[sIdx % p5StudyColors.length];
         doc.roundedRect(305, p5StudyY, 16, 16, 3).fill(p5Bg);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(p5Char, 305, p5StudyY + 4, { align: "center", width: 16 });
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(s.name, 326, p5StudyY, { width: 100, lineBreak: false });
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(s.why, 326, p5StudyY + 9, { width: 205, lineBreak: false });
-        p5StudyY += 22;
+        const sName = fitText(doc, s.name, 213, "Inter-Bold", 7.5, 1);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(sName, 326, p5StudyY, { width: 213 });
+        const whyText = fitText(doc, s.why, 213, "Inter", 6.5, 2, 1.5);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(whyText, 326, p5StudyY + 9, { width: 213, lineGap: 1.5 });
+        const wh = doc.heightOfString(whyText, { width: 213, lineGap: 1.5 });
+        p5StudyY += Math.max(22, 9 + wh + 6);
       });
 
       // ── AI Strategic Recommendation (y=440–528) ────────────────────────────
@@ -1190,13 +1393,14 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Based on competitive analysis and market opportunities", 65, 461);
       doc.roundedRect(65, 472, 40, 35, 6).fill(COLORS.indigoBg);
       drawIcon(doc, "trending_up", 72, 476, 26, COLORS.primary);
-      const recTextP5 = strategicRecommendation.length > 250 ? strategicRecommendation.substring(0, 247) + "..." : strategicRecommendation;
+      const recTextP5 = fitText(doc, strategicRecommendation, 230, "Inter", 7.5, 4, 2.5);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(recTextP5, 115, 472, { width: 230, lineGap: 2.5 });
       doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primary).text("Key Focus Areas", 360, 450);
       let focusY5 = 464;
       keyFocusAreas.slice(0, 4).forEach((f) => {
         drawIcon(doc, "checkmark", 360, focusY5, 10, COLORS.emerald);
-        doc.font("Inter").fontSize(7).fillColor(COLORS.dark).text(f, 374, focusY5 + 1, { width: 162, lineBreak: false });
+        const fText = fitText(doc, f, 162, "Inter", 7, 1);
+        doc.font("Inter").fontSize(7).fillColor(COLORS.dark).text(fText, 374, focusY5 + 1, { width: 162 });
         focusY5 += 14;
       });
 
@@ -1207,7 +1411,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       p5CollabItems.forEach((item, idx) => {
         doc.circle(60, p5CollabY + 6, 9).fill(COLORS.primary);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(`${idx + 1}`, 55, p5CollabY + 3, { width: 10, align: "center" });
-        const itemText = item.length > 110 ? item.substring(0, 107) + "..." : item;
+        const itemText = fitText(doc, item, 460, "Inter", 7.5, 1);
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(itemText, 76, p5CollabY + 1, { width: 460, lineBreak: false });
         p5CollabY += 22;
       });
@@ -1218,17 +1422,18 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.addPage();
       drawHeader(doc, "Your Action Plan");
 
-      // Title & potential score card
+      // Title & potential score card — subtitle is width-constrained so it never
+      // runs under the score box; box contents use explicit, non-overlapping rows.
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("YOUR ACTION PLAN", 50, 75);
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("A step-by-step plan to strengthen your pitch and increase your investment readiness.", 50, 87);
+      doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("A step-by-step plan to strengthen your pitch and increase your investment readiness.", 50, 87, { width: 290 });
 
       // Potential Score card
-      doc.roundedRect(350, 70, 195, 45, 6).lineWidth(1).fillAndStroke(COLORS.bgLight, COLORS.border);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Your Potential Score", 360, 77);
-      doc.font("Inter-Bold").fontSize(16).fillColor(COLORS.primaryDark).text("78", 360, 87);
-      doc.font("Inter").fontSize(9).fillColor(COLORS.textLight).text("/100", 382, 92);
-      drawIcon(doc, "trending_up", 408, 78, 16, COLORS.emerald);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("By addressing the key risks,\nyou can reach this score.", 426, 77, { width: 108, lineGap: 2 });
+      doc.roundedRect(350, 68, 195, 50, 6).lineWidth(1).fillAndStroke(COLORS.bgLight, COLORS.border);
+      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Your Potential Score", 360, 75, { width: 130 });
+      doc.font("Inter-Bold").fontSize(15).fillColor(COLORS.primaryDark).text("78", 360, 90);
+      doc.font("Inter").fontSize(8).fillColor(COLORS.textLight).text("/100", 382, 95);
+      drawIcon(doc, "trending_up", 410, 82, 14, COLORS.emerald);
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("By addressing the key risks, you can reach this score.", 430, 80, { width: 108, lineGap: 1.5 });
 
       // Priority Improvements
       doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TOP 5 PRIORITY IMPROVEMENTS", 50, 125);
@@ -1246,7 +1451,8 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         drawIcon(doc, p6PriorityIcons[pIdx] || "target", cardFigmaX + 60, 145, 18, COLORS.primary);
 
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(p.title, cardFigmaX + 8, 172, { width: 78, lineGap: 1.5 });
+        const pTitle = fitText(doc, p.title, 78, "Inter-Bold", 7.5, 2, 1.5);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(pTitle, cardFigmaX + 8, 172, { width: 78, lineGap: 1.5 });
 
         if (p6IsHigh) {
           doc.roundedRect(cardFigmaX + 8, 198, 54, 12, 3).fill(COLORS.rose);
@@ -1256,9 +1462,13 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
           doc.font("Inter-Bold").fontSize(5.5).fillColor(COLORS.amber).text(p.priority, cardFigmaX + 8, 201, { align: "center", width: 54 });
         }
 
-        doc.font("Inter").fontSize(6.8).fillColor(COLORS.textLight).text(p.desc, cardFigmaX + 8, 216, { width: 78, lineGap: 2 });
-
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("Impact: ", cardFigmaX + 8, 270, { continued: true });
+        // Pattern A: description fits the card, and "Impact" sits AFTER it
+        // (not pinned at a fixed Y where long copy would overlap it).
+        const pDesc = fitText(doc, p.desc, 78, "Inter", 6.8, 6, 2);
+        doc.font("Inter").fontSize(6.8).fillColor(COLORS.textLight).text(pDesc, cardFigmaX + 8, 216, { width: 78, lineGap: 2 });
+        const pDescH = doc.heightOfString(pDesc, { width: 78, lineGap: 2 });
+        const impactY = Math.min(274, 216 + pDescH + 6);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("Impact: ", cardFigmaX + 8, impactY, { continued: true });
         doc.font("Inter-Bold").fillColor(p6ImpactColor).text(p.impact);
 
         cardFigmaX += 101;
@@ -1284,7 +1494,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Suggested Answer Framework — dynamic from AI
       doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUGGESTED ANSWER FRAMEWORK", 268, 298);
       doc.roundedRect(268, 312, 277, 158, 4).fill(COLORS.indigoBg);
-      const fwQuestion = frameworkData.question.length > 72 ? frameworkData.question.substring(0, 69) + "..." : frameworkData.question;
+      const fwQuestion = fitText(doc, frameworkData.question, 250, "Inter-Bold", 6.5, 2);
       doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text(`For: ${fwQuestion}`, 276, 318, { width: 265 });
 
       const p6FwIcons = ["target", "calculator", "trending_up", "shield", "checkmark"];
@@ -1312,7 +1522,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(d.title, drillFigmaX + 8, 526, { width: 103, lineGap: 1.5 });
 
-        const drillDesc = typeof d.desc === "string" && d.desc.length > 85 ? d.desc.substring(0, 82) + "..." : (d.desc || "");
+        const drillDesc = fitText(doc, d.desc || "", 103, "Inter", 6.5, 4, 2);
         doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(drillDesc, drillFigmaX + 8, 544, { width: 103, lineGap: 2 });
 
         doc.moveTo(drillFigmaX + 8, 584).lineTo(drillFigmaX + 111, 584).strokeColor(COLORS.border).lineWidth(0.5).stroke();
@@ -1323,29 +1533,30 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         drillFigmaX += 125;
       });
 
-      // Track Your Progress
+      // Track Your Progress — only one series is plotted (projected overall
+      // score), so the legend lists exactly that one series.
       doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, 600);
 
       doc.rect(50, 615, 14, 2).fill(COLORS.primaryDark);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Overall Score", 68, 612);
-      doc.rect(130, 615, 14, 2).fill(COLORS.emerald);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Confidence Score", 148, 612);
+      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Projected Overall Score", 68, 612);
 
+      // Short x-labels so the last tick can't collide with the pills below.
       const chartPoints = [
-        { xVal: "Session 1", yVal: 30 },
-        { xVal: "Session 2", yVal: 42 },
-        { xVal: "Session 3", yVal: 55 },
-        { xVal: "Session 4", yVal: 66 },
-        { xVal: "Session 5 (Target)", yVal: 78 }
+        { xVal: "S1", yVal: 30 },
+        { xVal: "S2", yVal: 42 },
+        { xVal: "S3", yVal: 55 },
+        { xVal: "S4", yVal: 66 },
+        { xVal: "Target", yVal: 78 }
       ];
-      drawLineChart(doc, 50, 625, 235, 85, chartPoints, 100, COLORS.primaryDark);
+      drawLineChart(doc, 72, 625, 213, 80, chartPoints, 100, COLORS.primaryDark, { yAxis: true });
 
-      doc.roundedRect(50, 728, 112, 14, 4).fill(COLORS.indigoBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", 56, 731, { continued: true });
+      // Pills sit clear below the x-axis tick row (ticks at y+h+5 = 710)
+      doc.roundedRect(72, 730, 100, 14, 4).fill(COLORS.indigoBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", 78, 733, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.primary).text("Target Score");
 
-      doc.roundedRect(173, 728, 112, 14, 4).fill(COLORS.emeraldBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", 179, 731, { continued: true });
+      doc.roundedRect(180, 730, 105, 14, 4).fill(COLORS.emeraldBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", 186, 733, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.emerald).text("Target Confidence");
 
       // Success Metrics — with proper vector icons

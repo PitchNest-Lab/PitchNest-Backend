@@ -27,6 +27,7 @@ export interface EvaluationReport {
   evaluationStatus?: "complete" | "insufficient_data" | "failed";
   // ── Phase 2: Dynamic market intelligence fields ─────────────
   topic_coverage?: Array<{ topic: string; percentage: number }>;
+  topic_coverage_overall?: number; // computed: mean of topic_coverage percentages
   transcript_summary?: string;
   questions_to_prepare?: string[];
   competitive_landscape?: {
@@ -80,6 +81,42 @@ function clampScore(value: unknown): number {
   const n = Math.round(Number(value));
   if (!Number.isFinite(n)) return 0;
   return Math.min(100, Math.max(0, n));
+}
+
+/**
+ * Benchmark "average founder" overall score. A pitch at this score maps to the
+ * 50th percentile. MUST match the average value shown in the PDF benchmarking
+ * bars (pdfService.ts) so the report is internally consistent.
+ */
+export const AVERAGE_FOUNDER_SCORE = 42;
+
+/** Overall score = mean of the four category scores. Single definition. */
+export function computeOverallScore(scores: {
+  delivery: number;
+  clarity: number;
+  scalability: number;
+  readiness: number;
+}): number {
+  return Math.round(
+    (scores.delivery + scores.clarity + scores.scalability + scores.readiness) / 4,
+  );
+}
+
+/**
+ * Deterministic percentile derived ONLY from the overall score, so it can never
+ * contradict the score. Meaning: "scored higher than X% of founders".
+ * Piecewise-linear, anchored so AVERAGE_FOUNDER_SCORE → 50:
+ *   score <= avg → 0..50   (below-average score is always a below-average percentile)
+ *   score >  avg → 50..99
+ */
+export function computeFounderPercentile(overallScore: number): number {
+  const s = Math.min(100, Math.max(0, overallScore));
+  const avg = AVERAGE_FOUNDER_SCORE;
+  const pct =
+    s <= avg
+      ? (s / avg) * 50
+      : 50 + ((s - avg) / (100 - avg)) * 49;
+  return Math.min(99, Math.max(1, Math.round(pct)));
 }
 
 function validateEvaluationReport(raw: any): EvaluationReport {
@@ -237,25 +274,38 @@ function validateEvaluationReport(raw: any): EvaluationReport {
         }))
     : undefined;
 
-  const founderPercentile =
-    typeof raw?.founder_percentile === "number"
-      ? Math.min(100, Math.max(1, Math.round(raw.founder_percentile)))
+  const validatedScores = {
+    delivery: clampScore(scores.delivery),
+    clarity: clampScore(scores.clarity),
+    scalability: clampScore(scores.scalability),
+    readiness: clampScore(scores.readiness),
+  };
+
+  // Percentile is COMPUTED from the score (not model-estimated), so it can never
+  // contradict the score. Single definition used everywhere in the PDF.
+  const overallScore = computeOverallScore(validatedScores);
+  const founderPercentile = computeFounderPercentile(overallScore);
+
+  // Overall topic coverage = mean of the topic percentages. Computed once here
+  // so the donut center and any other reference stay consistent.
+  const topicCoverageOverall =
+    topicCoverage && topicCoverage.length > 0
+      ? Math.round(
+          topicCoverage.reduce((s, t) => s + t.percentage, 0) /
+            topicCoverage.length,
+        )
       : undefined;
 
   return {
     summary: String(raw?.summary || "Evaluation completed."),
-    scores: {
-      delivery: clampScore(scores.delivery),
-      clarity: clampScore(scores.clarity),
-      scalability: clampScore(scores.scalability),
-      readiness: clampScore(scores.readiness),
-    },
+    scores: validatedScores,
     strengths,
     risks,
     next_steps: nextSteps,
     sentiments,
     evaluationStatus: "complete",
     topic_coverage: topicCoverage,
+    topic_coverage_overall: topicCoverageOverall,
     transcript_summary: transcriptSummary,
     questions_to_prepare: questionsToPrepare,
     competitive_landscape: competitiveLandscape,
@@ -551,8 +601,7 @@ ADDITIONAL ANALYSIS (provide these for the report):
 - top_priorities: Based on weaknesses found in THIS pitch, list exactly 5 specific priority improvements. For each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority" or "Medium Priority"), impact ("Very High", "High", or "Medium").
 - answer_framework: Pick the single hardest or most avoided investor question from this session. Build a 5-step answer framework for it. question: the exact question text, steps: [{label: short step name, text: how to answer that step}].
 - category_matrix: For each score category (Delivery, Clarity, Scalability, Readiness), write: category name, went_well (one specific sentence referencing what the founder actually did), needs_improvement (one specific sentence about a real gap), impact ("High", "Moderate", or "Low").
-- confidence_timeline: Estimate the founder's confidence/sentiment at 5 time intervals across the session based on how they spoke. Return [{time: "0:00", value: 85}, ...]. Values should fluctuate realistically — start point, after first hard question, during weakest moment, during recovery, at close.
-- founder_percentile: Estimate what percentile of early-stage founders this pitch falls in (1-100 integer). A value of 37 means this founder is in the bottom 37% — top 63% of founders did better.
+- confidence_timeline: Estimate the founder's confidence at 5 time intervals across the session based on how they spoke. Return [{time: "0:00", value: 85}, ...]. Values should fluctuate realistically — start point, after first hard question, during weakest moment, during recovery, at close. (This is a single confidence series — do NOT add a second metric.)
 
 Return this exact JSON structure:
 {
@@ -575,13 +624,12 @@ Return this exact JSON structure:
   "collaboration_opportunities": ["Specific opportunity 1", "Specific opportunity 2", "Specific opportunity 3", "Specific opportunity 4"],
   "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
   "vc_investment_probability": 25,
-  "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "$10M+" } ],
+  "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "Est. ~$10M–$50M ARR" } ],
   "companies_to_study": [ { "name": "Company Name", "why": "One sentence specific to why this founder should study them." } ],
   "top_priorities": [ { "title": "Priority Title 3-5 words", "desc": "Specific actionable sentence citing this pitch", "priority": "High Priority", "impact": "Very High" } ],
   "answer_framework": { "question": "Hardest question from this session", "steps": [ { "label": "Step Name", "text": "How to answer this step" } ] },
   "category_matrix": [ { "category": "Delivery", "went_well": "Specific sentence about what was good", "needs_improvement": "Specific sentence about the gap", "impact": "Moderate" } ],
-  "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ],
-  "founder_percentile": 37
+  "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ]
 }`;
 
   const callOpenAI = async (attempt: number = 1): Promise<any> => {
