@@ -28,6 +28,37 @@ const MIN_EVAL_DURATION_SEC = 60;
 // garbled and ask the founder to repeat instead of answering it.
 const LOW_STT_CONFIDENCE = 0.4;
 
+// ── Varied opening greetings ─────────────────────────────────────────────────
+// "Welcome to the Nest" (play on PitchNest). A fresh one is picked at random each
+// session so the opening never feels canned. {b} is the business name.
+const PANEL_GREETINGS = [
+  "Welcome to the Nest — whenever you're ready, walk us through {b}.",
+  "Great to have you in the Nest. Take a breath, then kick off your pitch for {b} whenever you're set.",
+  "Welcome to the Nest — the panel's listening, so start your pitch for {b} whenever you'd like.",
+  "You've made it to the Nest. Let's hear what {b} is all about whenever you're ready.",
+  "Welcome to the Nest — the floor is yours; introduce {b} whenever you're ready.",
+  "Glad you're here in the Nest. Start your pitch for {b} whenever you feel ready.",
+];
+const COACH_GREETINGS = [
+  "Welcome to the Nest — I'm Riley. Let's sharpen your pitch for {b} whenever you're ready.",
+  "Great to have you in the Nest. Take your time, then walk me through {b}.",
+  "Welcome to the Nest — whenever you're set, start your pitch for {b} and I'll coach you through it.",
+  "You're in the Nest now. Let's make {b} shine — begin whenever you're ready.",
+  "Welcome to the Nest — I'm Riley, your coach. Kick off {b} whenever you're ready.",
+];
+
+function pickGreeting(isCoach: boolean, businessName: string): string {
+  const pool = isCoach ? COACH_GREETINGS : PANEL_GREETINGS;
+  const line = pool[Math.floor(Math.random() * pool.length)];
+  return line.replace("{b}", businessName || "your startup");
+}
+
+// Yields a fixed string as a single chunk so a canned line (e.g. the greeting)
+// can flow through the same sentence/TTS pipeline as streamed LLM output.
+async function* singleChunkStream(text: string): AsyncGenerator<string, void, unknown> {
+  yield text;
+}
+
 async function resolveDeckText(clientConfig: any): Promise<string> {
   const deck = clientConfig?.selectedDeck;
   if (!deck) return "";
@@ -317,19 +348,20 @@ export function initRestSocket(wss: WebSocketServer) {
         let promptToUse = masterPrompt;
         let userInputToUse = userInput;
 
-        if (turn.isGreeting) {
-          promptToUse = isCoachMode
-            ? `IDENTITY: Riley — elite startup pitch coach.\nRULES: Warmly welcome the founder to pitch ${currentBusinessName}. Keep it strictly to 1 short conversational sentence. MUST prefix your response with "Riley: ".`
-            : `IDENTITY: Marcus — Lead VC Partner.\nRULES: Warmly welcome the founder to PitchNest and invite them to pitch ${currentBusinessName}. Keep it strictly to 1 short conversational sentence. MUST prefix your response with "Marcus: ".`;
-          userInputToUse = "Hello, I am ready.";
-        }
-
-        const stream = streamPanelResponse(
-          userInputToUse,
-          turn.isGreeting ? [] : conversationHistory,
-          promptToUse,
-          turnAbort.signal,
-        );
+        // Greeting: speak a varied, code-chosen "Welcome to the Nest" line
+        // directly (no LLM call) so the opening is consistent on brand, varied
+        // each session, and instant. It still flows through the normal
+        // sentence/TTS pipeline via singleChunkStream.
+        const stream = turn.isGreeting
+          ? singleChunkStream(
+              `${isCoachMode ? "Riley" : "Marcus"}: ${pickGreeting(isCoachMode, currentBusinessName)}`,
+            )
+          : streamPanelResponse(
+              userInputToUse,
+              conversationHistory,
+              promptToUse,
+              turnAbort.signal,
+            );
 
         for await (const token of stream) {
           if (turnAbort.signal.aborted) break;
