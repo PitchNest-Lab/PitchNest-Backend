@@ -131,6 +131,20 @@ const evaluation_report = {
     { time: "6:00", value: 38 },
   ],
   duration: 372,
+  // Real transcript so delivery metrics (words spoken, filler %, questions
+  // asked, talk ratio) are computed, not faked. Includes a $50M raise the
+  // founder NEVER states — used to confirm the raise-figure guard.
+  transcript: [
+    { type: "model", speaker: "Marcus", text: "Welcome. Whenever you're ready, go ahead and give us your pitch." },
+    { type: "user", inputMethod: "voice", text: "We help elderly people in Nigeria monitor their health with AI.", fullText: "Um, so, like, HealthMate AI is basically a mobile app that, uh, helps elderly people in Nigeria monitor their health using AI. You know, a lot of older folks in underserved areas, um, don't get timely diagnosis, so we, like, give them daily check-ins and alerts." },
+    { type: "model", speaker: "Sarah", text: "How did you calculate your total addressable market?" },
+    { type: "user", inputMethod: "voice", text: "There are about 5 million elderly people we could reach.", fullText: "Uh, well, there are like 5 million elderly people in Nigeria, um, and we figure we can reach a good chunk of them, you know, over time." },
+    { type: "model", speaker: "Sarah", text: "What is your pricing model and what are the unit economics behind it?" },
+    { type: "user", inputMethod: "voice", text: "We haven't finalized pricing yet.", fullText: "Hmm, actually we, uh, haven't really finalized pricing yet, but it'll be, like, a subscription probably." },
+    { type: "model", speaker: "Chen", text: "Can you walk me through the AI architecture and your data strategy?" },
+    { type: "user", inputMethod: "chat", text: "It's still early, we're using off-the-shelf models for now." },
+    { type: "model", speaker: "Marcus", text: "Thanks, that gives us a clear picture of where you are." },
+  ],
 };
 
 const session = {

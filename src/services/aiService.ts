@@ -119,6 +119,71 @@ export function computeFounderPercentile(overallScore: number): number {
   return Math.min(99, Math.max(1, Math.round(pct)));
 }
 
+// ── Guard against unstated raise figures (FIX 1.3) ───────────────────────────
+// The model sometimes invents a specific funding amount the founder never said
+// (e.g. "a $50M funding allocation"). We only allow a concrete raise figure to
+// survive if it actually appears in the transcript; otherwise it is rewritten to
+// generic wording. Scoped strictly to funding/raise contexts so legitimate
+// market-size figures ("the $10B elderly-care market") are left untouched.
+const MONEY = String.raw`\$\s?\d[\d.,]*\s?(?:k|m|b|mm|bn|million|billion|thousand)?`;
+
+function normalizeMoney(s: string): string {
+  const m = s.toLowerCase().match(/\$?\s?(\d[\d.,]*)\s?(k|m|b|mm|bn|million|billion|thousand)?/);
+  if (!m) return s.toLowerCase().replace(/\s/g, "");
+  const num = parseFloat(m[1].replace(/,/g, ""));
+  if (!Number.isFinite(num)) return s.toLowerCase().replace(/\s/g, "");
+  const unit = m[2] || "";
+  const mult = /^(k|thousand)$/.test(unit) ? 1e3
+    : /^(m|mm|million)$/.test(unit) ? 1e6
+    : /^(b|bn|billion)$/.test(unit) ? 1e9
+    : 1;
+  return String(Math.round(num * mult));
+}
+
+function extractStatedFigures(transcriptText: string): Set<string> {
+  const set = new Set<string>();
+  const re = new RegExp(MONEY, "gi");
+  for (const match of transcriptText.matchAll(re)) set.add(normalizeMoney(match[0]));
+  return set;
+}
+
+function scrubUnstatedRaiseFigures(text: string, stated: Set<string>): string {
+  if (!text) return text;
+  // Form A: "a $50M funding/raise/round/allocation" → "your target funding/…"
+  // (absorbs a leading article so we don't leave "a your target …").
+  const trailing = new RegExp(`(?:\\b(?:a|an|the|your)\\s+)?(${MONEY})\\s+(funding|raise|round|allocation)`, "gi");
+  // Form B: "raising/seeking/allocate/invest … $50M" → "…your target raise"
+  const leading = new RegExp(
+    `\\b(rais(?:e|ing)|seeking|allocat(?:e|ing)|invest(?:ing)?)\\s+(?:a\\s+|an\\s+|of\\s+|about\\s+|up to\\s+|around\\s+)?(${MONEY})`,
+    "gi",
+  );
+  return text
+    .replace(trailing, (whole, amount, kw) =>
+      stated.has(normalizeMoney(amount)) ? whole : `your target ${kw.toLowerCase()}`,
+    )
+    .replace(leading, (whole, verb, amount) =>
+      stated.has(normalizeMoney(amount)) ? whole : `${verb} your target raise`,
+    );
+}
+
+// Recursively scrub raise figures from every narrative string, but never touch
+// competitor data (its size figures are clearly-labelled AI estimates handled
+// separately, not claims about the founder's raise).
+function scrubReportRaiseFigures(obj: any, stated: Set<string>): any {
+  if (typeof obj === "string") return scrubUnstatedRaiseFigures(obj, stated);
+  if (Array.isArray(obj)) return obj.map((v) => scrubReportRaiseFigures(v, stated));
+  if (obj && typeof obj === "object") {
+    const out: any = {};
+    for (const [k, v] of Object.entries(obj)) {
+      out[k] = k === "competitors" || k === "competitors_disclaimer" || k === "size"
+        ? v
+        : scrubReportRaiseFigures(v, stated);
+    }
+    return out;
+  }
+  return obj;
+}
+
 function validateEvaluationReport(raw: any): EvaluationReport {
   const scores = raw?.scores || {};
   const nextSteps = Array.isArray(raw?.next_steps)
@@ -581,6 +646,7 @@ EVALUATION RULES:
 - readiness = overall investability for the stated funding stage.
 - Cross-check transcript claims against deck content when deck is provided.
 - Be specific — cite actual topics discussed, not generic advice.
+- NEVER invent a specific fundraising amount. Only state a concrete raise/funding figure (e.g. "$2M seed") if the founder explicitly said it in the transcript. Otherwise always use generic wording like "your target raise" or "your funding ask". This applies to summary, questions_to_prepare, top_priorities, and answer_framework especially.
 - Keep summary to 2-3 sentences. Strengths/risks must reference real content.
 - Include one sentiment quote each for Marcus, Sarah, and Chen.
 
@@ -660,7 +726,11 @@ Return this exact JSON structure:
   };
 
   const parsed = await callOpenAI();
-  return validateEvaluationReport(parsed);
+  // Safety net: rewrite any specific raise/funding figure the model invented but
+  // the founder never actually stated (see scrubUnstatedRaiseFigures).
+  const stated = extractStatedFigures(transcriptText);
+  const cleaned = scrubReportRaiseFigures(parsed, stated);
+  return validateEvaluationReport(cleaned);
 }
 
 /**

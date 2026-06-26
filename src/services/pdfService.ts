@@ -87,6 +87,66 @@ function formatDate(dateStr?: string): string {
   }
 }
 
+// ── Delivery metrics computed from the REAL transcript ───────────────────────
+// Code owns every number on the report. Anything not derivable from the saved
+// transcript is returned as null so the caller renders "N/A" (honestly absent)
+// instead of a fabricated placeholder. We deliberately do NOT compute Speaking
+// Pace (WPM), Average Pause, or Avg Response: those need per-utterance audio
+// timestamps the session does not record, and a fake number on the one claim a
+// founder can personally disprove would discredit the whole report.
+const FILLER_RE =
+  /\b(?:u+m+|u+h+|e+r+|e+h+|a+h+|hmm+|like|y'?know|you know|i mean|sort of|kind of|kinda|sorta|basically|literally|actually)\b/gi;
+
+interface DeliveryMetrics {
+  founderWords: number | null;
+  fillerPct: number | null;
+  questionsAsked: number | null;
+  talkRatioPct: number | null;
+}
+function computeDeliveryMetrics(transcript: unknown): DeliveryMetrics {
+  const empty: DeliveryMetrics = {
+    founderWords: null,
+    fillerPct: null,
+    questionsAsked: null,
+    talkRatioPct: null,
+  };
+  if (!Array.isArray(transcript) || transcript.length === 0) return empty;
+
+  const wordCount = (s: string) => (s.trim().match(/\S+/g) || []).length;
+  let founderWords = 0;
+  let fillerCount = 0;
+  let panelWords = 0;
+  let questionsAsked = 0;
+  let hasFounderTurn = false;
+
+  for (const m of transcript as any[]) {
+    if (m?.type === "user") {
+      hasFounderTurn = true;
+      // Voice turns store the verbatim utterance in `fullText`; `text` holds a
+      // short summary. Use the raw utterance so word and filler counts reflect
+      // what the founder actually said, not the summarized version.
+      const raw = String(m.fullText || m.text || "");
+      founderWords += wordCount(raw);
+      const fillers = raw.match(FILLER_RE);
+      if (fillers) fillerCount += fillers.length;
+    } else if (m?.text) {
+      const t = String(m.text);
+      panelWords += wordCount(t);
+      // A panel turn that contains a question mark counts as one question asked.
+      if (/\?/.test(t)) questionsAsked += 1;
+    }
+  }
+
+  if (!hasFounderTurn) return empty;
+  const totalWords = founderWords + panelWords;
+  return {
+    founderWords: founderWords > 0 ? founderWords : 0,
+    fillerPct: founderWords > 0 ? Math.round((fillerCount / founderWords) * 100) : null,
+    questionsAsked, // 0 is a real, valid answer
+    talkRatioPct: totalWords > 0 ? Math.round((founderWords / totalWords) * 100) : null,
+  };
+}
+
 // ── Pattern B: word-boundary truncation ──────────────────────────────────────
 // One shared truncator: never cuts mid-word, appends a single standard ellipsis,
 // and verifies the result fits within `width` × `maxLines` using heightOfString.
@@ -978,15 +1038,21 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("By addressing the risks in this report.", 355, 503, { width: 186, align: "center" });
 
-      // AI Insights
+      // AI Insights — every value is computed from the real transcript (or live
+      // scores). No "vs avg" deltas: we have no per-metric founder benchmark, and
+      // a fabricated delta is worse than none. Metrics that can't be derived show
+      // a factual sub-label, never a placeholder number.
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("AI INSIGHTS AT A GLANCE", 50, 530);
+      const dm = computeDeliveryMetrics(report.transcript);
+      const numOrNA = (v: number | null, suffix = "") =>
+        isInsufficient || v === null ? "N/A" : `${v}${suffix}`;
       const metrics = [
-        { label: "Questions Asked", val: isInsufficient ? "N/A" : "8", trend: "-2 vs avg", tColor: COLORS.rose },
-        { label: "Confidence", val: isInsufficient ? "N/A" : `${scores.delivery}%`, trend: "+1.2% vs avg", tColor: COLORS.emerald },
-        { label: "Sentiment Trend", val: isInsufficient ? "N/A" : "-4%", trend: "-6% vs avg", tColor: COLORS.rose },
-        { label: "Avg Response", val: "5:42", trend: "+1:06 vs avg", tColor: COLORS.emerald },
-        { label: "Interactivity", val: "2.1", trend: "-0.8 vs avg", tColor: COLORS.rose },
-        { label: "Clarity Score", val: isInsufficient ? "N/A" : `${scores.clarity}%`, trend: "-9% vs avg", tColor: COLORS.rose }
+        { label: "Questions Asked", val: numOrNA(dm.questionsAsked), sub: "from the panel" },
+        { label: "Words Spoken", val: numOrNA(dm.founderWords), sub: "by you" },
+        { label: "Filler Words", val: numOrNA(dm.fillerPct, "%"), sub: "ideal: <5%" },
+        { label: "Confidence", val: isInsufficient ? "N/A" : `${scores.delivery}%`, sub: "ideal: 70%+" },
+        { label: "Clarity", val: isInsufficient ? "N/A" : `${scores.clarity}%`, sub: "ideal: 70%+" },
+        { label: "Talk Ratio", val: numOrNA(dm.talkRatioPct, "%"), sub: "your share" },
       ];
 
       let cardX = 50;
@@ -994,7 +1060,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.rect(cardX, 550, 72, 70).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
         doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(m.label, cardX + 5, 558, { width: 62, align: "center" });
         doc.font("Inter-Bold").fontSize(13).fillColor(COLORS.dark).text(m.val, cardX + 5, 578, { width: 62, align: "center" });
-        doc.font("Inter-Bold").fontSize(6.5).fillColor(m.tColor).text(m.trend, cardX + 5, 598, { width: 62, align: "center" });
+        doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text(m.sub, cardX + 5, 600, { width: 62, align: "center" });
         cardX += 84;
       });
 
@@ -1027,12 +1093,21 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.addPage();
       drawHeader(doc, "Performance & Delivery Analytics");
 
+      // Delivery stats — all computed from the real transcript / live scores.
+      // Speaking Pace (WPM) and Average Pause were removed: they require
+      // per-utterance audio timing the session does not capture, so we will not
+      // fabricate them. Filler Words and Words Spoken are derived from what the
+      // founder actually said.
+      const dmP3 = computeDeliveryMetrics(report.transcript);
+      const scoreDesc = (v: number) => (v >= 70 ? "On Track" : v >= 50 ? "Moderate" : "Needs Improvement");
+      const fillerColor =
+        dmP3.fillerPct === null ? COLORS.textLight : dmP3.fillerPct <= 5 ? COLORS.emerald : COLORS.amber;
       const statsPace = [
-        { title: "Speaking Pace", val: "148 WPM", desc: "Moderate (Ideal: 130-160)", color: COLORS.primary },
-        { title: "Confidence Score", val: isInsufficient ? "N/A" : `${scores.delivery}%`, desc: "Moderate (Ideal: 70%+)", color: COLORS.emerald },
-        { title: "Clarity Score", val: isInsufficient ? "N/A" : `${scores.clarity}%`, desc: "Needs Improvement", color: COLORS.rose },
-        { title: "Filler Words", val: "12%", desc: "High (Ideal: <5%)", color: COLORS.amber },
-        { title: "Average Pause", val: "2.1 sec", desc: "Slightly Long", color: COLORS.indigo }
+        { title: "Words Spoken", val: isInsufficient || dmP3.founderWords === null ? "N/A" : `${dmP3.founderWords}`, desc: "total, by you", color: COLORS.primary },
+        { title: "Filler Words", val: isInsufficient || dmP3.fillerPct === null ? "N/A" : `${dmP3.fillerPct}%`, desc: "Ideal: <5%", color: fillerColor },
+        { title: "Questions Asked", val: isInsufficient || dmP3.questionsAsked === null ? "N/A" : `${dmP3.questionsAsked}`, desc: "from the panel", color: COLORS.indigo },
+        { title: "Confidence Score", val: isInsufficient ? "N/A" : `${scores.delivery}%`, desc: `${scoreDesc(scores.delivery)} (Ideal: 70%+)`, color: getScoreAccentColor(scores.delivery) },
+        { title: "Clarity Score", val: isInsufficient ? "N/A" : `${scores.clarity}%`, desc: `${scoreDesc(scores.clarity)} (Ideal: 70%+)`, color: getScoreAccentColor(scores.clarity) },
       ];
 
       let statX = 50;
@@ -1322,19 +1397,21 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("How well you covered each key pitch topic", 50, 77);
       doc.roundedRect(50, 90, 495, 110, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
 
-      const topicDonutSegments = topicCoverage.map(t => ({ value: t.percentage, color: t.color }));
-      // Center = mean of the listed topic percentages (computed server-side, with
-      // a local fallback). Labeled so it's clear what the number represents.
-      const totalCoverage = typeof report.topic_coverage_overall === "number"
-        ? report.topic_coverage_overall
-        : topicCoverage.length > 0
-          ? Math.round(topicCoverage.reduce((s, t) => s + t.percentage, 0) / topicCoverage.length)
-          : 0;
+      // The donut, the legend, and the centre number all use the SAME displayed
+      // slice, so the centre (their mean) always reconciles with what's listed.
+      // We intentionally do NOT use report.topic_coverage_overall here — that is
+      // the mean of the full topic array (incl. unlisted Team/Financials/etc.)
+      // and would disagree with a 6-item legend.
+      const displayedTopics = topicCoverage.slice(0, 6);
+      const topicDonutSegments = displayedTopics.map(t => ({ value: t.percentage, color: t.color }));
+      const totalCoverage = displayedTopics.length > 0
+        ? Math.round(displayedTopics.reduce((s, t) => s + t.percentage, 0) / displayedTopics.length)
+        : 0;
       drawDonutChart(doc, 448, 147, 35, topicDonutSegments, `${totalCoverage}%`);
-      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("Overall coverage", 413, 187, { width: 70, align: "center" });
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("Avg of shown topics", 413, 187, { width: 70, align: "center" });
 
       let tLegY = 103;
-      topicCoverage.slice(0, 6).forEach((t) => {
+      displayedTopics.forEach((t) => {
         doc.circle(70, tLegY + 3.5, 3).fill(t.color);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(t.topic, 80, tLegY, { width: 145, lineBreak: false });
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(`${t.percentage}%`, 235, tLegY, { align: "right", width: 35 });

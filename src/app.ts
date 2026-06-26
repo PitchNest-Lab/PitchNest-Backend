@@ -59,8 +59,15 @@ app.use("/api/profile", profileRoutes);
 app.post("/api/waitlist", handleWaitlist);
 app.post("/api/survey", handleSurvey);
 
-// Health check endpoint
-app.get("/health", (req, res) => res.send("🚀 PitchNest Brain Online!"));
+// Health check endpoints — kept dependency-free so they return instantly and can
+// be used to pre-warm the Render service (which spins down on the free tier).
+// The frontend pings /api/health on Landing/Login/Signup mount to trigger the
+// cold start while the user is still typing, so login doesn't hit a sleeping server.
+const handleHealth = (_req: express.Request, res: express.Response) =>
+  res.status(200).json({ status: "ok", service: "pitchnest-live", time: new Date().toISOString() });
+
+app.get("/health", handleHealth);
+app.get("/api/health", handleHealth);
 
 // Frontend Static Build Serving & Single Page App Fallback
 const distPath = path.join(process.cwd(), "../frontend/dist");
