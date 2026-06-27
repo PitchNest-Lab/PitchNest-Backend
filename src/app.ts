@@ -25,6 +25,8 @@ const isProduction = config.nodeEnv === "production";
 const allowedOrigins = [
   config.allowedOrigin,
   'https://pitchnestapp.vercel.app',
+  'https://www.pitchnest.app',
+  'https://pitchnest.app',
   ...(isProduction ? [] : ['http://localhost:5173', 'http://localhost:3000']),
 ].filter(Boolean);
 
@@ -113,5 +115,18 @@ if (hasFrontendBuild) {
     res.status(404).json({ error: "Not Found", message: "Use /api routes to connect to PitchNest Live API services." });
   });
 }
+
+// Global error handler — guarantees API errors come back as JSON, never as
+// Express's default HTML error page (which the frontend can't JSON.parse and
+// surfaces as "Unexpected token '<'"). Notably catches CORS rejections.
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  if (res.headersSent) return;
+  const isCors = err?.message === "Not allowed by CORS";
+  const status = isCors ? 403 : err?.status || 500;
+  if (status >= 500) console.error("Unhandled error:", err);
+  res.status(status).json({
+    error: isCors ? "Origin not allowed." : "Something went wrong. Please try again.",
+  });
+});
 
 export default app;
