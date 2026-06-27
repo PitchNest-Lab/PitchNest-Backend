@@ -1509,18 +1509,33 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const summaryTextP5 = fitTextBySentence(doc, transcriptSummary, 475, "Inter", 7.5, 4, 2);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(summaryTextP5, 60, 228, { width: 475, lineGap: 2 });
 
-      // ── 2-Column: Market Gap (left, x=50) | Companies to Study (right, x=295) ──
+      // ── Pre-calculate heights for 2-Column: Market Gap & Companies to Study ──
+      const p5Gaps = marketGaps;
+      let mgGapHeight = 26; // Title + padding
+      p5Gaps.forEach((g) => {
+        const gDesc = fitText(doc, g.desc, 215, "Inter", 6.5, 3, 1.5);
+        const dh = doc.heightOfString(gDesc, { width: 215, lineGap: 1.5 });
+        mgGapHeight += Math.max(26, 10 + dh + 6);
+      });
+
+      let p5StudyHeight = 26; // Title + padding
+      studiesToShow.forEach((s) => {
+        const whyText = fitText(doc, s.why, 218, "Inter", 6.5, 3, 1.5);
+        const wh = doc.heightOfString(whyText, { width: 218, lineGap: 1.5 });
+        p5StudyHeight += Math.max(22, 9 + wh + 6);
+      });
+
+      const colMaxH = Math.max(148, Math.max(mgGapHeight, p5StudyHeight) + 10);
+
+      // ── Draw 2-Column layout ───────────────────────────────────────────────
       doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.primaryDark).text("MARKET GAP ANALYSIS", 50, 287);
       doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Key gaps competitors are not addressing", 50, 298);
 
-      doc.roundedRect(295, 283, 250, 148, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+      doc.roundedRect(295, 283, 250, colMaxH, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
       doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.primaryDark).text("COMPANIES TO STUDY", 305, 291);
       doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Competitors and examples worth learning from", 305, 302);
 
-      const p5Gaps = marketGaps;
       let mgGapY = 309;
-      // Pattern A + B: each gap advances by its measured height; text fits on
-      // word boundaries instead of clipping mid-word.
       p5Gaps.forEach((g) => {
         doc.circle(61, mgGapY + 7, 8).fill(COLORS.indigoBg);
         doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text((g.title || "?").charAt(0).toUpperCase(), 54, mgGapY + 4, { align: "center", width: 14 });
@@ -1534,8 +1549,6 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       const p5StudyColors = ["#4C6FD1", "#06b6d4", "#f59e0b", "#3b82f6"];
       let p5StudyY = 314;
-      // Pattern A: advance by measured height so a company's description can
-      // never overlap the next company's title.
       studiesToShow.forEach((s, sIdx) => {
         const p5Char = s.name.charAt(0).toUpperCase();
         const p5Bg = p5StudyColors[sIdx % p5StudyColors.length];
@@ -1549,16 +1562,17 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         p5StudyY += Math.max(22, 9 + wh + 6);
       });
 
-      // ── AI Strategic Recommendation (y=440–528) ────────────────────────────
-      doc.roundedRect(50, 440, 495, 88, 8).lineWidth(1).fillAndStroke(COLORS.bgLight, COLORS.border);
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primary).text("AI STRATEGIC RECOMMENDATION", 65, 450);
-      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Based on competitive analysis and market opportunities", 65, 461);
-      doc.roundedRect(65, 472, 40, 35, 6).fill(COLORS.indigoBg);
-      drawIcon(doc, "trending_up", 72, 476, 26, COLORS.primary);
+      // ── AI Strategic Recommendation ────────────────────────────────────────
+      const p5RecTopY = 283 + colMaxH + 15;
+      doc.roundedRect(50, p5RecTopY, 495, 88, 8).lineWidth(1).fillAndStroke(COLORS.bgLight, COLORS.border);
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primary).text("AI STRATEGIC RECOMMENDATION", 65, p5RecTopY + 10);
+      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Based on competitive analysis and market opportunities", 65, p5RecTopY + 21);
+      doc.roundedRect(65, p5RecTopY + 32, 40, 35, 6).fill(COLORS.indigoBg);
+      drawIcon(doc, "trending_up", 72, p5RecTopY + 36, 26, COLORS.primary);
       const recTextP5 = fitTextBySentence(doc, strategicRecommendation, 230, "Inter", 7.5, 4, 2.5);
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(recTextP5, 115, 472, { width: 230, lineGap: 2.5 });
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primary).text("Key Focus Areas", 360, 450);
-      let focusY5 = 464;
+      doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(recTextP5, 115, p5RecTopY + 32, { width: 230, lineGap: 2.5 });
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primary).text("Key Focus Areas", 360, p5RecTopY + 10);
+      let focusY5 = p5RecTopY + 24;
       keyFocusAreas.slice(0, 4).forEach((f) => {
         drawIcon(doc, "checkmark", 360, focusY5, 10, COLORS.emerald);
         const fText = fitText(doc, f, 162, "Inter", 7, 1);
@@ -1566,10 +1580,11 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         focusY5 += 14;
       });
 
-      // ── Strategic Collaboration (y=538–618) ───────────────────────────────
-      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("STRATEGIC COLLABORATION OPPORTUNITIES", 50, 538);
+      // ── Strategic Collaboration ───────────────────────────────────────────
+      const p5CollabTopY = p5RecTopY + 88 + 15;
+      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("STRATEGIC COLLABORATION OPPORTUNITIES", 50, p5CollabTopY);
       const p5CollabItems = collaborationOpportunities;
-      let p5CollabY = 553;
+      let p5CollabY = p5CollabTopY + 15;
       p5CollabItems.forEach((item, idx) => {
         doc.circle(60, p5CollabY + 6, 9).fill(COLORS.primary);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(`${idx + 1}`, 55, p5CollabY + 3, { width: 10, align: "center" });
