@@ -659,9 +659,16 @@ export function initRestSocket(wss: WebSocketServer) {
                 if (sessionEnded) return;
                 // Barge-in via server STT: abort the in-flight turn so the
                 // server stops generating + streaming further audio.
-                if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
-                  currentTurnAbort.abort();
-                }
+                // Only a partial that interrupts an ACTIVE turn is a real
+                // barge-in. A partial that arrives while the panel is idle
+                // (background noise, speaker echo between turns) must NOT emit
+                // stop_audio — that would make the client drop the NEXT turn's
+                // audio, which is exactly the "panel text shows but no voice
+                // plays" bug.
+                const hadActiveTurn =
+                  !!currentTurnAbort && !currentTurnAbort.signal.aborted;
+                if (!hadActiveTurn) return;
+                currentTurnAbort!.abort();
                 const now = Date.now();
                 // Avoid spamming stop_audio too fast
                 if (
