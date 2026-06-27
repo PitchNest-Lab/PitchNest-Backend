@@ -293,6 +293,18 @@ function drawTableRow(
   return y + rowH;
 }
 
+// ── Dynamic page break helper ────────────────────────────────────────────────
+// Call before every major section: if the remaining vertical space is less than
+// `needed`, start a fresh page with a header so content never runs off the edge.
+function ensureSpace(doc: PDFDoc, needed: number, title: string): void {
+  const bottomMargin = 80;
+  if (doc.y + needed > doc.page.height - bottomMargin) {
+    doc.addPage();
+    drawHeader(doc, title);
+    doc.y = 65;
+  }
+}
+
 // ── Vector Icon Drawing System ───────────────────────────────────────────────
 function drawIcon(doc: PDFDoc, name: string, x: number, y: number, size: number, color: string) {
   const s = size;
@@ -991,12 +1003,12 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       let sentX = 50;
       sentiments.slice(0, 3).forEach((s) => {
-        doc.rect(sentX, 605, 150, 150).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+        doc.rect(sentX, 605, 158, 155).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
         doc.circle(sentX + 25, 630, 14).fill(COLORS.border);
         doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.primary).text(s.persona.substring(0, 1), sentX + 22, 626);
-        doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text(s.persona, sentX + 48, 622, { width: 95 });
-        const cappedQuote = fitText(doc, s.quote, 116, "Helvetica-Oblique", 8, 6, 3);
-        doc.font("Helvetica-Oblique").fontSize(8).fillColor(COLORS.text).text(`"${cappedQuote}"`, sentX + 15, 655, { width: 120, lineGap: 3 });
+        doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text(s.persona, sentX + 48, 622, { width: 103 });
+        const cappedQuote = fitText(doc, s.quote, 130, "Helvetica-Oblique", 8, 8, 3);
+        doc.font("Helvetica-Oblique").fontSize(8).fillColor(COLORS.text).text(`"${cappedQuote}"`, sentX + 15, 655, { width: 130, lineGap: 3 });
         sentX += 172;
       });
 
@@ -1032,11 +1044,17 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Actionable Next Steps
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("ACTIONABLE NEXT STEPS", 50, 320);
       let stepY = 340;
-      // Fixed-height rows so the three boxes always end above the "AI INSIGHTS"
-      // section (y=530): 340 + 3×(54+6) = 520. Title and description are each
-      // bounded to fit inside the row, so neither can overflow or overlap.
-      const stepRowH = 54;
-      nextSteps.slice(0, 3).forEach((step, idx) => {
+      const stepsToShow = nextSteps.slice(0, 5);
+      for (let idx = 0; idx < stepsToShow.length; idx++) {
+        const step = stepsToShow[idx];
+        // Dynamic row height: measure description to determine card size
+        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, 3, 1.5);
+        const descH = doc.heightOfString(descText, { width: 225, lineGap: 1.5 });
+        const stepRowH = Math.max(48, 24 + descH + 8);
+
+        // Stop drawing if we'd overflow into the AI INSIGHTS section
+        if (stepY + stepRowH > 520) break;
+
         doc.rect(50, stepY, 280, stepRowH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
         doc.circle(70, stepY + stepRowH / 2, 12).fill(COLORS.primary);
         doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + stepRowH / 2 - 4, { align: "center", width: 6 });
@@ -1044,8 +1062,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         // Title: one line, leaving room for the priority pill on the same row.
         const stepTitle = fitText(doc, step.title || "", 150, "Inter-Bold", 8.5, 1);
         doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(stepTitle, 92, stepY + 9, { width: 150 });
-        // Description: up to two lines BELOW the title/pill row, full card width.
-        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, 2, 1.5);
+        // Description: up to three lines BELOW the title/pill row, full card width.
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 225, lineGap: 1.5 });
 
         // Priority tag — High Priority: red bg, white text
@@ -1059,7 +1076,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         }
 
         stepY += stepRowH + 6;
-      });
+      }
 
       // Investment Gauge Card
       doc.roundedRect(345, 320, 200, 125, 6).lineWidth(0.5).fillAndStroke(COLORS.white, COLORS.border);
@@ -1232,7 +1249,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("DETAILED CATEGORY MATRIX", 50, doc.y);
 
       const tableHeaders = ["Category", "Score", "What Went Well", "What Needs Improvement", "Impact"];
-      const colWidths = [85, 45, 140, 160, 60];
+      const colWidths = [80, 45, 145, 155, 60];
 
       let ty = Math.max(370, doc.y + 16);
       doc.rect(50, ty, 495, 18).fill(COLORS.primary);
@@ -1255,8 +1272,8 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         const cells: RowCell[] = [
           { text: row.category, font: "Inter-Bold" },
           { text: `${catScore}/100`, font: "Inter-Bold" },
-          { text: fitText(doc, row.went_well, 130, "Inter", 7.5, 3, 1.5) },
-          { text: fitText(doc, row.needs_improvement, 150, "Inter", 7.5, 3, 1.5) },
+          { text: fitText(doc, row.went_well, 135, "Inter", 7.5, 5, 1.5) },
+          { text: fitText(doc, row.needs_improvement, 145, "Inter", 7.5, 5, 1.5) },
           { text: row.impact },
         ];
         ty = drawTableRow(doc, 50, ty, colWidths, cells, {
@@ -1269,10 +1286,12 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         });
       });
 
-      // Founder Benchmarking — Improved layout
+      // Founder Benchmarking — Improved layout with card background
       ty += 15;
       
-      doc.roundedRect(50, ty, 495, 140, 8).fill(COLORS.indigoBg);
+      // Card background matching VC INVESTMENT PROBABILITY style
+      doc.roundedRect(50, ty, 495, 140, 8).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+      doc.roundedRect(55, ty + 5, 485, 130, 6).fill(COLORS.indigoBg);
       
       doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.primaryDark).text("BENCHMARKING AGAINST OTHER FOUNDERS", 65, ty + 15);
       
@@ -1432,10 +1451,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const p4ScatterPoints: { name: string; xVal: number; yVal: number; color: string; labelPosition?: "left" | "right" }[] = [
         { name: `${businessName} (You)`, xVal: -30, yVal: 65, color: COLORS.primary, labelPosition: "right" }
       ];
-      const p4MapPositions = [[55, 50], [65, 15], [60, -40], [-55, -60]];
+      // Compute scatter coordinates from real AI data (similarity → X,
+      // derived market presence → Y) instead of hard-coded positions.
       competitorList.forEach((c, ci) => {
-        const pos = p4MapPositions[ci] || [0, 0];
-        p4ScatterPoints.push({ name: c.name, xVal: pos[0], yVal: pos[1], color: p4BgColors[ci % p4BgColors.length] });
+        // X-axis: map similarity (0–100) to plot range (-80..+80)
+        const simX = ((c.similarity ?? 50) / 100) * 160 - 80;
+        // Y-axis: spread competitors vertically based on index and similarity
+        const ySpread = [50, 15, -30, -55];
+        const simY = ySpread[ci] ?? (50 - ci * 30);
+        p4ScatterPoints.push({ name: c.name, xVal: simX, yVal: simY, color: p4BgColors[ci % p4BgColors.length] });
       });
       drawScatterPlot(doc, 75, p4MapY + 34, 460, 100, p4ScatterPoints);
       // X-axis label on the axis line (bottom of the plot), not floating above it
@@ -1502,9 +1526,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text((g.title || "?").charAt(0).toUpperCase(), 54, mgGapY + 4, { align: "center", width: 14 });
         const gTitle = fitText(doc, g.title, 210, "Inter-Bold", 7.5, 1);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(gTitle, 74, mgGapY, { width: 210 });
-        const gDesc = fitText(doc, g.desc, 210, "Inter", 6.5, 2, 1.5);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(gDesc, 74, mgGapY + 10, { width: 210, lineGap: 1.5 });
-        const dh = doc.heightOfString(gDesc, { width: 210, lineGap: 1.5 });
+        const gDesc = fitText(doc, g.desc, 215, "Inter", 6.5, 3, 1.5);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(gDesc, 74, mgGapY + 10, { width: 215, lineGap: 1.5 });
+        const dh = doc.heightOfString(gDesc, { width: 215, lineGap: 1.5 });
         mgGapY += Math.max(26, 10 + dh + 6);
       });
 
@@ -1519,9 +1543,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(p5Char, 305, p5StudyY + 4, { align: "center", width: 16 });
         const sName = fitText(doc, s.name, 213, "Inter-Bold", 7.5, 1);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(sName, 326, p5StudyY, { width: 213 });
-        const whyText = fitText(doc, s.why, 213, "Inter", 6.5, 2, 1.5);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(whyText, 326, p5StudyY + 9, { width: 213, lineGap: 1.5 });
-        const wh = doc.heightOfString(whyText, { width: 213, lineGap: 1.5 });
+        const whyText = fitText(doc, s.why, 218, "Inter", 6.5, 3, 1.5);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(whyText, 326, p5StudyY + 9, { width: 218, lineGap: 1.5 });
+        const wh = doc.heightOfString(whyText, { width: 218, lineGap: 1.5 });
         p5StudyY += Math.max(22, 9 + wh + 6);
       });
 
@@ -1574,6 +1598,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("By addressing the key risks, you can reach this score.", 430, 80, { width: 108, lineGap: 1.5 });
 
       // Priority Improvements
+      ensureSpace(doc, 180, "Your Action Plan");
       doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TOP 5 PRIORITY IMPROVEMENTS", 50, 125);
 
       const p6PriorityIcons = ["target", "dollar", "bar_chart", "user", "trending_up"];
@@ -1602,9 +1627,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         // Pattern A: description fits the card, and "Impact" sits AFTER it
         // (not pinned at a fixed Y where long copy would overlap it).
-        const pDesc = fitText(doc, p.desc, 78, "Inter", 6.8, 6, 2);
-        doc.font("Inter").fontSize(6.8).fillColor(COLORS.textLight).text(pDesc, cardFigmaX + 8, 216, { width: 78, lineGap: 2 });
-        const pDescH = doc.heightOfString(pDesc, { width: 78, lineGap: 2 });
+        const pDesc = fitText(doc, p.desc, 82, "Inter", 6.8, 8, 2);
+        doc.font("Inter").fontSize(6.8).fillColor(COLORS.textLight).text(pDesc, cardFigmaX + 8, 216, { width: 82, lineGap: 2 });
+        const pDescH = doc.heightOfString(pDesc, { width: 82, lineGap: 2 });
         const impactY = Math.min(274, 216 + pDescH + 6);
         doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("Impact: ", cardFigmaX + 8, impactY, { continued: true });
         doc.font("Inter-Bold").fillColor(p6ImpactColor).text(p.impact);
@@ -1612,23 +1637,22 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         cardFigmaX += 101;
       });
 
-      // Questions to Prepare — Fixed with gray cards and dark blue circles
+      // Questions to Prepare — with larger cards for full text
       doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("QUESTIONS TO PREPARE FOR", 50, 298);
 
       let fqY = 314;
       questionsToPrepare.slice(0, 6).forEach((q, qIdx) => {
-        // Gray background card
-        doc.roundedRect(50, fqY - 3, 200, 22, 4).fill(COLORS.cardBg);
+        // Taller card for longer questions
+        doc.roundedRect(50, fqY - 3, 200, 26, 4).fill(COLORS.cardBg);
 
         // Dark blue circle with white number
-        doc.circle(62, fqY + 7, 8).fill(COLORS.primaryDark);
-        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.white).text(String(qIdx + 1), 55, fqY + 4, { align: "center", width: 14 });
+        doc.circle(62, fqY + 8, 8).fill(COLORS.primaryDark);
+        doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.white).text(String(qIdx + 1), 55, fqY + 5, { align: "center", width: 14 });
 
-        // Question text — bounded to 2 lines so it never spills past its card
-        // into the next one (Pattern B).
-        const qText = fitText(doc, q, 168, "Inter", 7.5, 2, 1.5);
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(qText, 76, fqY + 1, { width: 168, lineGap: 1.5 });
-        fqY += 26;
+        // Question text — bounded to 3 lines for more space
+        const qText = fitText(doc, q, 190, "Inter", 7.5, 3, 1.5);
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(qText, 76, fqY + 1, { width: 190, lineGap: 1.5 });
+        fqY += 28;
       });
 
       // Suggested Answer Framework — dynamic from AI
@@ -1673,9 +1697,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         drillFigmaX += 125;
       });
 
-      // Track Your Progress — only one series is plotted (projected overall
-      // score), so the legend lists exactly that one series.
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, 600);
+      // Track Your Progress — add spacing and check for overflow
+      doc.y = 600;
+      ensureSpace(doc, 170, "Your Action Plan");
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, doc.y);
 
       doc.rect(50, 615, 14, 2).fill(COLORS.primaryDark);
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Projected Overall Score", 68, 612);
@@ -1700,7 +1725,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.emerald).text("Target Confidence");
 
       // Success Metrics — with proper vector icons
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", 300, 600);
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", 300, doc.y > 650 ? doc.y - 100 : 600);
 
       const successIcons = ["target", "arrow_up", "speech_bubble", "gauge", "trending_up"];
       const figmaMetrics = [

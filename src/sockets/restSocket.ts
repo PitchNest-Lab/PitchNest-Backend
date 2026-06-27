@@ -26,7 +26,7 @@ const MIN_EVAL_USER_CHARS = 150;
 const MIN_EVAL_DURATION_SEC = 60;
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
 // garbled and ask the founder to repeat instead of answering it.
-const LOW_STT_CONFIDENCE = 0.4;
+const LOW_STT_CONFIDENCE = 0.2;
 
 // ── Varied opening greetings ─────────────────────────────────────────────────
 // "Welcome to the Nest" (play on PitchNest). A fresh one is picked at random each
@@ -619,20 +619,15 @@ export function initRestSocket(wss: WebSocketServer) {
                   if (turnQueue[i].isNudge) turnQueue.splice(i, 1);
                 }
 
-                // Low-confidence recognitions are usually mis-transcriptions
-                // (background noise, clipped speech). Rather than have the panel
-                // confidently answer garbage like "Sorry, that wasn't a pitch",
-                // ask the founder to repeat — and do NOT record the garbled text
-                // in the transcript, so it can't pollute the evaluation.
+                // Low-confidence recognitions are logged but still sent to
+                // the AI — the model uses conversational context to interpret
+                // accented or unclear speech far better than discarding it.
+                // Only truly garbled noise (< 0.2) is skipped.
                 if (confidence < LOW_STT_CONFIDENCE) {
                   console.log(
-                    `[stt] low confidence (${confidence.toFixed(2)}), asking founder to repeat:`,
+                    `[stt] very low confidence (${confidence.toFixed(2)}), skipping likely noise:`,
                     text,
                   );
-                  enqueueTurn({
-                    text: "[SYSTEM: The founder's last words came through garbled / could not be heard clearly. In ONE short, friendly sentence, ask them to repeat what they just said. Do NOT answer, evaluate, or guess at the unclear input.]",
-                    inputMethod: "voice",
-                  });
                   return;
                 }
 
@@ -812,7 +807,7 @@ export function initRestSocket(wss: WebSocketServer) {
             .join(", ");
 
           enqueueTurn({
-            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name, state INVEST or PASS, and give ONE reason in 1-2 sentences. Keep it brief. Do not ask any more questions. Start now.]`,
+            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:"), state INVEST or PASS, and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Use phrases like "I'm in because…" or "I'm out because…". Avoid generic phrases — each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
             isVerdict: true,
             panelists: panelists,
           });
