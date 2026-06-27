@@ -192,6 +192,43 @@ function fitText(
   return result ? result + ELLIPSIS : (words[0] || "") + ELLIPSIS;
 }
 
+// ── Pattern B2: sentence-complete truncation (for prose "writeups") ───────────
+// Long-form paragraphs (executive summary, transcript summary, strategic
+// recommendation) must never end mid-sentence with a dangling "…for". This packs
+// as many WHOLE sentences as the reserved space allows and ends cleanly on a
+// period — no ellipsis. Only if not even the first sentence fits do we fall back
+// to fitText's word-boundary cut (which is still never mid-word).
+function fitTextBySentence(
+  doc: PDFDoc,
+  text: string,
+  width: number,
+  font: string,
+  fontSize: number,
+  maxLines: number,
+  lineGap = 0,
+): string {
+  const full = (text || "").trim();
+  if (!full) return "";
+  doc.font(font).fontSize(fontSize);
+  const lineH = doc.currentLineHeight();
+  const maxHeight = maxLines * lineH + Math.max(0, maxLines - 1) * lineGap + 0.5;
+  if (doc.heightOfString(full, { width, lineGap }) <= maxHeight) return full;
+
+  // Split on sentence terminators, keeping the punctuation (and any closing
+  // quote/bracket) attached to each sentence.
+  const sentences = full.match(/[^.!?]+[.!?]+["'”’)\]]*\s*|[^.!?]+$/g) || [full];
+  let result = "";
+  for (const s of sentences) {
+    const candidate = (result + s).replace(/\s+$/, "");
+    if (doc.heightOfString(candidate, { width, lineGap }) > maxHeight) break;
+    result += s;
+  }
+  result = result.trim();
+  if (result) return result;
+  // First sentence alone overflows — fall back to a clean word-boundary cut.
+  return fitText(doc, full, width, font, fontSize, maxLines, lineGap);
+}
+
 // ── Pattern A: dynamic row heights ───────────────────────────────────────────
 // Measure a row's height as the tallest cell, so wrapping text never overlaps
 // the next element. Shared by the page-3 matrix and page-4 competitor table so
@@ -897,9 +934,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.y += 6;
       const rawSummary = report.summary || "This pitch was too short to generate a full evaluation. Please complete a session speaking for at least 2 minutes to get full VC grading and analytics.";
       // Use the full height available before Category Breakdown (~10 lines). A
-      // normal 2-3 sentence summary fits fully; only abusively long input is
-      // word-boundary truncated (never mid-word) by fitText.
-      const summary = fitText(doc, rawSummary, 260, "Inter", 9, 10, 3.5);
+      // normal 2-3 sentence summary fits fully; a longer one is trimmed to whole
+      // sentences (never mid-sentence) so the writeup always reads complete.
+      const summary = fitTextBySentence(doc, rawSummary, 260, "Inter", 9, 10, 3.5);
       doc.font("Inter").fontSize(9).fillColor(COLORS.text).text(summary, 50, doc.y, { width: 260, lineGap: 3.5 });
 
       // Right Column Overall Score Card — improved contrast
@@ -995,29 +1032,33 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Actionable Next Steps
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("ACTIONABLE NEXT STEPS", 50, 320);
       let stepY = 340;
-      // Pattern A: row grows to fit a wrapping description (was fixed 52/60).
+      // Fixed-height rows so the three boxes always end above the "AI INSIGHTS"
+      // section (y=530): 340 + 3×(54+6) = 520. Title and description are each
+      // bounded to fit inside the row, so neither can overflow or overlap.
+      const stepRowH = 54;
       nextSteps.slice(0, 3).forEach((step, idx) => {
-        const descText = fitText(doc, step.desc || "", 155, "Inter", 7.5, 3, 0);
-        const descH = doc.heightOfString(descText, { width: 155 });
-        const rowH = Math.max(52, 24 + descH + 12);
-        doc.rect(50, stepY, 280, rowH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
-        doc.circle(70, stepY + rowH / 2, 12).fill(COLORS.primary);
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + rowH / 2 - 4, { align: "center", width: 6 });
+        doc.rect(50, stepY, 280, stepRowH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+        doc.circle(70, stepY + stepRowH / 2, 12).fill(COLORS.primary);
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + stepRowH / 2 - 4, { align: "center", width: 6 });
 
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(step.title, 92, stepY + 10, { width: 155 });
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 155 });
+        // Title: one line, leaving room for the priority pill on the same row.
+        const stepTitle = fitText(doc, step.title || "", 150, "Inter-Bold", 8.5, 1);
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(stepTitle, 92, stepY + 9, { width: 150 });
+        // Description: up to two lines BELOW the title/pill row, full card width.
+        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, 2, 1.5);
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 225, lineGap: 1.5 });
 
         // Priority tag — High Priority: red bg, white text
         const isHighPriority = (step.priority || "").toLowerCase().includes("high");
         if (isHighPriority) {
-          doc.roundedRect(255, stepY + 10, 65, 14, 6).fill(COLORS.rose);
-          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.white).text(step.priority || "High Priority", 255, stepY + 13, { align: "center", width: 65 });
+          doc.roundedRect(255, stepY + 8, 65, 14, 6).fill(COLORS.rose);
+          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.white).text(step.priority || "High Priority", 255, stepY + 11, { align: "center", width: 65 });
         } else {
-          doc.roundedRect(255, stepY + 10, 65, 14, 6).lineWidth(0.5).fillAndStroke(COLORS.amberBg, COLORS.amber);
-          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 13, { align: "center", width: 65 });
+          doc.roundedRect(255, stepY + 8, 65, 14, 6).lineWidth(0.5).fillAndStroke(COLORS.amberBg, COLORS.amber);
+          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 11, { align: "center", width: 65 });
         }
 
-        stepY += rowH + 8;
+        stepY += stepRowH + 6;
       });
 
       // Investment Gauge Card
@@ -1441,7 +1482,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // ── AI Summary (y=208–278) ─────────────────────────────────────────────
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("AI SUMMARY OF TRANSCRIPT", 50, 208);
       doc.roundedRect(50, 221, 495, 55, 6).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
-      const summaryTextP5 = fitText(doc, transcriptSummary, 475, "Inter", 7.5, 4, 2);
+      const summaryTextP5 = fitTextBySentence(doc, transcriptSummary, 475, "Inter", 7.5, 4, 2);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(summaryTextP5, 60, 228, { width: 475, lineGap: 2 });
 
       // ── 2-Column: Market Gap (left, x=50) | Companies to Study (right, x=295) ──
@@ -1490,7 +1531,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text("Based on competitive analysis and market opportunities", 65, 461);
       doc.roundedRect(65, 472, 40, 35, 6).fill(COLORS.indigoBg);
       drawIcon(doc, "trending_up", 72, 476, 26, COLORS.primary);
-      const recTextP5 = fitText(doc, strategicRecommendation, 230, "Inter", 7.5, 4, 2.5);
+      const recTextP5 = fitTextBySentence(doc, strategicRecommendation, 230, "Inter", 7.5, 4, 2.5);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(recTextP5, 115, 472, { width: 230, lineGap: 2.5 });
       doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primary).text("Key Focus Areas", 360, 450);
       let focusY5 = 464;
@@ -1583,8 +1624,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.circle(62, fqY + 7, 8).fill(COLORS.primaryDark);
         doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.white).text(String(qIdx + 1), 55, fqY + 4, { align: "center", width: 14 });
 
-        // Question text
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(q, 76, fqY + 1, { width: 168, lineGap: 1.5 });
+        // Question text — bounded to 2 lines so it never spills past its card
+        // into the next one (Pattern B).
+        const qText = fitText(doc, q, 168, "Inter", 7.5, 2, 1.5);
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(qText, 76, fqY + 1, { width: 168, lineGap: 1.5 });
         fqY += 26;
       });
 

@@ -620,6 +620,10 @@ COACHING EVALUATION RULES:
 - sentiments: Write 1 coaching observation from Riley's perspective as the coach — be encouraging but honest.
 - Keep summary to 2-3 sentences framed as a coach's overall assessment of the session.
 
+LENGTH BUDGETS (rendered in fixed-size report cards — stay within and always end on a complete sentence):
+- summary: ≤ 320 characters. each strengths / risks item: ≤ 140 characters.
+- next_steps: title ≤ 28 characters, desc ≤ 110 characters. sentiments quote: ≤ 140 characters.
+
 Return this exact JSON structure:
 {
   "summary": "2-3 sentence coach assessment of the overall session",
@@ -661,6 +665,14 @@ RULES:
 - confidence_timeline: 5 points fluctuating realistically (start, after first hard question, weakest moment, recovery, close).
 ${sharedRules}
 
+LENGTH BUDGETS (these fields are rendered in fixed-size report cards — stay within the limits and always end on a complete sentence; do NOT trail off):
+- summary: ≤ 320 characters (2-3 complete sentences).
+- transcript_summary: ≤ 360 characters.
+- each strengths / risks item: ≤ 140 characters.
+- each sentiments quote: ≤ 140 characters.
+- next_steps: title ≤ 28 characters, desc ≤ 110 characters.
+- category_matrix went_well / needs_improvement: ≤ 90 characters each.
+
 Return this exact JSON structure:
 {
   "summary": "2-3 sentence executive summary",
@@ -690,6 +702,14 @@ RULES:
 - competitive_landscape.strategic_recommendation: 2-3 sentences. key_focus_areas: 4 areas.
 ${sharedRules}
 
+LENGTH BUDGETS (rendered in fixed-size cards — stay within and end on a complete sentence):
+- each competitor strength / weakness: ≤ 90 characters.
+- each companies_to_study why: ≤ 100 characters.
+- each market_gaps title: ≤ 28 characters; desc: ≤ 100 characters.
+- each collaboration_opportunities item: ≤ 100 characters.
+- strategic_recommendation: ≤ 240 characters.
+- each key_focus_areas item: ≤ 38 characters.
+
 Return this exact JSON structure:
 {
   "competitors": [ { "name": "Real Competitor Name", "similarity": 85, "strength": "One key strength", "weakness": "One key weakness", "size": "Est. ~$10M–$50M ARR" } ],
@@ -713,6 +733,12 @@ RULES:
 - answer_framework: pick the single hardest/most-avoided question from this session; build a 5-step answer framework. question = exact text; steps = [{label, text}].
 - practice_drills: 4 drills with title, desc, reps, time.
 ${sharedRules}
+
+LENGTH BUDGETS (rendered in fixed-size cards — stay within and end on a complete sentence):
+- each questions_to_prepare item: ≤ 110 characters.
+- top_priorities: title ≤ 30 characters, desc ≤ 100 characters.
+- answer_framework steps: label ≤ 28 characters, text ≤ 130 characters.
+- practice_drills: title ≤ 30 characters, desc ≤ 90 characters.
 
 Return this exact JSON structure:
 {
