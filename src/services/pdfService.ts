@@ -1629,7 +1629,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         drawIcon(doc, p6PriorityIcons[pIdx] || "target", cardFigmaX + 60, 145, 18, COLORS.primary);
 
-        const pTitle = fitText(doc, p.title, 78, "Inter-Bold", 7.5, 2, 1.5);
+        const pTitle = fitText(doc, p.title, 78, "Inter-Bold", 7.5, 3, 1.5);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(pTitle, cardFigmaX + 8, 172, { width: 78, lineGap: 1.5 });
 
         if (p6IsHigh) {
@@ -1657,17 +1657,20 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       let fqY = 314;
       questionsToPrepare.slice(0, 6).forEach((q, qIdx) => {
-        // Taller card for longer questions
-        doc.roundedRect(50, fqY - 3, 200, 26, 4).fill(COLORS.cardBg);
+        const qText = fitText(doc, q, 190, "Inter", 7.5, 3, 1.5);
+        const qH = doc.heightOfString(qText, { width: 190, lineGap: 1.5 });
+        const boxH = Math.max(26, qH + 8);
+
+        // Gray background card dynamically sized
+        doc.roundedRect(50, fqY - 3, 200, boxH, 4).fill(COLORS.cardBg);
 
         // Dark blue circle with white number
         doc.circle(62, fqY + 8, 8).fill(COLORS.primaryDark);
         doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.white).text(String(qIdx + 1), 55, fqY + 5, { align: "center", width: 14 });
 
-        // Question text — bounded to 3 lines for more space
-        const qText = fitText(doc, q, 190, "Inter", 7.5, 3, 1.5);
+        // Question text
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(qText, 76, fqY + 1, { width: 190, lineGap: 1.5 });
-        fqY += 28;
+        fqY += boxH + 4;
       });
 
       // Suggested Answer Framework — dynamic from AI
@@ -1712,15 +1715,16 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         drillFigmaX += 125;
       });
 
-      // Track Your Progress — add spacing and check for overflow
+      // Track Your Progress & Success Metrics — vertically stacked
       doc.y = 600;
-      ensureSpace(doc, 170, "Your Action Plan");
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, doc.y);
+      ensureSpace(doc, 360, "Your Action Plan");
+      const page7StartY = doc.y;
 
-      doc.rect(50, 615, 14, 2).fill(COLORS.primaryDark);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Projected Overall Score", 68, 612);
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, page7StartY);
 
-      // Short x-labels so the last tick can't collide with the pills below.
+      doc.rect(50, page7StartY + 15, 14, 2).fill(COLORS.primaryDark);
+      doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Projected Overall Score", 68, page7StartY + 12);
+
       const chartPoints = [
         { xVal: "S1", yVal: 30 },
         { xVal: "S2", yVal: 42 },
@@ -1728,19 +1732,22 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { xVal: "S4", yVal: 66 },
         { xVal: "Target", yVal: 78 }
       ];
-      drawLineChart(doc, 72, 625, 213, 80, chartPoints, 100, COLORS.primaryDark, { yAxis: true });
+      // Chart starts a bit lower so y-axis is clear
+      drawLineChart(doc, 72, page7StartY + 25, 213, 80, chartPoints, 100, COLORS.primaryDark, { yAxis: true });
 
-      // Pills sit clear below the x-axis tick row (ticks at y+h+5 = 710)
-      doc.roundedRect(72, 730, 100, 14, 4).fill(COLORS.indigoBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", 78, 733, { continued: true });
+      // Pills sit clear below the x-axis tick row
+      const pillY = page7StartY + 130;
+      doc.roundedRect(72, pillY, 100, 14, 4).fill(COLORS.indigoBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", 78, pillY + 3, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.primary).text("Target Score");
 
-      doc.roundedRect(180, 730, 105, 14, 4).fill(COLORS.emeraldBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", 186, 733, { continued: true });
+      doc.roundedRect(180, pillY, 105, 14, 4).fill(COLORS.emeraldBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", 186, pillY + 3, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.emerald).text("Target Confidence");
 
-      // Success Metrics — with proper vector icons
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", 300, doc.y > 650 ? doc.y - 100 : 600);
+      // Success Metrics — vertically stacked below the chart
+      const successY = pillY + 30;
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", 50, successY);
 
       const successIcons = ["target", "arrow_up", "speech_bubble", "gauge", "trending_up"];
       const figmaMetrics = [
@@ -1751,26 +1758,28 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { label: "VC Investment Probability", sub: "Goal: 35%+", val: isInsufficient ? 0 : vcInvestmentProbability, color: COLORS.violet, display: isInsufficient ? "N/A" : `${vcInvestmentProbability}%` }
       ];
 
-      let metricFigmaY = 618;
+      let metricFigmaY = successY + 18;
       figmaMetrics.forEach((m, mIdx) => {
-        // Proper vector icon
-        doc.circle(310, metricFigmaY + 11, 10).fill(COLORS.indigoBg);
-        drawIcon(doc, successIcons[mIdx], 302, metricFigmaY + 3, 16, COLORS.primary);
+        // Shifted X coordinates to left-align (x=50)
+        doc.circle(60, metricFigmaY + 11, 10).fill(COLORS.indigoBg);
+        drawIcon(doc, successIcons[mIdx], 52, metricFigmaY + 3, 16, COLORS.primary);
 
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(m.label, 326, metricFigmaY);
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(m.color).text(m.display, 490, metricFigmaY, { align: "right", width: 55 });
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(m.sub, 326, metricFigmaY + 8);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(m.label, 76, metricFigmaY);
+        // Position value on the right edge of the bar (which is 219 wide + 76 start = 295)
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(m.color).text(m.display, 240, metricFigmaY, { align: "right", width: 55 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(m.sub, 76, metricFigmaY + 8);
 
-        doc.roundedRect(326, metricFigmaY + 17, 219, 5, 2.5).fill(COLORS.border);
+        doc.roundedRect(76, metricFigmaY + 17, 219, 5, 2.5).fill(COLORS.border);
         if (m.val > 0) {
-          doc.roundedRect(326, metricFigmaY + 17, (m.val / 100) * 219, 5, 2.5).fill(m.color);
+          doc.roundedRect(76, metricFigmaY + 17, (m.val / 100) * 219, 5, 2.5).fill(m.color);
         }
         metricFigmaY += 28;
       });
 
       // Bottom callout
-      doc.roundedRect(50, 752, 495, 20, 6).lineWidth(1).fillAndStroke(COLORS.indigoBg, COLORS.primary);
-      doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text("Next Step: ", 62, 757, { continued: true });
+      const nextStepY = metricFigmaY + 15;
+      doc.roundedRect(50, nextStepY, 495, 20, 6).lineWidth(1).fillAndStroke(COLORS.indigoBg, COLORS.primary);
+      doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text("Next Step: ", 62, nextStepY + 5, { continued: true });
       doc.font("Inter").fontSize(8).fillColor(COLORS.dark).text("Implement this plan, practice consistently, and re-pitch. Your next session could be your breakthrough!", { lineBreak: false });
 
       // ── Footer loops ───────────────────────────────────────────────────────
