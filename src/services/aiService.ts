@@ -41,6 +41,8 @@ export interface EvaluationReport {
     key_focus_areas: string[];
   };
   practice_drills?: Array<{ title: string; desc: string; reps: string; time: string }>;
+  // Personalized 30-second practice plan (exactly 3 steps, 10 sec each).
+  practice_plan?: Array<{ title: string; seconds: string; desc: string }>;
   // ── Phase 3: Business-specific market intelligence ───────────
   market_gaps?: Array<{ title: string; desc: string }>;
   collaboration_opportunities?: string[];
@@ -196,6 +198,28 @@ function validateEvaluationReport(raw: any): EvaluationReport {
         }))
     : [];
 
+  // Guard: the report renders 3-4 next steps, so a model that returns only 1-2
+  // (against instructions) would leave the page looking empty. Repair by topping
+  // up from a generic action pool until there are at least 3, skipping any whose
+  // title duplicates one the model already produced. (When next_steps is empty,
+  // the PDF uses its own richer fallback, so this only fires for 1-2 items.)
+  if (nextSteps.length > 0 && nextSteps.length < 3) {
+    const fallbacks = [
+      { title: "Validate With Real Users", desc: "Run a pilot and collect specific metrics that prove product-market fit.", priority: "High Priority" },
+      { title: "Sharpen Unit Economics", desc: "Define CAC, LTV, pricing, and payback with concrete, defensible numbers.", priority: "High Priority" },
+      { title: "Detail Go-to-Market", desc: "Outline acquisition channels, early conversion metrics, and a 12-month plan.", priority: "Medium Priority" },
+      { title: "Strengthen the Team Story", desc: "Show why this team wins and name the key hires you still need.", priority: "Medium Priority" },
+    ];
+    const seen = new Set(nextSteps.map((s: { title: string }) => s.title.toLowerCase()));
+    for (const fb of fallbacks) {
+      if (nextSteps.length >= 3) break;
+      if (!seen.has(fb.title.toLowerCase())) {
+        nextSteps.push(fb);
+        seen.add(fb.title.toLowerCase());
+      }
+    }
+  }
+
   const strengths = Array.isArray(raw?.strengths)
     ? raw.strengths.map((s: unknown) => String(s)).filter(Boolean)
     : [];
@@ -248,6 +272,20 @@ function validateEvaluationReport(raw: any): EvaluationReport {
           time: String(d.time || "5 min"),
         }))
     : undefined;
+
+  // Personalized 30-second plan: render only when the model returns a usable set
+  // of 3 steps; otherwise leave undefined so the PDF keeps its generic fallback.
+  const practicePlan = Array.isArray(raw?.practice_plan)
+    ? raw.practice_plan
+        .filter((p: any) => p && typeof p.title === "string")
+        .slice(0, 3)
+        .map((p: any) => ({
+          title: String(p.title),
+          seconds: String(p.seconds || "10 sec"),
+          desc: String(p.desc || ""),
+        }))
+    : undefined;
+  const validatedPracticePlan = practicePlan && practicePlan.length === 3 ? practicePlan : undefined;
 
   const marketGaps = Array.isArray(raw?.market_gaps)
     ? raw.market_gaps
@@ -375,6 +413,7 @@ function validateEvaluationReport(raw: any): EvaluationReport {
     questions_to_prepare: questionsToPrepare,
     competitive_landscape: competitiveLandscape,
     practice_drills: practiceDrills,
+    practice_plan: validatedPracticePlan,
     market_gaps: marketGaps,
     collaboration_opportunities: collaborationOpportunities,
     question_difficulty: questionDifficulty,
@@ -528,43 +567,49 @@ ${deckContext}
 ${buildArchetypeDirective(archetype)}
 ${toneBlock}
 
-PANEL VOICES:
-- Marcus: Moat, scalability, valuation, competitive threats. Can also probe technical trade-offs and feasibility.
-- Sarah: CAC, LTV, churn, market sizing, unit economics. Can also discuss market trends and growth trajectory.
-- Chen: Architecture, tech debt, build vs buy, engineering velocity. Can also consider business viability and go-to-market.
-
-SPEAKER RULES:
+SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
-- CRITICAL: ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their 1 question, STOP IMMEDIATELY.
-- Rotate naturally between Marcus, Sarah, and Chen across the session — do not let one person dominate.
-- Do not add any extra text or stage directions.
-- Marcus usually leads the opening, but if the founder specifically asks for someone else (like Sarah or Chen), that panelist should respond immediately.
-- When the founder asks a direct question, answer it before asking a new one.
+- ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their one question, STOP IMMEDIATELY.
+- Do not add any extra text or stage directions — only the words that panelist would actually say aloud.
+- When the founder asks a direct question, answer it before asking a new one. If the founder specifically asks for Sarah or Chen by name, that panelist responds immediately.
 
-VALIDATION & FACT-CHECKING RULES:
-- **Pitch Structure Validation**: If the founder merely introduces themselves and their business but fails to give a proper pitch (e.g. they don't cover problem, solution, market, or metrics), immediately point this out. Tell them that an introduction is not a pitch and ask them to actually pitch their business.
-- **Competitor Analysis**: Actively cross-reference the founder's claims against real-world companies. If they claim to have no competitors or claim a unique feature that already exists in products like Stripe, AWS, Shopify, etc., name-drop those real competitors and challenge them.
-- **Fact-Checking**: Use your internal knowledge to verify their market sizes, growth rates, and technical feasibility. If their numbers are wildly inaccurate or physically impossible, challenge them aggressively.
+PANEL CONVERSATION STYLE
 
-SESSION FLOW:
-1. OPENING: Marcus welcomes and invites the pitch. Keep it to 1-2 sentences.
-2. LISTENING: When the founder is presenting their pitch, DO NOT interrupt. Let them finish their thought before asking questions.
-3. STRUCTURED Q&A: After the founder speaks, follow these rules strictly:
-   a. ASK ONE QUESTION AT A TIME. Wait for the founder to respond before asking the next question.
-   b. FOLLOW UP on the same topic if their answer is weak, unclear, or incomplete. Say something like "That doesn't fully address my concern" or "Can you be more specific about the numbers?"
-   c. If the founder gives a WRONG or WEAK response, point it out directly. Example: "That CAC number doesn't add up with your stated LTV" or "You said no competitors, but Stripe already does this."
-   d. If the founder does NOT answer or stays silent, gently remind them: "We're still waiting on that answer — this is a critical point that investors will ask about."
-   e. Only move to a NEW topic after the current topic has been adequately addressed.
-4. TOPIC FLOW: Follow a logical investor evaluation order:
-   - First: Problem and solution (What are you building? Why does it matter?)
-   - Then: Market size and opportunity (TAM/SAM/SOM)
-   - Then: Business model and unit economics (How do you make money?)
-   - Then: Traction and metrics (What have you achieved so far?)
-   - Then: Team and competitive advantage (Why you? What's your moat?)
-   - Finally: Ask and use of funds (How much are you raising? What will you do with it?)
-   Do NOT jump randomly between unrelated topics. The conversation should feel like a natural, guided evaluation.
-5. SPEAKER COORDINATION: When rotating speakers, the new speaker should build on what was just discussed, not start a completely new topic. For example, if Marcus just asked about revenue, Sarah might follow up with "And what are your margins on that?"
-6. CONCLUSION: If the system explicitly states that time is up or the session is ending, immediately stop asking questions and conclude.
+You are three distinct investors having a real, flowing conversation with a founder. You are not running a script.
+
+Personalities (keep them distinct in voice and focus):
+- Marcus (Lead): blunt and direct. Owns market, competition, moat, and the overall "would I invest" call. Opens the session and delivers the closing direction.
+- Sarah (Partner): precise, numbers-first. Owns unit economics, financials, pricing, LTV/CAC, retention. Asks for specific figures.
+- Chen (Tech Investor): calm and technical. Owns product, architecture, build-vs-buy, data, and execution feasibility.
+
+How the conversation flows:
+- After the founder gives their opening (problem + solution), engage as a genuine discussion, not a fixed Q&A list.
+- All three of you participate across the session. Do NOT let one panelist carry it while the other two stay silent. Whoever's domain the founder just touched is the natural person to speak next.
+- React to each other and to the founder: "Building on Sarah's point about churn..." or "I'd push back on what Marcus said...".
+
+Turn discipline (strict):
+- ONE panelist speaks per turn, asking ONE thing.
+- Only ONE question may be open at a time. If a question is unanswered, the ONLY permitted next turn is a follow-up to that same question, or silence — never a new topic.
+- Follow-ups that drill deeper into the founder's LAST answer are encouraged and may come from any panelist whose domain it touches. A follow-up on the current thread is always allowed; opening a brand-new topic before the current one is answered is never allowed.
+
+Session arc (pacing):
+- A session runs roughly 6–10 questions total.
+- Early: explore breadth across problem, market, model, product, and team.
+- Middle: drill into the 1–2 biggest weaknesses you've found.
+- Late: Marcus moves toward closing direction and the verdict.
+- Do not grill endlessly and do not wrap before covering the core areas.
+
+No scripts, no repetition:
+- Do NOT pull from a fixed bank of stock questions. Every question must come from what the founder ACTUALLY just said — challenge their specific claim, number, assumption, or the gap they left.
+- Vary phrasing, depth, and angle. Pursue what is genuinely interesting or weak in THIS specific pitch.
+
+Interrupting (use sparingly):
+- Default to letting the founder finish their thought.
+- Only interject if the founder has spoken 30+ seconds without answering the question on the table, or states something clearly false or internally inconsistent. In that case the relevant panelist may briefly cut in ("Sorry, let me jump in —") and ask the pointed question.
+- Never interrupt a founder who is mid-answer and on track.
+
+Grounding:
+- Challenge the logic and internal consistency of their claims (does CAC reconcile with LTV, is the TAM actually derived, does the timeline hold) rather than asserting external facts you cannot verify.
 
 ACCENT & ADAPTABILITY RULES:
 - Be tolerant of various English accents, including Nigerian English and other regional variants. Do not ask the user to repeat unless the content is truly incomprehensible; use context and conversation history to interpret ambiguous statements.
@@ -628,13 +673,13 @@ COACHING EVALUATION RULES:
 - readiness = how prepared they are to face a real investor panel based on this session.
 - strengths: Specific things the founder did well — cite real moments from the transcript.
 - risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
-- next_steps: Concrete practice actions the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
+- next_steps: 3-4 concrete practice actions (NEVER fewer than 3) the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
 - sentiments: Write 1 coaching observation from Riley's perspective as the coach — be encouraging but honest.
 - Keep summary to 2-3 sentences framed as a coach's overall assessment of the session.
 
 LENGTH BUDGETS (rendered in fixed-size report cards — stay within and always end on a complete sentence):
 - summary: ≤ 320 characters. each strengths / risks item: ≤ 140 characters.
-- next_steps: title ≤ 28 characters, desc ≤ 110 characters. sentiments quote: ≤ 140 characters.
+- next_steps: 3-4 items (never fewer than 3); title ≤ 28 characters, desc ≤ 110 characters. sentiments quote: ≤ 140 characters.
 
 Return this exact JSON structure:
 {
@@ -642,7 +687,7 @@ Return this exact JSON structure:
   "scores": { "delivery": 75, "clarity": 80, "scalability": 65, "readiness": 70 },
   "strengths": ["specific strength 1 from the session", "specific strength 2", "specific strength 3"],
   "risks": ["specific gap or weakness 1", "gap 2", "gap 3"],
-  "next_steps": [ { "title": "Practice action title", "desc": "Short actionable coaching instruction", "priority": "High Priority" } ],
+  "next_steps": [ { "title": "First practice action", "desc": "Short actionable coaching instruction", "priority": "High Priority" }, { "title": "Second practice action", "desc": "Short actionable coaching instruction", "priority": "High Priority" }, { "title": "Third practice action", "desc": "Short actionable coaching instruction", "priority": "Medium Priority" } ],
   "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ]
 }`;
 
@@ -670,6 +715,7 @@ RULES:
 - readiness = overall investability for the stated funding stage.
 - ACCENT FAIRNESS: Focus on the substance and clarity of the pitch content. Do not penalize pronunciation, grammatical variations, or speech patterns due to non-native accents or regional English variants (e.g. Nigerian English, Indian English).
 - Keep summary to 2-3 sentences. Include one sentiment quote each for Marcus, Sarah, and Chen.
+- next_steps: provide 3-4 concrete action items, NEVER fewer than 3. Each must address a specific weakness or gap from THIS pitch (not generic advice).
 - topic_coverage: percentage 0-100 for each topic: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details.
 - transcript_summary: 3-5 sentence summary of what was discussed and what was missed.
 - question_difficulty: integer counts {easy, medium, hard} of the panel's questions.
@@ -683,7 +729,7 @@ LENGTH BUDGETS (these fields are rendered in fixed-size report cards — stay wi
 - transcript_summary: ≤ 360 characters.
 - each strengths / risks item: ≤ 140 characters.
 - each sentiments quote: ≤ 140 characters.
-- next_steps: title ≤ 28 characters, desc ≤ 110 characters.
+- next_steps: 3-4 items (never fewer than 3); title ≤ 28 characters, desc ≤ 110 characters.
 - category_matrix went_well / needs_improvement: ≤ 90 characters each.
 
 Return this exact JSON structure:
@@ -692,7 +738,7 @@ Return this exact JSON structure:
   "scores": { "delivery": 85, "clarity": 90, "scalability": 75, "readiness": 80 },
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
-  "next_steps": [ { "title": "Action title", "desc": "Short actionable description", "priority": "High Priority" } ],
+  "next_steps": [ { "title": "First action title", "desc": "Short actionable description", "priority": "High Priority" }, { "title": "Second action title", "desc": "Short actionable description", "priority": "High Priority" }, { "title": "Third action title", "desc": "Short actionable description", "priority": "Medium Priority" } ],
   "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ],
   "topic_coverage": [ { "topic": "Problem Definition", "percentage": 90 }, { "topic": "Solution Overview", "percentage": 80 }, { "topic": "Market Size", "percentage": 30 }, { "topic": "Business Model", "percentage": 20 }, { "topic": "Go-to-Market", "percentage": 10 }, { "topic": "Traction", "percentage": 0 }, { "topic": "Team", "percentage": 0 }, { "topic": "Financials", "percentage": 0 }, { "topic": "Technical Details", "percentage": 5 } ],
   "transcript_summary": "3-5 sentence summary of the session",
@@ -745,6 +791,7 @@ RULES:
 - top_priorities: exactly 5 priority improvements. Each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority"/"Medium Priority"), impact ("Very High"/"High"/"Medium").
 - answer_framework: pick the single hardest/most-avoided question from this session; build a 5-step answer framework. question = exact text; steps = [{label, text}].
 - practice_drills: 4 drills with title, desc, reps, time.
+- practice_plan: EXACTLY 3 steps for a 30-second pitch drill (10 seconds each), tailored to the weakest areas/categories THIS founder showed. Each: title (what to say), seconds (always "10 sec"), desc (one concrete instruction for this pitch). Order them as a natural 30-second pitch.
 ${sharedRules}
 
 LENGTH BUDGETS (rendered in fixed-size cards — stay within and end on a complete sentence):
@@ -752,13 +799,15 @@ LENGTH BUDGETS (rendered in fixed-size cards — stay within and end on a comple
 - top_priorities: title ≤ 30 characters, desc ≤ 100 characters.
 - answer_framework steps: label ≤ 28 characters, text ≤ 130 characters.
 - practice_drills: title ≤ 30 characters, desc ≤ 90 characters.
+- practice_plan: title ≤ 20 characters, desc ≤ 70 characters.
 
 Return this exact JSON structure:
 {
   "questions_to_prepare": ["Question 1", "Question 2", "Question 3", "Question 4", "Question 5", "Question 6"],
   "top_priorities": [ { "title": "Priority Title 3-5 words", "desc": "Specific actionable sentence citing this pitch", "priority": "High Priority", "impact": "Very High" } ],
   "answer_framework": { "question": "Hardest question from this session", "steps": [ { "label": "Step Name", "text": "How to answer this step" } ] },
-  "practice_drills": [ { "title": "Drill name", "desc": "What to practice", "reps": "3 Reps", "time": "5 min" } ]
+  "practice_drills": [ { "title": "Drill name", "desc": "What to practice", "reps": "3 Reps", "time": "5 min" } ],
+  "practice_plan": [ { "title": "Step tied to weak area", "seconds": "10 sec", "desc": "One concrete instruction for this pitch" }, { "title": "Step 2", "seconds": "10 sec", "desc": "One concrete instruction" }, { "title": "Step 3", "seconds": "10 sec", "desc": "One concrete instruction" } ]
 }`;
 
   // One JSON call with a single fast retry. Before regenerating, we try to
@@ -915,7 +964,9 @@ export async function* streamPanelResponse(
       {
         model: config.azureOpenAiDeployment || "gpt-4o",
         messages: messages,
-        temperature: 0.7,
+        // Higher temperature than scoring/eval calls: the live panel should vary
+        // its questions between sessions instead of sounding scripted.
+        temperature: 0.9,
         max_tokens: 320,
         stream: true,
       },

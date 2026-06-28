@@ -662,14 +662,14 @@ function drawGaugeChart(doc: PDFDoc, cx: number, cy: number, radius: number, per
   doc.font("Inter-Bold").fontSize(8).fillColor(color).text(label.toUpperCase(), cx - 60, cy - 5, { width: 120, align: "center" });
 }
 
-function drawHalfGaugeChart(doc: PDFDoc, cx: number, cy: number, radius: number, percentage: number, label: string, color: string, thickness: number = 10, textColor: string = COLORS.dark) {
+function drawHalfGaugeChart(doc: PDFDoc, cx: number, cy: number, radius: number, percentage: number, label: string, color: string, thickness: number = 10, textColor: string = COLORS.dark, valueFontSize: number = 20) {
   drawArc(doc, cx, cy, radius, 270, 90, COLORS.border, thickness);
   const activeEndAngle = 270 + (percentage / 100) * 180;
   if (percentage > 0) {
     drawArc(doc, cx, cy, radius, 270, activeEndAngle, color, thickness);
   }
-  
-  doc.font("Inter-Bold").fontSize(20).fillColor(textColor).text(`${percentage}%`, cx - 40, cy - 15, { width: 80, align: "center" });
+
+  doc.font("Inter-Bold").fontSize(valueFontSize).fillColor(textColor).text(`${percentage}%`, cx - 40, cy - valueFontSize + 5, { width: 80, align: "center" });
   if (label) {
     doc.font("Inter-Bold").fontSize(8).fillColor(color).text(label.toUpperCase(), cx - 60, cy + 5, { width: 120, align: "center" });
   }
@@ -1041,28 +1041,37 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         rY += Math.max(40, doc.heightOfString(rText, { width: 200, lineGap: 2.5 }) + 12);
       });
 
-      // Actionable Next Steps
+      // Actionable Next Steps — the model now returns 3-4 items. Cards share the
+      // band between the header and the AI INSIGHTS row equally, so every card
+      // fits cleanly (no card is cut off, none overlaps the section below).
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("ACTIONABLE NEXT STEPS", 50, 320);
-      let stepY = 340;
-      const stepsToShow = nextSteps.slice(0, 5);
+      const stepsToShow = nextSteps.slice(0, 4);
+      const nsTop = 340;
+      const nsBottom = 524;          // AI INSIGHTS header sits at y=530
+      const nsGap = 6;
+      const nsCount = Math.max(stepsToShow.length, 1);
+      const nsCardH = Math.max(
+        40,
+        Math.floor((nsBottom - nsTop - (nsCount - 1) * nsGap) / nsCount),
+      );
+      let stepY = nsTop;
       for (let idx = 0; idx < stepsToShow.length; idx++) {
         const step = stepsToShow[idx];
-        // Dynamic row height: measure description to determine card size
-        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, 3, 1.5);
-        const descH = doc.heightOfString(descText, { width: 225, lineGap: 1.5 });
-        const stepRowH = Math.max(48, 24 + descH + 8);
 
-        // Stop drawing if we'd overflow into the AI INSIGHTS section
-        if (stepY + stepRowH > 520) break;
-
-        doc.rect(50, stepY, 280, stepRowH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
-        doc.circle(70, stepY + stepRowH / 2, 12).fill(COLORS.primary);
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + stepRowH / 2 - 4, { align: "center", width: 6 });
+        doc.rect(50, stepY, 280, nsCardH).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
+        doc.circle(70, stepY + nsCardH / 2, 12).fill(COLORS.primary);
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.white).text(`${idx + 1}`, 67, stepY + nsCardH / 2 - 4, { align: "center", width: 6 });
 
         // Title: one line, leaving room for the priority pill on the same row.
         const stepTitle = fitText(doc, step.title || "", 150, "Inter-Bold", 8.5, 1);
         doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(stepTitle, 92, stepY + 9, { width: 150 });
-        // Description: up to three lines BELOW the title/pill row, full card width.
+
+        // Description: as many lines as fit below the title/pill row inside this
+        // card's height (more room for 3 cards, less for 4) — never overruns.
+        doc.font("Inter").fontSize(7.5);
+        const nsDescLineH = doc.currentLineHeight() + 1.5;
+        const nsDescLines = Math.max(1, Math.min(3, Math.floor((nsCardH - 24 - 4) / nsDescLineH)));
+        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, nsDescLines, 1.5);
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 225, lineGap: 1.5 });
 
         // Priority tag — High Priority: red bg, white text
@@ -1075,7 +1084,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
           doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 11, { align: "center", width: 65 });
         }
 
-        stepY += stepRowH + 6;
+        stepY += nsCardH + nsGap;
       }
 
       // Investment Gauge Card
@@ -1139,27 +1148,49 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         cardX += 84;
       });
 
-      // 30-Second practice plan
+      // 30-Second practice plan — personalized from the model when available
+      // (3 steps tied to this pitch's weakest areas). When it isn't, we fall back
+      // to a generic plan AND drop "Personalized" from the heading so the label
+      // is never a false claim. Each column grows its description to fill the gap
+      // above the time pill, so longer personalized copy never overlaps.
+      const hasRealPlan = Array.isArray(report.practice_plan) && report.practice_plan.length === 3;
+      const planSteps: { title: string; time: string; desc: string }[] = hasRealPlan
+        ? report.practice_plan.map((p: any) => ({ title: String(p.title || ""), time: String(p.seconds || "10 sec"), desc: String(p.desc || "") }))
+        : [
+            { title: "Define the Problem", time: "10 sec", desc: "State the problem in one clear sentence." },
+            { title: "Present Your Solution", time: "10 sec", desc: "Explain how your startup solves it." },
+            { title: "Market & Vision", time: "10 sec", desc: "Share market size and your ultimate vision." },
+          ];
+
       doc.rect(50, 640, 495, 120).lineWidth(1).fillAndStroke(COLORS.indigoBg, "#c7d2fe");
-      doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.primary).text("YOUR PERSONALIZED 30-SECOND PRACTICE PLAN", 65, 652);
+      doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.primary).text(
+        hasRealPlan ? "YOUR PERSONALIZED 30-SECOND PRACTICE PLAN" : "30-SECOND PRACTICE PLAN",
+        65, 652,
+      );
 
       doc.circle(95, 705, 30).fill(COLORS.white);
       doc.font("Inter-Bold").fontSize(18).fillColor(COLORS.primary).text("30", 65, 692, { align: "center", width: 60 });
       doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.primary).text("SEC", 65, 712, { align: "center", width: 60 });
 
-      const steps30 = [
-        { title: "1. Define the Problem", time: "10 sec", desc: "State the problem in one clear sentence." },
-        { title: "2. Present Your Solution", time: "10 sec", desc: "Explain how your startup solves it." },
-        { title: "3. Market & Vision", time: "10 sec", desc: "Share market size and your ultimate vision." }
-      ];
+      let planX = 145;
+      planSteps.forEach((s, i) => {
+        // Title: numbered, up to 2 lines so a longer personalized title wraps
+        // instead of colliding with the next column or the description.
+        const planTitle = fitText(doc, `${i + 1}. ${s.title}`, 125, "Inter-Bold", 8.5, 2, 1);
+        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(planTitle, planX, 665, { width: 125, lineGap: 1 });
+        const planTitleH = doc.heightOfString(planTitle, { width: 125, lineGap: 1 });
 
-      let stepX = 145;
-      steps30.forEach((s) => {
-        doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.dark).text(s.title, stepX, 665);
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(s.desc, stepX, 678, { width: 110 });
-        doc.roundedRect(stepX, 710, 45, 12, 6).fill(COLORS.border);
-        doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.textLight).text(s.time, stepX, 713, { align: "center", width: 45 });
-        stepX += 135;
+        // Description fills the space between the title and the pill row (y=712).
+        const planDescY = 665 + planTitleH + 3;
+        doc.font("Inter").fontSize(7.5);
+        const planDescLineH = doc.currentLineHeight() + 1.5;
+        const planDescLines = Math.max(1, Math.min(3, Math.floor((710 - planDescY) / planDescLineH)));
+        const planDesc = fitText(doc, s.desc, 125, "Inter", 7.5, planDescLines, 1.5);
+        doc.font("Inter").fontSize(7.5).fillColor(COLORS.text).text(planDesc, planX, planDescY, { width: 125, lineGap: 1.5 });
+
+        doc.roundedRect(planX, 712, 45, 12, 6).fill(COLORS.border);
+        doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.textLight).text(s.time, planX, 715, { align: "center", width: 45 });
+        planX += 135;
       });
 
       // =======================================================================
@@ -1295,13 +1326,25 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       
       doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.primaryDark).text("BENCHMARKING AGAINST OTHER FOUNDERS", 65, ty + 15);
       
-      // Gauge on left
-      const benchGaugeY = ty + 95;
-      drawHalfGaugeChart(doc, 125, benchGaugeY, 45, isInsufficient ? 0 : founderPercentile, "", COLORS.primary, 8, COLORS.dark);
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("You scored higher than", 80, benchGaugeY - 28, { width: 90, align: "center" });
-      doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("of early-stage founders\non PitchNest", 80, benchGaugeY + 8, { width: 90, align: "center" });
-      doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.dark).text("0%", 70, benchGaugeY + 2);
-      doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.dark).text("100%", 165, benchGaugeY + 2);
+      // Gauge on its own WHITE card (matching the "Percentile Rank" card on the
+      // right) so it reads as a distinct stat block instead of floating on the
+      // grey panel. Text is placed clear of the arc: the caption sits above the
+      // arc top, the percentage inside the opening, and the sub-caption below the
+      // diameter line (the arc is only the upper half, so nothing collides).
+      const benchCardX = 62;
+      const benchCardW = 140;
+      const benchCardY = ty + 28;
+      const benchCardH = 100;
+      doc.roundedRect(benchCardX, benchCardY, benchCardW, benchCardH, 6).lineWidth(0.5).fillAndStroke(COLORS.white, COLORS.border);
+
+      const benchCx = benchCardX + benchCardW / 2;   // 132
+      const benchR = 42;
+      const benchGaugeY = benchCardY + 67;            // diameter line of the half-gauge
+      doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text("You scored higher than", benchCardX + 4, benchCardY + 8, { width: benchCardW - 8, align: "center" });
+      drawHalfGaugeChart(doc, benchCx, benchGaugeY, benchR, isInsufficient ? 0 : founderPercentile, "", COLORS.primary, 8, COLORS.dark, 17);
+      doc.font("Inter-Bold").fontSize(6).fillColor(COLORS.textLight).text("0%", benchCx - benchR - 16, benchGaugeY - 3, { width: 14, align: "right" });
+      doc.font("Inter-Bold").fontSize(6).fillColor(COLORS.textLight).text("100%", benchCx + benchR + 2, benchGaugeY - 3);
+      doc.font("Inter").fontSize(6).fillColor(COLORS.dark).text("of early-stage founders\non PitchNest", benchCardX + 4, benchGaugeY + 8, { width: benchCardW - 8, align: "center" });
 
       // Vertical Divider
       doc.moveTo(210, ty + 40).lineTo(210, ty + 125).strokeColor(COLORS.border).lineWidth(0.5).stroke();
@@ -1350,12 +1393,13 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const p4CompHeaders = ["Company", "Similarity", "Strengths", "Weaknesses", "Est. Size"];
       let p4fty = 106;
 
-      // Pattern A + B: cap each prose cell at 3 lines, then pre-measure each row
-      // (tallest of strength/weakness) so both the box and the rows grow with
-      // wrapping text but can never overflow the page.
+      // Pattern A + B: cap each prose cell at 4 lines (word-boundary), then
+      // pre-measure each row (tallest of strength/weakness) so both the box and
+      // the rows grow with wrapping text — a longer strength/weakness now fits
+      // instead of being cut mid-sentence — but can never overflow the page.
       const p4Cells = competitorList.map((c: any) => ({
-        strength: fitText(doc, c.strength, 104, "Inter", 6.5, 3, 1.5),
-        weakness: fitText(doc, c.weakness, 104, "Inter", 6.5, 3, 1.5),
+        strength: fitText(doc, c.strength, 104, "Inter", 6.5, 4, 1.5),
+        weakness: fitText(doc, c.weakness, 104, "Inter", 6.5, 4, 1.5),
       }));
       const p4RowHeights = p4Cells.map((c) =>
         measureRowHeight(
@@ -1410,7 +1454,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Key takeaway strip
       const p4KtY = p4RowY + 2;
       doc.roundedRect(56, p4KtY, 483, 22, 5).lineWidth(0.5).fillAndStroke("#eff6ff", "#bfdbfe");
-      const p4KtText = fitText(doc, strategicRecommendation, 380, "Inter", 7, 1);
+      // Sentence-complete so the one-line takeaway ends cleanly (no "…entrench")
+      // — the full recommendation appears on page 5.
+      const p4KtText = fitTextBySentence(doc, strategicRecommendation, 380, "Inter", 7, 1);
       doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.primary).text("Key Takeaway: ", 72, p4KtY + 6, { continued: true });
       doc.font("Inter").fontSize(7).fillColor(COLORS.dark).text(p4KtText, { width: 435, lineBreak: false });
 
@@ -1424,26 +1470,46 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { label: "OPPORTUNITIES", color: COLORS.primary, bg: COLORS.indigoBg, border: "#bfdbfe", items: swotData.opportunities },
         { label: "THREATS", color: COLORS.amber, bg: COLORS.amberBg, border: COLORS.amberBorder, items: swotData.threats }
       ];
-      const p4SwotQH = 100;
-      p4SwotItems.forEach((s, idx) => {
+      // Pattern A+B: pre-fit each bullet (up to 4 lines, word-boundary) and grow
+      // every quadrant box to its measured content, so no SWOT item is cut off
+      // mid-sentence. The two boxes in a row share the taller height; the second
+      // row and the positioning map start after the measured bottom.
+      const p4SwotFitW = 211;
+      const p4SwotQuads = p4SwotItems.map((s) => {
+        const fitItems = (s.items || []).slice(0, 4).map((item: string) => fitText(doc, item, p4SwotFitW, "Inter", 6.5, 4, 1.5));
+        let contentH = 0;
+        fitItems.forEach((it: string) => {
+          contentH += Math.max(14, doc.heightOfString(it, { width: p4SwotFitW, lineGap: 1.5 }) + 4);
+        });
+        return { ...s, fitItems, boxH: contentH + 30 };   // 22px header offset + 8px bottom pad
+      });
+      const p4SwotGridTop = p4SwotTopY + 14;
+      const p4SwotRow1H = Math.max(p4SwotQuads[0].boxH, p4SwotQuads[1].boxH);
+      const p4SwotRow2H = Math.max(p4SwotQuads[2].boxH, p4SwotQuads[3].boxH);
+      p4SwotQuads.forEach((s, idx) => {
         const p4sx = idx % 2 === 0 ? 50 : 300;
-        const p4sy = p4SwotTopY + 14 + (idx < 2 ? 0 : p4SwotQH + 8);
-        doc.roundedRect(p4sx, p4sy, 245, p4SwotQH, 6).lineWidth(0.75).fillAndStroke(s.bg, s.border);
+        const p4sy = idx < 2 ? p4SwotGridTop : p4SwotGridTop + p4SwotRow1H + 8;
+        const boxH = idx < 2 ? p4SwotRow1H : p4SwotRow2H;
+        doc.roundedRect(p4sx, p4sy, 245, boxH, 6).lineWidth(0.75).fillAndStroke(s.bg, s.border);
         doc.font("Inter-Bold").fontSize(8).fillColor(s.color).text(s.label, p4sx + 10, p4sy + 8);
         let p4ItemY = p4sy + 22;
-        // Pattern A: advance by each item's measured height (max 2 lines) so a
-        // wrapping bullet never overlaps the next.
-        s.items.slice(0, 4).forEach((item: string) => {
-          const itemText = fitText(doc, item, 211, "Inter", 6.5, 2, 1.5);
+        s.fitItems.forEach((itemText: string) => {
           doc.circle(p4sx + 14, p4ItemY + 3.5, 2.5).fill(s.color);
-          doc.font("Inter").fontSize(6.5).fillColor(COLORS.text).text(itemText, p4sx + 22, p4ItemY, { width: 211, lineGap: 1.5 });
-          const ih = doc.heightOfString(itemText, { width: 211, lineGap: 1.5 });
+          doc.font("Inter").fontSize(6.5).fillColor(COLORS.text).text(itemText, p4sx + 22, p4ItemY, { width: p4SwotFitW, lineGap: 1.5 });
+          const ih = doc.heightOfString(itemText, { width: p4SwotFitW, lineGap: 1.5 });
           p4ItemY += Math.max(14, ih + 4);
         });
       });
 
-      // ── Market Positioning Map — below SWOT ──────────────────────────────
-      const p4MapY = p4SwotTopY + 14 + p4SwotQH * 2 + 8 + 16;
+      // ── Market Positioning Map — below SWOT (after the measured bottom) ───
+      let p4MapY = p4SwotGridTop + p4SwotRow1H + 8 + p4SwotRow2H + 16;
+      // If competitors/SWOT grew tall, push the map to a fresh page rather than
+      // letting it run off the bottom edge.
+      if (p4MapY + 162 > doc.page.height - 60) {
+        doc.addPage();
+        drawHeader(doc, "Competitive Landscape");
+        p4MapY = 70;
+      }
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("MARKET POSITIONING MAP", 50, p4MapY);
       doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text("Relative competitive positioning in the market", 50, p4MapY + 12);
       doc.roundedRect(50, p4MapY + 24, 495, 128, 8).strokeColor(COLORS.border).lineWidth(1).stroke();
@@ -1629,7 +1695,8 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         drawIcon(doc, p6PriorityIcons[pIdx] || "target", cardFigmaX + 60, 145, 18, COLORS.primary);
 
-        const pTitle = fitText(doc, p.title, 78, "Inter-Bold", 7.5, 3, 1.5);
+        // Cap at 2 lines so the title can't run into the priority pill at y=198.
+        const pTitle = fitText(doc, p.title, 78, "Inter-Bold", 7.5, 2, 1.5);
         doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(pTitle, cardFigmaX + 8, 172, { width: 78, lineGap: 1.5 });
 
         if (p6IsHigh) {
@@ -1652,10 +1719,17 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         cardFigmaX += 101;
       });
 
-      // Questions to Prepare — with larger cards for full text
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("QUESTIONS TO PREPARE FOR", 50, 298);
+      // Questions to Prepare (left) + Suggested Answer Framework (right). Both
+      // columns start below the fixed priority-card grid and advance by measured
+      // content; Practice Drills then starts after whichever column is taller, so
+      // no section is pinned to a fixed Y where it could overlap the block above.
+      const p6PriorityBottom = 140 + 148;          // priority cards: fixed grid
+      const qaHeaderY = p6PriorityBottom + 14;      // 302
+      const qaBodyTop = qaHeaderY + 16;             // 318
 
-      let fqY = 314;
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("QUESTIONS TO PREPARE FOR", 50, qaHeaderY);
+
+      let fqY = qaBodyTop;
       questionsToPrepare.slice(0, 6).forEach((q, qIdx) => {
         const qText = fitText(doc, q, 190, "Inter", 7.5, 3, 1.5);
         const qH = doc.heightOfString(qText, { width: 190, lineGap: 1.5 });
@@ -1672,57 +1746,87 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text(qText, 76, fqY + 1, { width: 190, lineGap: 1.5 });
         fqY += boxH + 4;
       });
+      const questionsBottom = fqY;
 
-      // Suggested Answer Framework — dynamic from AI
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUGGESTED ANSWER FRAMEWORK", 268, 298);
-      doc.roundedRect(268, 312, 277, 158, 4).fill(COLORS.indigoBg);
+      // Suggested Answer Framework — the box grows to fit the question + measured
+      // steps instead of clipping at a fixed 158px height.
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUGGESTED ANSWER FRAMEWORK", 268, qaHeaderY);
       const fwQuestion = fitText(doc, frameworkData.question, 250, "Inter-Bold", 6.5, 2);
-      doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text(`For: ${fwQuestion}`, 276, 318, { width: 265 });
+      const fwBoxTop = qaBodyTop - 6;               // 312
+      const fwQuestionY = fwBoxTop + 6;
+      doc.font("Inter-Bold").fontSize(6.5);
+      const fwQuestionH = doc.heightOfString(`For: ${fwQuestion}`, { width: 265 });
 
       const p6FwIcons = ["target", "calculator", "trending_up", "shield", "checkmark"];
-      let frameY = 334;
-      frameworkData.steps.slice(0, 5).forEach((f: { label: string; text: string }, fIdx: number) => {
+      // Pre-measure each step so the surrounding box can size to the content.
+      const fwStepLayout = frameworkData.steps.slice(0, 5).map((f: { label: string; text: string }) => {
+        const text = fitText(doc, f.text, 242, "Inter", 6.5, 3, 1.5);
+        const h = doc.heightOfString(text, { width: 242, lineGap: 1.5 });
+        return { label: f.label, text, stepH: Math.max(24, 9 + h + 6) };
+      });
+      const fwBodyTop = fwQuestionY + fwQuestionH + 8;
+      const fwBodyH = fwStepLayout.reduce((a: number, s: { stepH: number }) => a + s.stepH, 0);
+      const fwBoxH = (fwBodyTop - fwBoxTop) + fwBodyH + 6;
+      doc.roundedRect(268, fwBoxTop, 277, fwBoxH, 4).fill(COLORS.indigoBg);
+      doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.primary).text(`For: ${fwQuestion}`, 276, fwQuestionY, { width: 265 });
+
+      let frameY = fwBodyTop;
+      fwStepLayout.forEach((f: { label: string; text: string; stepH: number }, fIdx: number) => {
         drawIcon(doc, p6FwIcons[fIdx] || "target", 276, frameY, 14, COLORS.primary);
         doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.primary).text(f.label, 294, frameY);
         doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(f.text, 294, frameY + 9, { width: 242, lineGap: 1.5 });
-        frameY += 28;
+        frameY += f.stepH;
       });
+      const frameworkBottom = fwBoxTop + fwBoxH;
 
-      // Practice Drills — with vector icons
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("PRACTICE DRILLS FOR NEXT SESSION", 50, 480);
+      // Practice Drills — starts after BOTH columns above it (measured), so the
+      // header can never overlap the questions list or the framework box.
+      const drillsHeaderY = Math.max(questionsBottom, frameworkBottom) + 16;
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("PRACTICE DRILLS FOR NEXT SESSION", 50, drillsHeaderY);
 
       const drillIcons = ["microphone", "network", "dollar", "user"];
       const drillColors = [COLORS.primaryDark, COLORS.primary, COLORS.emerald, COLORS.amber];
+      const drillCardY = drillsHeaderY + 16;
+      const drillCardH = 105;
 
       let drillFigmaX = 50;
       practiceDrills.slice(0, 4).forEach((d, dIdx) => {
-        doc.roundedRect(drillFigmaX, 496, 119, 105, 6).strokeColor(COLORS.border).lineWidth(1).stroke();
+        doc.roundedRect(drillFigmaX, drillCardY, 119, drillCardH, 6).strokeColor(COLORS.border).lineWidth(1).stroke();
 
-        doc.circle(drillFigmaX + 16, 511, 10).fill(drillColors[dIdx] || COLORS.primary);
-        drawIcon(doc, drillIcons[dIdx] || "target", drillFigmaX + 8, 503, 16, COLORS.white);
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.textLight).text("Drill", drillFigmaX + 32, 507);
+        doc.circle(drillFigmaX + 16, drillCardY + 15, 10).fill(drillColors[dIdx] || COLORS.primary);
+        drawIcon(doc, drillIcons[dIdx] || "target", drillFigmaX + 8, drillCardY + 7, 16, COLORS.white);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.textLight).text("Drill", drillFigmaX + 32, drillCardY + 11);
 
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(d.title, drillFigmaX + 8, 526, { width: 103, lineGap: 1.5 });
+        // Title capped at 2 lines so it can't run into the description below it.
+        const drillTitle = fitText(doc, d.title || "", 103, "Inter-Bold", 7.5, 2, 1.5);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(drillTitle, drillFigmaX + 8, drillCardY + 30, { width: 103, lineGap: 1.5 });
 
         const drillDesc = fitText(doc, d.desc || "", 103, "Inter", 6.5, 4, 2);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(drillDesc, drillFigmaX + 8, 544, { width: 103, lineGap: 2 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(drillDesc, drillFigmaX + 8, drillCardY + 48, { width: 103, lineGap: 2 });
 
-        doc.moveTo(drillFigmaX + 8, 584).lineTo(drillFigmaX + 111, 584).strokeColor(COLORS.border).lineWidth(0.5).stroke();
+        doc.moveTo(drillFigmaX + 8, drillCardY + 88).lineTo(drillFigmaX + 111, drillCardY + 88).strokeColor(COLORS.border).lineWidth(0.5).stroke();
 
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(d.reps || "", drillFigmaX + 8, 588);
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(d.time || "", drillFigmaX + 80, 588, { align: "right", width: 31 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(d.reps || "", drillFigmaX + 8, drillCardY + 92);
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(d.time || "", drillFigmaX + 80, drillCardY + 92, { align: "right", width: 31 });
 
         drillFigmaX += 125;
       });
+      const drillsBottom = drillCardY + drillCardH;
 
-      // Track Your Progress & Success Metrics — vertically stacked
-      doc.y = 600;
-      ensureSpace(doc, 360, "Your Action Plan");
+      // Track Your Progress & Success Metrics — its own page (page 7). Advance the
+      // cursor from the measured bottom of the drills, then break to a fresh page.
+      doc.y = drillsBottom + 12;
+      ensureSpace(doc, 380, "Your Action Plan");
       const page7StartY = doc.y;
 
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", 50, page7StartY);
+      // Page 7 fills the full page width with a tall progress chart and full-width
+      // metric bars, instead of being squeezed into the top-left corner.
+      const p7Left = 50;
+      const p7Right = 545;          // content right edge (page width 595 − 50 margin)
 
-      doc.rect(50, page7StartY + 15, 14, 2).fill(COLORS.primaryDark);
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("TRACK YOUR PROGRESS", p7Left, page7StartY);
+
+      doc.rect(p7Left, page7StartY + 15, 14, 2).fill(COLORS.primaryDark);
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text("Projected Overall Score", 68, page7StartY + 12);
 
       const chartPoints = [
@@ -1732,22 +1836,33 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { xVal: "S4", yVal: 66 },
         { xVal: "Target", yVal: 78 }
       ];
-      // Chart starts a bit lower so y-axis is clear
-      drawLineChart(doc, 72, page7StartY + 25, 213, 80, chartPoints, 100, COLORS.primaryDark, { yAxis: true });
+      // Full-width, tall chart. x=72 leaves room for the y-axis labels (drawn at
+      // x−20); width runs to the right content edge.
+      const p7ChartX = 72;
+      const p7ChartY = page7StartY + 28;
+      // Leave ~20px on the right so the last x-axis label ("Target", centred on
+      // the rightmost point) stays inside the content margin. x=72 balances the
+      // y-axis labels on the left, keeping the chart visually centred.
+      const p7ChartW = p7Right - p7ChartX - 20;   // ~453
+      const p7ChartH = 210;
+      drawLineChart(doc, p7ChartX, p7ChartY, p7ChartW, p7ChartH, chartPoints, 100, COLORS.primaryDark, { yAxis: true });
 
-      // Pills sit clear below the x-axis tick row
-      const pillY = page7StartY + 130;
-      doc.roundedRect(72, pillY, 100, 14, 4).fill(COLORS.indigoBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", 78, pillY + 3, { continued: true });
+      // Pills centered below the x-axis tick row.
+      const pillY = p7ChartY + p7ChartH + 24;
+      const pill1W = 100, pill2W = 105, pillGap = 12;
+      const pill1X = (p7Left + p7Right) / 2 - (pill1W + pill2W + pillGap) / 2;
+      const pill2X = pill1X + pill1W + pillGap;
+      doc.roundedRect(pill1X, pillY, pill1W, 14, 4).fill(COLORS.indigoBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.primaryDark).text("78 ", pill1X + 6, pillY + 3, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.primary).text("Target Score");
 
-      doc.roundedRect(180, pillY, 105, 14, 4).fill(COLORS.emeraldBg);
-      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", 186, pillY + 3, { continued: true });
+      doc.roundedRect(pill2X, pillY, pill2W, 14, 4).fill(COLORS.emeraldBg);
+      doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.emerald).text("70% ", pill2X + 6, pillY + 3, { continued: true });
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.emerald).text("Target Confidence");
 
-      // Success Metrics — vertically stacked below the chart
-      const successY = pillY + 30;
-      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", 50, successY);
+      // Success Metrics — full-width bars, generously spaced.
+      const successY = pillY + 38;
+      doc.font("Inter-Bold").fontSize(9.5).fillColor(COLORS.primaryDark).text("SUCCESS METRICS", p7Left, successY);
 
       const successIcons = ["target", "arrow_up", "speech_bubble", "gauge", "trending_up"];
       const figmaMetrics = [
@@ -1758,26 +1873,27 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         { label: "VC Investment Probability", sub: "Goal: 35%+", val: isInsufficient ? 0 : vcInvestmentProbability, color: COLORS.violet, display: isInsufficient ? "N/A" : `${vcInvestmentProbability}%` }
       ];
 
-      let metricFigmaY = successY + 18;
+      const p7BarX = 76;
+      const p7BarW = p7Right - p7BarX;   // full width to the right edge (~462)
+      let metricFigmaY = successY + 20;
       figmaMetrics.forEach((m, mIdx) => {
-        // Shifted X coordinates to left-align (x=50)
         doc.circle(60, metricFigmaY + 11, 10).fill(COLORS.indigoBg);
         drawIcon(doc, successIcons[mIdx], 52, metricFigmaY + 3, 16, COLORS.primary);
 
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(m.label, 76, metricFigmaY);
-        // Position value on the right edge of the bar (which is 219 wide + 76 start = 295)
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(m.color).text(m.display, 240, metricFigmaY, { align: "right", width: 55 });
-        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(m.sub, 76, metricFigmaY + 8);
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.dark).text(m.label, p7BarX, metricFigmaY);
+        // Value sits at the right end of the full-width bar.
+        doc.font("Inter-Bold").fontSize(7.5).fillColor(m.color).text(m.display, p7Right - 60, metricFigmaY, { align: "right", width: 60 });
+        doc.font("Inter").fontSize(6.5).fillColor(COLORS.textLight).text(m.sub, p7BarX, metricFigmaY + 8);
 
-        doc.roundedRect(76, metricFigmaY + 17, 219, 5, 2.5).fill(COLORS.border);
+        doc.roundedRect(p7BarX, metricFigmaY + 17, p7BarW, 5, 2.5).fill(COLORS.border);
         if (m.val > 0) {
-          doc.roundedRect(76, metricFigmaY + 17, (m.val / 100) * 219, 5, 2.5).fill(m.color);
+          doc.roundedRect(p7BarX, metricFigmaY + 17, (m.val / 100) * p7BarW, 5, 2.5).fill(m.color);
         }
-        metricFigmaY += 28;
+        metricFigmaY += 46;
       });
 
       // Bottom callout
-      const nextStepY = metricFigmaY + 15;
+      const nextStepY = metricFigmaY + 4;
       doc.roundedRect(50, nextStepY, 495, 20, 6).lineWidth(1).fillAndStroke(COLORS.indigoBg, COLORS.primary);
       doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.dark).text("Next Step: ", 62, nextStepY + 5, { continued: true });
       doc.font("Inter").fontSize(8).fillColor(COLORS.dark).text("Implement this plan, practice consistently, and re-pitch. Your next session could be your breakthrough!", { lineBreak: false });
