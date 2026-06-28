@@ -8,6 +8,8 @@ import {
   resetPassword,
   deleteAccount,
   deleteAccountByCredentials,
+  verifyEmail,
+  resendEmailVerification,
 } from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
 import { authMiddleware } from "../middleware/authMiddleware.ts";
@@ -32,6 +34,8 @@ router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
 router.post("/forgot-password", authLimiter, forgotPassword);
 router.post("/reset-password", authLimiter, resetPassword);
+router.get("/verify-email", authLimiter, verifyEmail);
+router.post("/resend-verification", authLimiter, resendEmailVerification);
 
 router.get("/me", authMiddleware, (req, res) => {
   res.json({ id: req.user!.id, email: req.user!.email });

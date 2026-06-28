@@ -8,7 +8,8 @@ import { supabase } from "../config/supabase.ts";
 export const saveProfile = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ error: "Authentication required." });
+    if (!userId)
+      return res.status(401).json({ error: "Authentication required." });
 
     const { startup_name, industry, goal, funding_stage } = req.body;
 
@@ -17,10 +18,17 @@ export const saveProfile = async (req: Request, res: Response) => {
       .from("profiles")
       .upsert(
         { user_id: userId, startup_name, industry, goal, funding_stage },
-        { onConflict: "user_id" }
+        { onConflict: "user_id" },
       )
       .select()
       .single();
+
+    await supabase
+      .from("users")
+      .update({
+        onboardingCompleted: true,
+      })
+      .eq("id", userId);
 
     if (error) {
       console.error("❌ Profile save error:", error);
@@ -34,13 +42,31 @@ export const saveProfile = async (req: Request, res: Response) => {
   }
 };
 
+export const skipOnbording = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    let data = await supabase
+      .from("users")
+      .update({
+        onboardingCompleted: true,
+      })
+      .eq("id", userId);
+
+    res.status(200).json(data);
+  } catch (error) {
+    console.error("❌ skip onboarding exception:", error);
+    res.status(500).json({ error: "Failed to save profile." });
+  }
+};
+
 /**
  * Get the authenticated user's profile.
  */
 export const getProfile = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-    if (!userId) return res.status(401).json({ error: "Authentication required." });
+    if (!userId)
+      return res.status(401).json({ error: "Authentication required." });
 
     const { data, error } = await supabase
       .from("profiles")

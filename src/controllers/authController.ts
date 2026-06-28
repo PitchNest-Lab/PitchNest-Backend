@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { Resend } from "resend";
+import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 
 const BCRYPT_ROUNDS = 12;
 const resend = new Resend(`${process.env.RESEND_API_KEY}`);
@@ -65,8 +66,14 @@ export const signup = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    if (existingUser) return res.status(400).json({ error: "Email exists" });
+    const is_verified = existingUser?.isEmailVerified;
 
+    if (existingUser && is_verified)
+      return res.status(400).json({ error: "Email exists" });
+    if (existingUser && !is_verified)
+      return res
+        .status(409)
+        .json({ message: "Email already registered but not verified" });
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
@@ -80,6 +87,7 @@ export const signup = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Signup failed" });
 
     const token = signToken({ id: newUser.id, email: newUser.email });
+    await sendVerificationEmail(newUser.id, email);
 
     res.status(201).json({
       user: { id: newUser.id, name: newUser.name, email: newUser.email },
@@ -115,6 +123,9 @@ export const login = async (req: Request, res: Response) => {
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
       return res.status(401).json({ error: "Invalid credentials." });
+    }
+    if (!user.isEmailVerified) {
+      return res.status(403).json({ message: "Email not verified" });
     }
 
     const token = signToken({ id: user.id, email: user.email });
@@ -195,6 +206,82 @@ export const forgotPassword = async (req: Request, res: Response) => {
     res.status(200).json({ message: "a reset link has been sent." });
   } catch (error) {
     console.error("Forgot password error:", error);
+    res.status(500).json({ error: "Failed to process request." });
+  }
+};
+
+export const verifyEmail = async (req: Request, res: Response) => {
+  try {
+    const { token } = req.query;
+
+    if (!token) return res.status(400).json({ message: "Token required" });
+
+    // 1. Find token in Supabase
+    const { data: record, error } = await supabase
+      .from("email_verification_tokens")
+      .select("*")
+      .eq("token", token)
+      .single();
+
+    if (error || !record) {
+      return res.status(400).json({ message: "Invalid token" });
+    }
+
+    // 2. Check expiry
+    if (new Date(record.expires_at) < new Date()) {
+      return res.status(400).json({ message: "Token expired" });
+    }
+
+    // 3. Mark user as verified
+    await supabase
+      .from("users")
+      .update({ isEmailVerified: true })
+      .eq("id", record.user_id);
+
+    const { data: user } = await supabase
+      .from("users")
+      .select("id, email ,name ,onboardingCompleted")
+      .eq("id", record.user_id)
+      .single();
+
+    // 4. Delete token (one-time use)
+    await supabase
+      .from("email_verification_tokens")
+      .delete()
+      .eq("token", token);
+
+    const JwtToken = signToken({ id: user?.id, email: user?.email });
+
+    res.json({
+      user: { id: user?.id, name: user?.name, email: user?.email },
+      token:JwtToken,
+      message: "Email verified successfully",
+      redirectTo: user?.onboardingCompleted ? "/dashboard" : "/onboarding",
+    });
+  } catch (error) {
+    console.error("Email verfication  error:", error);
+    res.status(500).json({ error: "Failed to process request." });
+  }
+};
+
+export const resendEmailVerification = async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+
+    const { data: user } = await supabase
+      .from("users")
+      .select("id, isEmailVerified")
+      .eq("email", email)
+      .single();
+
+    if (!user) return res.status(404).json({ message: "User not found" });
+    if (user?.isEmailVerified)
+      return res.status(400).json({ message: "Already verified" });
+
+    await sendVerificationEmail(user.id, email);
+    res.json({ message: "Verification email resent" });
+  } catch (error) {
+    console.error("resend Email veridication  error:", error);
     res.status(500).json({ error: "Failed to process request." });
   }
 };
