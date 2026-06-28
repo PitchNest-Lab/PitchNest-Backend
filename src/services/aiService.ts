@@ -529,6 +529,7 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
     return `${OUTPUT_RULES}
 
 IDENTITY: Riley — elite startup pitch coach in a live 1-on-1 video session.
+Do not prefix your responses with any name or speaker label.
 
 STARTUP CONTEXT:
 - Name: ${currentBusinessName}
@@ -655,8 +656,21 @@ export async function evaluatePitch(
     : "";
 
   const isCoachOrSolo = mode === "coach" || mode === "solo";
+  const isSolo = mode === "solo";
 
-  const coachPrompt = `You are Riley, an elite startup pitch coach. Review this coaching session and write a comprehensive development report for your student. Return ONLY valid JSON.
+  // Solo = self-recorded practice with no live AI. Riley was NOT in the room;
+  // they are reviewing a recording after the fact. Coach = Riley was live in a
+  // 1-on-1 session. Frame the report honestly for each so it never claims a live
+  // conversation that did not happen.
+  const coachIntro = isSolo
+    ? `You are Riley, an elite startup pitch coach. The founder recorded a solo practice run with no live coaching — you are now reviewing that recording after the fact. Write a comprehensive development report based on what they recorded. Return ONLY valid JSON.`
+    : `You are Riley, an elite startup pitch coach. Review this live coaching session and write a comprehensive development report for your student. Return ONLY valid JSON.`;
+  const sessionWord = isSolo ? "recorded practice run" : "session";
+  const rileyObservation = isSolo
+    ? `- sentiments: Write 1 observation from Riley's perspective as the coach who reviewed this recording — be encouraging but honest.`
+    : `- sentiments: Write 1 coaching observation from Riley's perspective as the coach — be encouraging but honest.`;
+
+  const coachPrompt = `${coachIntro}
 
 BUSINESS: ${businessName}
 ${deckSection}
@@ -664,7 +678,7 @@ SESSION TRANSCRIPT:
 ${transcriptText}
 
 COACHING EVALUATION RULES:
-- You are writing as a coach evaluating a student, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
+- You are writing as a coach evaluating a ${isSolo ? "recorded practice run" : "student"}, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
 - Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
 - IF THE FOUNDER WAS SILENT OR THE SESSION WAS TOO SHORT: Provide low scores and use the summary to gently encourage more participation next time.
 - delivery = vocal confidence, pacing, how well they handle coaching questions under pressure.
@@ -674,8 +688,8 @@ COACHING EVALUATION RULES:
 - strengths: Specific things the founder did well — cite real moments from the transcript.
 - risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
 - next_steps: 3-4 concrete practice actions (NEVER fewer than 3) the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
-- sentiments: Write 1 coaching observation from Riley's perspective as the coach — be encouraging but honest.
-- Keep summary to 2-3 sentences framed as a coach's overall assessment of the session.
+${rileyObservation}
+- Keep summary to 2-3 sentences framed as a coach's overall assessment of the ${sessionWord}.
 
 LENGTH BUDGETS (rendered in fixed-size report cards — stay within and always end on a complete sentence):
 - summary: ≤ 320 characters. each strengths / risks item: ≤ 140 characters.

@@ -172,6 +172,7 @@ export function initRestSocket(wss: WebSocketServer) {
     let resolvedDeckText = "";
     let masterPrompt = "";
     let isCoachMode = false;
+    let isSoloMode = false;
     let sessionMode = "panel";
     let sttRecognizer: StreamingRecognizer | null = null;
 
@@ -233,6 +234,18 @@ export function initRestSocket(wss: WebSocketServer) {
     sendJson(ws, { type: "status", status: "vertex_ready" });
 
     const processAiTurn = async (turn: QueuedTurn) => {
+      // Solo (practice) mode: never run a live AI turn. The server only
+      // receives/stores the founder's audio + transcript (handled in the
+      // message handler) and produces an after-the-fact report at session end.
+      // No greeting, panel/coach turn, nudge, or verdict is ever generated, and
+      // no audio/transcript/turn message is sent back during the session — even
+      // if the founder says "Sarah" or "Chen", there is no panel to summon.
+      // This is the single, authoritative guard: any turn that reaches the queue
+      // in solo mode is silently dropped here regardless of how it was enqueued.
+      if (isSoloMode) {
+        return;
+      }
+
       if (!hasOpenAiConfig()) {
         sendJson(ws, {
           type: "error",
@@ -591,13 +604,30 @@ export function initRestSocket(wss: WebSocketServer) {
           currentUserId = clientConfig.userId || null;
           sessionMode = clientConfig.mode || "panel";
           isCoachMode = sessionMode === "coach";
+          isSoloMode = sessionMode === "solo";
 
-          console.log("🟢 Setup complete — triggering pitch introduction...");
-          enqueueTurn({ text: "", isGreeting: true });
+          // Solo (practice) mode has no live AI interaction at all — the founder
+          // self-records and the session is reviewed only afterward. Skip the
+          // greeting entirely so the room opens silently (no pickGreeting, no
+          // greeting audio). Coach and Panel still greet as Riley / Marcus.
+          if (isSoloMode) {
+            console.log(
+              "🟢 Setup complete — solo practice mode (no live AI, opening silently)...",
+            );
+          } else {
+            console.log("🟢 Setup complete — triggering pitch introduction...");
+            enqueueTurn({ text: "", isGreeting: true });
+          }
 
+          // Always resolve the deck text — the after-the-fact evaluation needs
+          // it in every mode. Only build the live master prompt when there is a
+          // live AI turn to drive (panel/coach); solo never runs one, so leaving
+          // masterPrompt empty avoids accidentally arming the panel prompt for a
+          // solo session if a turn path is ever added later.
           resolveDeckText(clientConfig)
             .then((text) => {
               resolvedDeckText = text;
+              if (isSoloMode) return;
               const enrichedConfig = { ...clientConfig, resolvedDeckText };
               masterPrompt = getMasterPrompt(
                 isCoachMode,
