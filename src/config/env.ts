@@ -17,8 +17,13 @@ export const config = {
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
+  googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   nodeEnv: process.env.NODE_ENV || "development",
 };
+
+export function hasGoogleAuthConfig(): boolean {
+  return !!config.googleClientId;
+}
 
 export function hasAzureOpenAiConfig(): boolean {
   return !!(

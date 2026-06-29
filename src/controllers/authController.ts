@@ -5,10 +5,12 @@ import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { Resend } from "resend";
+import { OAuth2Client } from "google-auth-library";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 
 const BCRYPT_ROUNDS = 12;
 const resend = new Resend(`${process.env.RESEND_API_KEY}`);
+const googleClient = new OAuth2Client(config.googleClientId);
 
 // The only roles a user record may hold. Kept in one place so signup, the PATCH
 // endpoint, and any future caller validate against the same source of truth.
@@ -117,6 +119,7 @@ export const signup = async (req: Request, res: Response) => {
         name: newUser.name,
         email: newUser.email,
         role: newUser.role,
+        bio: newUser.bio,
       },
       token,
       emailSent,
@@ -164,6 +167,7 @@ export const login = async (req: Request, res: Response) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        bio: user.bio,
       },
       token,
     });
@@ -173,26 +177,56 @@ export const login = async (req: Request, res: Response) => {
   }
 };
 
+const MAX_BIO_LENGTH = 600;
+
 /**
- * PATCH /api/auth/me — update the authenticated user's editable profile fields.
- * Currently only `role` (Founder | Investor | Advisor). Returns the updated user.
+ * PATCH /api/auth/me — update the authenticated user's editable profile fields:
+ * `name`, `bio`, and `role` (Founder | Investor | Advisor). All fields optional;
+ * only the ones present in the body are updated. Email is intentionally NOT
+ * editable here (it is the login identity and would require re-verification).
+ * Returns the updated user.
  */
 export const updateMe = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { role } = req.body;
+    const { name, bio, role } = req.body;
 
-    if (!isValidRole(role)) {
-      return res.status(400).json({
-        error: "Invalid role. Must be one of: Founder, Investor, Advisor.",
-      });
+    const updates: Record<string, unknown> = {};
+
+    if (name !== undefined) {
+      if (typeof name !== "string" || name.trim().length < 2) {
+        return res
+          .status(400)
+          .json({ error: "Name must be at least 2 characters." });
+      }
+      updates.name = name.trim();
+    }
+
+    if (bio !== undefined) {
+      if (typeof bio !== "string") {
+        return res.status(400).json({ error: "Bio must be text." });
+      }
+      updates.bio = bio.slice(0, MAX_BIO_LENGTH);
+    }
+
+    if (role !== undefined) {
+      if (!isValidRole(role)) {
+        return res.status(400).json({
+          error: "Invalid role. Must be one of: Founder, Investor, Advisor.",
+        });
+      }
+      updates.role = role;
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: "No valid fields to update." });
     }
 
     const { data: updated, error } = await supabase
       .from("users")
-      .update({ role })
+      .update(updates)
       .eq("id", userId)
-      .select("id, name, email, role")
+      .select("id, name, email, role, bio")
       .single();
 
     if (error || !updated) {
@@ -205,11 +239,103 @@ export const updateMe = async (req: Request, res: Response) => {
         name: updated.name,
         email: updated.email,
         role: updated.role,
+        bio: updated.bio,
       },
     });
   } catch (error) {
     console.error("updateMe error:", error);
     res.status(500).json({ error: "Failed to update profile." });
+  }
+};
+
+/**
+ * POST /api/auth/google — sign in / sign up with a Google ID token (credential)
+ * obtained client-side via Google Identity Services. Verifies the token against
+ * our OAuth client id, then finds-or-creates the matching user (linked by email)
+ * and issues our own JWT. Google accounts have no password — a random hash is
+ * stored to satisfy the column; users can set one later via "forgot password".
+ */
+export const googleAuth = async (req: Request, res: Response) => {
+  try {
+    if (!config.googleClientId) {
+      return res
+        .status(503)
+        .json({ error: "Google sign-in is not configured on the server." });
+    }
+
+    const { credential } = req.body;
+    if (!credential || typeof credential !== "string") {
+      return res.status(400).json({ error: "Missing Google credential." });
+    }
+
+    let payload;
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: config.googleClientId,
+      });
+      payload = ticket.getPayload();
+    } catch {
+      return res.status(401).json({ error: "Invalid Google credential." });
+    }
+
+    if (!payload?.email || payload.email_verified === false) {
+      return res
+        .status(401)
+        .json({ error: "Google account email is unavailable or unverified." });
+    }
+
+    const email = payload.email.toLowerCase().trim();
+    const name =
+      payload.name || payload.given_name || email.split("@")[0] || "Founder";
+
+    let { data: user } = await supabase
+      .from("users")
+      .select("*")
+      .eq("email", email)
+      .maybeSingle();
+
+    if (!user) {
+      // Random unusable password — Google is the auth method for this account.
+      const randomPassword = await bcrypt.hash(
+        crypto.randomBytes(32).toString("hex"),
+        BCRYPT_ROUNDS,
+      );
+      const { data: created, error } = await supabase
+        .from("users")
+        .insert([
+          {
+            name,
+            email,
+            password: randomPassword,
+            isEmailVerified: true,
+            role: "Founder",
+          },
+        ])
+        .select()
+        .single();
+
+      if (error || !created) {
+        console.error("Google signup insert failed:", error);
+        return res.status(500).json({ error: "Could not create account." });
+      }
+      user = created;
+    }
+
+    const token = signToken({ id: user.id, email: user.email });
+    res.status(200).json({
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        bio: user.bio,
+      },
+      token,
+    });
+  } catch (error) {
+    console.error("Google auth error:", error);
+    res.status(500).json({ error: "Google sign-in failed." });
   }
 };
 
@@ -313,7 +439,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, email ,name ,onboardingCompleted, role")
+      .select("id, email ,name ,onboardingCompleted, role, bio")
       .eq("id", record.user_id)
       .single();
 
@@ -331,6 +457,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
         name: user?.name,
         email: user?.email,
         role: user?.role,
+        bio: user?.bio,
       },
       token:JwtToken,
       message: "Email verified successfully",

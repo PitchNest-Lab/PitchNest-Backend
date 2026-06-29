@@ -3,6 +3,7 @@ import rateLimit from "express-rate-limit";
 import {
   signup,
   login,
+  googleAuth,
   updateMe,
   wipeDb,
   forgotPassword,
@@ -34,6 +35,7 @@ if (config.nodeEnv === "development") {
 
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
+router.post("/google", authLimiter, googleAuth);
 router.post("/forgot-password", authLimiter, forgotPassword);
 router.post("/reset-password", authLimiter, resetPassword);
 router.get("/verify-email", authLimiter, verifyEmail);
@@ -46,7 +48,7 @@ router.get("/me", authMiddleware, async (req, res) => {
   try {
     const { data: user } = await supabase
       .from("users")
-      .select("id, name, email, role")
+      .select("id, name, email, role, bio")
       .eq("id", req.user!.id)
       .maybeSingle();
 
@@ -56,6 +58,7 @@ router.get("/me", authMiddleware, async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        bio: user.bio,
       });
     }
   } catch (err) {
