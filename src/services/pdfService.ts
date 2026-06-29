@@ -177,8 +177,16 @@ function fitText(
 ): string {
   if (!text) return "";
   doc.font(font).fontSize(fontSize);
-  const lineH = doc.currentLineHeight();
-  const maxHeight = maxLines * lineH + Math.max(0, maxLines - 1) * lineGap + 0.5;
+  // Measure ONE real line the same way heightOfString counts them. PDFKit's
+  // per-line height (ascent/descent + internal + lineGap) is larger than
+  // currentLineHeight() + lineGap, so the old formula undercounted maxHeight by
+  // ~1.7pt per line. With lineGap > 0 and maxLines = 1 that made even the first
+  // word "overflow", so fitText fell through to the `words[0] + ELLIPSIS`
+  // branch and every value collapsed to a single word + "…" (e.g. "Develop…").
+  // Deriving maxHeight from an actual single-line measurement keeps it exactly
+  // in step with the per-candidate heightOfString checks below.
+  const oneLineH = doc.heightOfString("Mg", { width: 100000, lineGap });
+  const maxHeight = maxLines * oneLineH + 0.5;
   if (doc.heightOfString(text, { width, lineGap }) <= maxHeight) return text;
 
   const words = text.split(/\s+/);
@@ -1046,9 +1054,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // fits cleanly (no card is cut off, none overlaps the section below).
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("ACTIONABLE NEXT STEPS", 50, 320);
       const stepsToShow = nextSteps.slice(0, 4);
-      const nsTop = 340;
-      const nsBottom = 524;          // AI INSIGHTS header sits at y=530
-      const nsGap = 6;
+      const nsTop = 334;
+      const nsBottom = 528;          // AI INSIGHTS header sits at y=530
+      const nsGap = 4;
       const nsCount = Math.max(stepsToShow.length, 1);
       const nsCardH = Math.max(
         40,
@@ -1068,20 +1076,26 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
         // Description: as many lines as fit below the title/pill row inside this
         // card's height (more room for 3 cards, less for 4) — never overruns.
-        doc.font("Inter").fontSize(7.5);
-        const nsDescLineH = doc.currentLineHeight() + 1.5;
-        const nsDescLines = Math.max(1, Math.min(3, Math.floor((nsCardH - 24 - 4) / nsDescLineH)));
-        const descText = fitText(doc, step.desc || "", 225, "Inter", 7.5, nsDescLines, 1.5);
-        doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(descText, 92, stepY + 24, { width: 225, lineGap: 1.5 });
+        // 7pt with a 21px top offset leaves room for 2 full lines even in the
+        // tightest 4-card layout, so a ≤110-char desc renders in full (no "…").
+        // nsDescLineH is measured the same way fitText measures lines, so the
+        // line-count estimate and the fit check stay in agreement.
+        doc.font("Inter").fontSize(7);
+        const nsDescLineH = doc.heightOfString("Mg", { width: 100000, lineGap: 1.5 });
+        const nsDescLines = Math.max(1, Math.min(3, Math.floor((nsCardH - 21 - 2) / nsDescLineH)));
+        const descText = fitText(doc, step.desc || "", 225, "Inter", 7, nsDescLines, 1.5);
+        doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text(descText, 92, stepY + 21, { width: 225, lineGap: 1.5 });
 
-        // Priority tag — High Priority: red bg, white text
+        // Priority tag — High Priority: red bg, white text. Sits on the title
+        // row and ends above the description (y+19) so the first desc line is
+        // free to use the full card width.
         const isHighPriority = (step.priority || "").toLowerCase().includes("high");
         if (isHighPriority) {
-          doc.roundedRect(255, stepY + 8, 65, 14, 6).fill(COLORS.rose);
-          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.white).text(step.priority || "High Priority", 255, stepY + 11, { align: "center", width: 65 });
+          doc.roundedRect(255, stepY + 7, 65, 12, 6).fill(COLORS.rose);
+          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.white).text(step.priority || "High Priority", 255, stepY + 9, { align: "center", width: 65 });
         } else {
-          doc.roundedRect(255, stepY + 8, 65, 14, 6).lineWidth(0.5).fillAndStroke(COLORS.amberBg, COLORS.amber);
-          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 11, { align: "center", width: 65 });
+          doc.roundedRect(255, stepY + 7, 65, 12, 6).lineWidth(0.5).fillAndStroke(COLORS.amberBg, COLORS.amber);
+          doc.font("Inter-Bold").fontSize(6.5).fillColor(COLORS.amber).text(step.priority || "Medium Priority", 255, stepY + 9, { align: "center", width: 65 });
         }
 
         stepY += nsCardH + nsGap;
