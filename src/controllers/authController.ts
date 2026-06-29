@@ -10,6 +10,13 @@ import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 const BCRYPT_ROUNDS = 12;
 const resend = new Resend(`${process.env.RESEND_API_KEY}`);
 
+// The only roles a user record may hold. Kept in one place so signup, the PATCH
+// endpoint, and any future caller validate against the same source of truth.
+const ALLOWED_ROLES = ["Founder", "Investor", "Advisor"] as const;
+type Role = (typeof ALLOWED_ROLES)[number];
+const isValidRole = (value: unknown): value is Role =>
+  typeof value === "string" && (ALLOWED_ROLES as readonly string[]).includes(value);
+
 /**
  * Signs a JWT token for the given user.
  */
@@ -33,7 +40,7 @@ export const wipeDb = async (req: Request, res: Response) => {
 
 export const signup = async (req: Request, res: Response) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, role } = req.body;
     if (!name || !email || !password) {
       return res
         .status(400)
@@ -77,9 +84,14 @@ export const signup = async (req: Request, res: Response) => {
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
+    // Role is optional at signup; fall back to 'Founder' when absent or invalid.
+    const signupRole: Role = isValidRole(role) ? role : "Founder";
+
     const { data: newUser, error } = await supabase
       .from("users")
-      .insert([{ name, email: cleanEmail, password: hashedPassword }])
+      .insert([
+        { name, email: cleanEmail, password: hashedPassword, role: signupRole },
+      ])
       .select()
       .single();
 
@@ -100,7 +112,12 @@ export const signup = async (req: Request, res: Response) => {
     }
 
     res.status(201).json({
-      user: { id: newUser.id, name: newUser.name, email: newUser.email },
+      user: {
+        id: newUser.id,
+        name: newUser.name,
+        email: newUser.email,
+        role: newUser.role,
+      },
       token,
       emailSent,
     });
@@ -142,12 +159,57 @@ export const login = async (req: Request, res: Response) => {
     const token = signToken({ id: user.id, email: user.email });
 
     res.status(200).json({
-      user: { id: user.id, name: user.name, email: user.email },
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
       token,
     });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
+  }
+};
+
+/**
+ * PATCH /api/auth/me — update the authenticated user's editable profile fields.
+ * Currently only `role` (Founder | Investor | Advisor). Returns the updated user.
+ */
+export const updateMe = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const { role } = req.body;
+
+    if (!isValidRole(role)) {
+      return res.status(400).json({
+        error: "Invalid role. Must be one of: Founder, Investor, Advisor.",
+      });
+    }
+
+    const { data: updated, error } = await supabase
+      .from("users")
+      .update({ role })
+      .eq("id", userId)
+      .select("id, name, email, role")
+      .single();
+
+    if (error || !updated) {
+      return res.status(500).json({ error: "Failed to update profile." });
+    }
+
+    res.status(200).json({
+      user: {
+        id: updated.id,
+        name: updated.name,
+        email: updated.email,
+        role: updated.role,
+      },
+    });
+  } catch (error) {
+    console.error("updateMe error:", error);
+    res.status(500).json({ error: "Failed to update profile." });
   }
 };
 
@@ -251,7 +313,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, email ,name ,onboardingCompleted")
+      .select("id, email ,name ,onboardingCompleted, role")
       .eq("id", record.user_id)
       .single();
 
@@ -264,7 +326,12 @@ export const verifyEmail = async (req: Request, res: Response) => {
     const JwtToken = signToken({ id: user?.id, email: user?.email });
 
     res.json({
-      user: { id: user?.id, name: user?.name, email: user?.email },
+      user: {
+        id: user?.id,
+        name: user?.name,
+        email: user?.email,
+        role: user?.role,
+      },
       token:JwtToken,
       message: "Email verified successfully",
       redirectTo: user?.onboardingCompleted ? "/dashboard" : "/onboarding",
