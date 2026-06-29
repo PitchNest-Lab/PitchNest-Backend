@@ -5,7 +5,7 @@ export const transporter = nodemailer.createTransport({
   port: Number(process.env.MAIL_PORT), // 587
   secure: false,
   auth: {
-    user: process.env.MAIL_USER,     // hello@pitchnest.io
+    user: process.env.MAIL_USER,     // pitchnestapp@gmail.com
     pass: process.env.MAIL_PASS,     // Gmail App Password
   },
 });

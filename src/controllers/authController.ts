@@ -87,11 +87,22 @@ export const signup = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Signup failed" });
 
     const token = signToken({ id: newUser.id, email: newUser.email });
-    await sendVerificationEmail(newUser.id, email);
+
+    // The account already exists at this point — a mail failure must not turn a
+    // successful signup into a 500. Log the real reason and let the user fall
+    // through to the "resend verification" screen instead.
+    let emailSent = true;
+    try {
+      await sendVerificationEmail(newUser.id, email);
+    } catch (mailErr) {
+      emailSent = false;
+      console.error("⚠️ Signup succeeded but verification email failed:", mailErr);
+    }
 
     res.status(201).json({
       user: { id: newUser.id, name: newUser.name, email: newUser.email },
       token,
+      emailSent,
     });
   } catch (error) {
     console.error("Signup error:", error);

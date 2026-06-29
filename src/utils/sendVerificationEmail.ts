@@ -21,9 +21,20 @@ export async function sendVerificationEmail(userId: string, email: string) {
   if (error) throw new Error("Failed to save token");
 
   // 4. Send email
-  const verifyUrl = `${process.env.CLIENT_URL}/verify?token=${token}`;
+  // Normalize the base URL so a trailing slash in CLIENT_URL doesn't produce a
+  // broken double-slash link (e.g. https://app//verify).
+  const baseUrl = (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, "");
+  const verifyUrl = `${baseUrl}/verify?token=${token}`;
 
-  await transporter.sendMail({
+  if (!process.env.MAIL_HOST || !process.env.MAIL_USER || !process.env.MAIL_PASS) {
+    throw new Error(
+      "Mail is not configured (MAIL_HOST / MAIL_USER / MAIL_PASS missing). " +
+        "Set these in the backend environment so verification emails can send.",
+    );
+  }
+
+  try {
+    await transporter.sendMail({
     from: `"PitchNest" <${process.env.MAIL_USER}>`,
     to: email,
     subject: "Verify your PitchNest account",
@@ -44,5 +55,11 @@ export async function sendVerificationEmail(userId: string, email: string) {
         </p>
       </div>
     `,
-  });
+    });
+  } catch (err: any) {
+    // Surface the real SMTP failure (auth rejected, blocked port, etc.) instead
+    // of letting it bubble up as a generic "Signup failed".
+    console.error("❌ Verification email send failed:", err?.message || err);
+    throw new Error(`Failed to send verification email: ${err?.message || err}`);
+  }
 }
