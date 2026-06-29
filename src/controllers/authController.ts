@@ -4,12 +4,11 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
-import { Resend } from "resend";
 import { OAuth2Client } from "google-auth-library";
+import { transporter } from "../utils/mailer.ts";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 
 const BCRYPT_ROUNDS = 12;
-const resend = new Resend(`${process.env.RESEND_API_KEY}`);
 const googleClient = new OAuth2Client(config.googleClientId);
 
 // The only roles a user record may hold. Kept in one place so signup, the PATCH
@@ -332,6 +331,9 @@ export const googleAuth = async (req: Request, res: Response) => {
         bio: user.bio,
       },
       token,
+      // New (or not-yet-onboarded) Google users go through onboarding, exactly
+      // like email users do after verifying. Returning users skip to dashboard.
+      redirectTo: user.onboardingCompleted ? "/dashboard" : "/onboarding",
     });
   } catch (error) {
     console.error("Google auth error:", error);
@@ -376,31 +378,58 @@ export const forgotPassword = async (req: Request, res: Response) => {
         used: false,
       },
     ]);
-    const resetLink = `${config.allowedOrigin}/reset-password?token=${resetToken}`;
-    console.log(email);
-    const { data, error } = await resend.emails.send({
-      from: "pitchnestapp@gmail.com",
-      to: email,
-      subject: "Reset Your Password",
-      html: `
-    <h2>Password Reset Request</h2>
-    <p>We received a request to reset your password.</p>
-    <p>
-      <a href="${resetLink}">
-        Reset Password
-      </a>
-    </p>
-    <p>If you didn't request this, you can safely ignore this email.</p>
-  `,
-    });
-    if (error) {
-      console.error("Resend error:", error); // ← this will tell you exactly what's wrong
+    const baseUrl = (config.allowedOrigin || "http://localhost:5174").replace(
+      /\/+$/,
+      "",
+    );
+    const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
+
+    // Send via the same SMTP transporter used for verification emails, so the
+    // whole app sends mail through one configured provider (MAIL_HOST/USER/PASS)
+    // instead of a second one (Resend) that needed its own verified domain.
+    if (
+      !process.env.MAIL_HOST ||
+      !process.env.MAIL_USER ||
+      !process.env.MAIL_PASS
+    ) {
+      console.error(
+        "❌ Password reset email not sent: MAIL_HOST/MAIL_USER/MAIL_PASS missing.",
+      );
       return res.status(500).json({ error: "Failed to send email." });
     }
-    // For now, log it so you can test manually:
-    console.log(
-      `Password reset link: ${config.allowedOrigin}/reset-password?token=${resetToken}`,
-    );
+
+    try {
+      await transporter.sendMail({
+        from: `"PitchNest" <${process.env.MAIL_USER}>`,
+        to: email,
+        subject: "Reset your PitchNest password",
+        html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px">
+        <h2 style="color:#1a1a2e">Reset your password</h2>
+        <p style="color:#6b7280">
+          We received a request to reset your PitchNest password. Click the
+          button below to choose a new one.
+        </p>
+        <a href="${resetLink}"
+           style="display:inline-block;margin:24px 0;padding:14px 28px;
+                  background:#3b82f6;color:#fff;border-radius:12px;
+                  text-decoration:none;font-weight:700">
+          Reset Password →
+        </a>
+        <p style="color:#9ca3af;font-size:12px">
+          Link expires in 1 hour. If you didn't request this, you can safely
+          ignore this email.
+        </p>
+      </div>
+    `,
+      });
+    } catch (mailErr: any) {
+      console.error(
+        "❌ Password reset email send failed:",
+        mailErr?.message || mailErr,
+      );
+      return res.status(500).json({ error: "Failed to send email." });
+    }
 
     res.status(200).json({ message: "a reset link has been sent." });
   } catch (error) {

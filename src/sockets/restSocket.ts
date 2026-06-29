@@ -843,6 +843,16 @@ export function initRestSocket(wss: WebSocketServer) {
             clearInterval(idleCheckInterval);
             idleCheckInterval = null;
           }
+
+          // The founder ended the session — cut the panel off immediately.
+          // Abort any in-flight turn and drop everything still queued so the
+          // verdict is the very next thing spoken (no "let me finish my point
+          // first" before the verdicts).
+          if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
+            currentTurnAbort.abort();
+          }
+          turnQueue.length = 0;
+
           const panelists = data.panelists || [
             { name: "Marcus", role: "Lead Investor" },
             { name: "Sarah", role: "Financial Analyst" },
