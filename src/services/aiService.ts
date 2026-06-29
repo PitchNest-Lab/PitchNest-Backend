@@ -931,6 +931,66 @@ export async function generatePanelResponse(
 }
 
 /**
+ * Generates a SHORT, AI-powered "answer tip" for a panelist's question, aligned
+ * to what was actually asked (vs. the static keyword library). Returns a compact
+ * { term, definition, tip } card or null on any failure — callers must treat
+ * null as "no AI tip" and fall back to the local keyword card.
+ *
+ * Designed to be cheap and non-blocking: tiny token budget, low temperature, and
+ * it is fired in PARALLEL with TTS playback on the server, never in the main
+ * conversation turn's await path, so it adds no latency to what the founder hears.
+ *
+ * HARD RULE (kept identical to the static library): give DIRECTION only, never a
+ * model answer the founder could read aloud — that would pollute scoring.
+ */
+export async function generateAnswerTip(
+  question: string,
+  businessName?: string,
+): Promise<{ term: string; definition: string; tip: string } | null> {
+  const q = (question || "").trim();
+  if (q.length < 8) return null;
+
+  const openai = getOpenAIClient();
+  const prompt = `A startup founder is in a live pitch practice. An investor just asked them this:
+
+"${q}"
+${businessName ? `\nThe startup is "${businessName}".` : ""}
+
+Produce a tiny on-screen coaching card that helps the founder know HOW to answer THIS specific question. Return ONLY valid JSON: { "term": string, "definition": string, "tip": string }.
+
+RULES:
+- "term": the single core concept the investor is probing (e.g. "CAC", "Unit economics", "Go-to-market"). ≤ 24 characters.
+- "definition": one plain-language line explaining that concept. ≤ 90 characters.
+- "tip": direction on WHAT to talk about to answer well — never a sample answer, never invented numbers. Good: "Explain how you reach customers and roughly what each costs." Forbidden: "Say your CAC is $40." ≤ 120 characters.
+- Be specific to what was actually asked. If the question is generic, pick the most relevant concept and give general direction.
+- Africa-first framing where natural (agent networks, mobile money, telcos, distributors); keep money references neutral/per-customer.`;
+
+  try {
+    const response = await openai.chat.completions.create({
+      model: config.azureOpenAiDeployment || "gpt-4o",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.3,
+      max_tokens: 160,
+      response_format: { type: "json_object" },
+    });
+    const raw = response.choices[0]?.message?.content?.trim() || "";
+    if (!raw) return null;
+    const parsed = parseJsonLoose(raw);
+
+    const clamp = (v: unknown, max: number) =>
+      typeof v === "string" ? v.trim().slice(0, max) : "";
+    const term = clamp(parsed?.term, 24);
+    const definition = clamp(parsed?.definition, 90);
+    const tip = clamp(parsed?.tip, 120);
+    if (!term || !tip) return null; // incomplete card — let the caller fall back
+    return { term, definition, tip };
+  } catch (err: any) {
+    console.warn("Answer-tip generation failed (non-fatal):", err?.message || err);
+    return null;
+  }
+}
+
+/**
  * Summarizes long voice input into a short sentence.
  */
 export async function summarizeVoiceInput(text: string): Promise<string> {

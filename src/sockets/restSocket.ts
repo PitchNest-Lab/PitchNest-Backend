@@ -7,6 +7,7 @@ import {
   generatePanelResponse,
   streamPanelResponse,
   summarizeVoiceInput,
+  generateAnswerTip,
 } from "../services/aiService.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import {
@@ -494,6 +495,21 @@ export function initRestSocket(wss: WebSocketServer) {
               speaker: activeSpeaker,
             });
           }
+        }
+
+        // Answer-tip (non-blocking): generate a short, AI-powered coaching card
+        // for THIS question and stream it to the client. Fired here so it runs
+        // in parallel with the TTS playback below — it is NEVER awaited, so it
+        // adds zero latency to the panel's voice. Skipped for greetings/nudges
+        // (not real questions). The client falls back to its local keyword card
+        // if this never arrives (slow/failed), so the tip layer can't break.
+        if (!turn.isGreeting && !turn.isNudge && fullSpokenText.trim()) {
+          const tipQuestion = fullSpokenText;
+          generateAnswerTip(tipQuestion, currentBusinessName)
+            .then((tip) => {
+              if (tip) sendJson(ws, { type: "answer_tip", ...tip });
+            })
+            .catch(() => {});
         }
 
         // 4. Wait for the sequential TTS delivery pipeline to completely finish
