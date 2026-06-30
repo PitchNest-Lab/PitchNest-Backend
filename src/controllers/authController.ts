@@ -41,7 +41,7 @@ export const wipeDb = async (req: Request, res: Response) => {
 
 export const signup = async (req: Request, res: Response) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password } = req.body;
     if (!name || !email || !password) {
       return res
         .status(400)
@@ -85,14 +85,9 @@ export const signup = async (req: Request, res: Response) => {
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    // Role is optional at signup; fall back to 'Founder' when absent or invalid.
-    const signupRole: Role = isValidRole(role) ? role : "Founder";
-
     const { data: newUser, error } = await supabase
       .from("users")
-      .insert([
-        { name, email: cleanEmail, password: hashedPassword, role: signupRole },
-      ])
+      .insert([{ name, email: cleanEmail, password: hashedPassword }])
       .select()
       .single();
 
@@ -101,33 +96,21 @@ export const signup = async (req: Request, res: Response) => {
 
     const token = signToken({ id: newUser.id, email: newUser.email });
 
-    // The account already exists at this point — a mail failure must not turn a
-    // successful signup into a 500. Log the real reason and let the user fall
-    // through to the "resend verification" screen instead.
-    let emailSent = true;
-    try {
-      await sendVerificationEmail(newUser.id, email);
-    } catch (mailErr) {
-      emailSent = false;
-      console.error("⚠️ Signup succeeded but verification email failed:", mailErr);
-    }
+    // Don't await — let it run in the background
+    sendVerificationEmail(newUser.id, email).catch((err) => {
+      console.error("Failed to send verification email:", err);
+    });
 
     res.status(201).json({
-      user: {
-        id: newUser.id,
-        name: newUser.name,
-        email: newUser.email,
-        role: newUser.role,
-        bio: newUser.bio,
-      },
+      user: { id: newUser.id, name: newUser.name, email: newUser.email },
       token,
-      emailSent,
     });
   } catch (error) {
     console.error("Signup error:", error);
     res.status(500).json({ error: "Signup failed" });
   }
 };
+
 
 export const login = async (req: Request, res: Response) => {
   try {
@@ -501,7 +484,6 @@ export const verifyEmail = async (req: Request, res: Response) => {
 export const resendEmailVerification = async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
-
     const { data: user } = await supabase
       .from("users")
       .select("id, isEmailVerified")
@@ -512,10 +494,14 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
     if (user?.isEmailVerified)
       return res.status(400).json({ message: "Already verified" });
 
-    await sendVerificationEmail(user.id, email);
+    // Don't block the response on email delivery
+    sendVerificationEmail(user.id, email).catch((err) => {
+      console.error("Failed to resend verification email:", err);
+    });
+
     res.json({ message: "Verification email resent" });
   } catch (error) {
-    console.error("resend Email veridication  error:", error);
+    console.error("resend Email verification error:", error);
     res.status(500).json({ error: "Failed to process request." });
   }
 };
