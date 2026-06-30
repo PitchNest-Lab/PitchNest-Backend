@@ -622,6 +622,27 @@ export function initRestSocket(wss: WebSocketServer) {
           isCoachMode = sessionMode === "coach";
           isSoloMode = sessionMode === "solo";
 
+          // Verify that the user still exists in the database (prevents deleted users
+          // from pitching via WebSocket since WS bypasses Express auth middleware).
+          if (currentUserId) {
+            const { data: dbUser, error: userErr } = await supabase
+              .from("users")
+              .select("id")
+              .eq("id", currentUserId)
+              .maybeSingle();
+
+            if (userErr || !dbUser) {
+              console.error("❌ WS client_ready: User not found in database. Rejecting.");
+              sendJson(ws, {
+                type: "error",
+                message: "User account no longer exists. Please log in again.",
+                code: "USER_DELETED"
+              });
+              ws.close();
+              return;
+            }
+          }
+
           // Solo (practice) mode has no live AI interaction at all — the founder
           // self-records and the session is reviewed only afterward. Skip the
           // greeting entirely so the room opens silently (no pickGreeting, no
