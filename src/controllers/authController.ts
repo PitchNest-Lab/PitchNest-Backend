@@ -80,10 +80,21 @@ export const signup = async (req: Request, res: Response) => {
 
     if (existingUser && is_verified)
       return res.status(400).json({ error: "Email exists" });
-    if (existingUser && !is_verified)
+    if (existingUser && !is_verified) {
+      // Auto-resend verification email so user isn't stuck
+      sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
+        console.error("Failed to resend verification email on signup retry:", err);
+      });
+
+      const token = signToken({ id: existingUser.id, email: existingUser.email });
       return res
-        .status(409)
-        .json({ message: "Email already registered but not verified" });
+        .status(200)
+        .json({
+          user: { id: existingUser.id, name: existingUser.name, email: existingUser.email },
+          token,
+          message: "Verification email resent",
+        });
+    }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
