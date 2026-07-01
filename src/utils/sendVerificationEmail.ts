@@ -5,8 +5,8 @@ import { supabase } from "../config/supabase"; // your server-side supabase clie
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 export async function sendVerificationEmail(userId: string | number, email: string) {
-  // 1. Generate token
-  const token = crypto.randomBytes(32).toString("hex");
+  // 1. Generate 6-digit OTP code
+  const token = Math.floor(100000 + Math.random() * 900000).toString();
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
 
   // 2. Delete any old tokens for this user
@@ -41,19 +41,28 @@ export async function sendVerificationEmail(userId: string | number, email: stri
       to: email,
       subject: "Verify your PitchNest account",
       html: `
-        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px">
-          <h2 style="color:#1a1a2e">Verify your email</h2>
-          <p style="color:#6b7280">
-            Click the button below to verify your PitchNest account.
+        <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:16px;background:#fff">
+          <h2 style="color:#111827;font-size:24px;margin-bottom:8px">Verify your email</h2>
+          <p style="color:#4b5563;font-size:16px;line-height:24px;margin-bottom:24px">
+            Enter this 6-digit verification code on the verification screen:
           </p>
-          <a href="${verifyUrl}"
-             style="display:inline-block;margin:24px 0;padding:14px 28px;
-                    background:#3b82f6;color:#fff;border-radius:12px;
-                    text-decoration:none;font-weight:700">
-            Verify my email →
-          </a>
-          <p style="color:#9ca3af;font-size:12px">
-            Link expires in 24 hours. If you didn't sign up, ignore this.
+          <div style="font-size:36px;font-weight:800;letter-spacing:6px;color:#0284c7;margin:24px 0;padding:16px;background:#f0f9ff;border-radius:12px;text-align:center;width:fit-content;margin-left:auto;margin-right:auto">
+            ${token}
+          </div>
+          <p style="color:#4b5563;font-size:16px;line-height:24px;margin-bottom:24px;text-align:center">
+            — OR —
+          </p>
+          <div style="text-align:center;margin-bottom:24px">
+            <a href="${verifyUrl}"
+               style="display:inline-block;padding:14px 28px;
+                      background:#0284c7;color:#fff;border-radius:12px;
+                      text-decoration:none;font-weight:700;font-size:16px">
+              Verify my email →
+            </a>
+          </div>
+          <hr style="border:0;border-top:1px solid #e5e7eb;margin:24px 0" />
+          <p style="color:#9ca3af;font-size:12px;line-height:18px;text-align:center">
+            Link and code expire in 24 hours. If you didn't sign up, ignore this.
           </p>
         </div>
       `,

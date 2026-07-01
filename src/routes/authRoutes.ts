@@ -48,7 +48,7 @@ router.get("/me", authMiddleware, async (req, res) => {
   try {
     const { data: user } = await supabase
       .from("users")
-      .select("id, name, email, role, bio")
+      .select("id, name, email, role, bio, isEmailVerified")
       .eq("id", req.user!.id)
       .maybeSingle();
 
@@ -59,12 +59,13 @@ router.get("/me", authMiddleware, async (req, res) => {
         email: user.email,
         role: user.role,
         bio: user.bio,
+        isEmailVerified: user.isEmailVerified,
       });
     }
   } catch (err) {
     console.warn("GET /me lookup failed, falling back to token identity:", err);
   }
-  res.json({ id: req.user!.id, email: req.user!.email });
+  res.json({ id: req.user!.id, email: req.user!.email, isEmailVerified: false });
 });
 
 router.patch("/me", authMiddleware, updateMe);
