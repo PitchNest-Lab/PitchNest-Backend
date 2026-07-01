@@ -5,8 +5,10 @@ import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { OAuth2Client } from "google-auth-library";
-import { transporter } from "../utils/mailer.ts";
+import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 const BCRYPT_ROUNDS = 12;
 const googleClient = new OAuth2Client(config.googleClientId);
@@ -367,23 +369,16 @@ export const forgotPassword = async (req: Request, res: Response) => {
     );
     const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
 
-    // Send via the same SMTP transporter used for verification emails, so the
-    // whole app sends mail through one configured provider (MAIL_HOST/USER/PASS)
-    // instead of a second one (Resend) that needed its own verified domain.
-    if (
-      !process.env.MAIL_HOST ||
-      !process.env.MAIL_USER ||
-      !process.env.MAIL_PASS
-    ) {
+    if (!process.env.RESEND_API_KEY) {
       console.error(
-        "❌ Password reset email not sent: MAIL_HOST/MAIL_USER/MAIL_PASS missing.",
+        "❌ Password reset email not sent: RESEND_API_KEY missing.",
       );
       return res.status(500).json({ error: "Failed to send email." });
     }
 
     try {
-      await transporter.sendMail({
-        from: `"PitchNest" <${process.env.MAIL_USER}>`,
+      const { data, error } = await resend.emails.send({
+        from: "PitchNest <hello@pitchnest.app>",
         to: email,
         subject: "Reset your PitchNest password",
         html: `
@@ -406,6 +401,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
       </div>
     `,
       });
+
+      if (error) {
+        throw new Error(error.message);
+      }
     } catch (mailErr: any) {
       console.error(
         "❌ Password reset email send failed:",
