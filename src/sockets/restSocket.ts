@@ -621,6 +621,7 @@ export function initRestSocket(wss: WebSocketServer) {
           sessionMode = clientConfig.mode || "panel";
           isCoachMode = sessionMode === "coach";
           isSoloMode = sessionMode === "solo";
+          const isResume = !!data.resume;
 
           // Verify that the user still exists in the database (prevents deleted users
           // from pitching via WebSocket since WS bypasses Express auth middleware).
@@ -647,9 +648,32 @@ export function initRestSocket(wss: WebSocketServer) {
           // self-records and the session is reviewed only afterward. Skip the
           // greeting entirely so the room opens silently (no pickGreeting, no
           // greeting audio). Coach and Panel still greet as Riley / Marcus.
+          // On resume (client reconnected after a refresh) the client is the
+          // source of truth for the transcript. Rebuild the panel's conversation
+          // memory from it so the AI keeps context, and skip the greeting so the
+          // room reopens mid-session instead of re-introducing the panel.
+          if (isResume && Array.isArray(data.transcript)) {
+            for (const m of data.transcript) {
+              const text = (m?.text || "").trim();
+              if (!text) continue;
+              if (m.type === "user") {
+                conversationHistory.push({ role: "user", text });
+              } else if (m.type === "ai") {
+                conversationHistory.push({ role: "assistant", text });
+              }
+            }
+            console.log(
+              `🔁 Resume — rebuilt ${conversationHistory.length} history turns, skipping greeting`,
+            );
+          }
+
           if (isSoloMode) {
             console.log(
               "🟢 Setup complete — solo practice mode (no live AI, opening silently)...",
+            );
+          } else if (isResume) {
+            console.log(
+              "🔁 Resume — panel will continue on the founder's next turn",
             );
           } else {
             console.log("🟢 Setup complete — triggering pitch introduction...");
