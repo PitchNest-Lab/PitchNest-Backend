@@ -48,8 +48,6 @@ router.get("/me", authMiddleware, async (req, res) => {
   // lookup fails transiently, fall back to the JWT identity so a healthy token
   // is never treated as logged-out — same liveness semantics as before.
   try {
-    // select("*") (never returning the password) keeps this resilient if the
-    // avatar_url / settings columns from migration 0003 aren't present yet.
     const { data: user } = await supabase
       .from("users")
       .select("*")

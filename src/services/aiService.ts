@@ -121,7 +121,7 @@ export function computeFounderPercentile(overallScore: number): number {
   return Math.min(99, Math.max(1, Math.round(pct)));
 }
 
-// ── Guard against unstated raise figures (FIX 1.3) ───────────────────────────
+// ── Guard against unstated raise figures ─────────────────────────────────────
 // The model sometimes invents a specific funding amount the founder never said
 // (e.g. "a $50M funding allocation"). We only allow a concrete raise figure to
 // survive if it actually appears in the transcript; otherwise it is rewritten to
@@ -320,7 +320,7 @@ function validateEvaluationReport(raw: any): EvaluationReport {
           strength: String(c.strength || ""),
           weakness: String(c.weakness || ""),
           // Figures are AI-estimated, not sourced — label them so they aren't
-          // mistaken for verified facts (see FIX 6A).
+          // mistaken for verified facts.
           size: (() => {
             const v = String(c.size || "").trim();
             if (!v || v.toUpperCase() === "N/A") return "N/A";

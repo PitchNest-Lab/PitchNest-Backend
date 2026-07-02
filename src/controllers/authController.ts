@@ -20,19 +20,12 @@ type Role = (typeof ALLOWED_ROLES)[number];
 const isValidRole = (value: unknown): value is Role =>
   typeof value === "string" && (ALLOWED_ROLES as readonly string[]).includes(value);
 
-// Sectors the AI-preferences panel offers. Kept server-side so `settings` can't
-// be populated with arbitrary values from the client.
 const ALLOWED_SECTORS = [
   "Venture Capital",
   "Angel Investor",
   "Strategic Corporate",
 ] as const;
 
-/**
- * Shape a raw `users` row into the safe object we return to the client. Never
- * includes the password hash. Maps the DB's snake_case `avatar_url` to the
- * `avatarUrl` the frontend expects, and always returns a `settings` object.
- */
 export function toPublicUser(u: any) {
   return {
     id: u?.id,
@@ -45,10 +38,6 @@ export function toPublicUser(u: any) {
   };
 }
 
-/**
- * Whitelist + coerce user-supplied settings so only known keys with valid types
- * are ever persisted. Unknown keys are dropped.
- */
 export function sanitizeSettings(input: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (!input || typeof input !== "object") return out;
@@ -283,13 +272,7 @@ export const updateMe = async (req: Request, res: Response) => {
   }
 };
 
-/**
- * PATCH /api/auth/settings — persist the authenticated user's app preferences
- * (notification toggles, AI "toughness", default sector). Values are whitelisted
- * server-side via {@link sanitizeSettings} and merged with any existing settings
- * so a partial update never drops unrelated keys. Requires the `settings` column
- * added in migration 0003.
- */
+// PATCH /api/auth/settings — persist whitelisted user preferences (needs migration 0003).
 export const updateSettings = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
@@ -608,8 +591,6 @@ async function purgeUserAccount(userId: number): Promise<void> {
     .select("video_url")
     .eq("user_id", userId);
 
-  // Best-effort avatar cleanup. The select is defensive: if the avatar_url column
-  // isn't present yet (migration 0003 not applied), this simply yields nothing.
   const { data: userRow } = await supabase
     .from("users")
     .select("avatar_url")

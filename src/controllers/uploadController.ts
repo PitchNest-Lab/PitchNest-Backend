@@ -36,12 +36,6 @@ export const uploadVideo = async (req: Request, res: Response) => {
   }
 };
 
-/**
- * POST /api/upload-avatar — store a user's profile image in Supabase Storage and
- * persist its public URL on the user row (users.avatar_url, migration 0003).
- * Replaces the old base64-in-localStorage approach so avatars are real, shared
- * across devices, and survive a cache clear. Returns { avatarUrl }.
- */
 export const uploadAvatar = async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No image file provided" });
