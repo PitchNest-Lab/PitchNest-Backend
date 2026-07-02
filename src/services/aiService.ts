@@ -106,7 +106,7 @@ export function computeOverallScore(scores: {
 
 /**
  * Deterministic percentile derived ONLY from the overall score, so it can never
- * contradict the score. Meaning: "scored higher than X% of founders".
+ * contradict the score. Meaning: "scored higher than X% of our readiness benchmark".
  * Piecewise-linear, anchored so AVERAGE_FOUNDER_SCORE → 50:
  *   score <= avg → 0..50   (below-average score is always a below-average percentile)
  *   score >  avg → 50..99

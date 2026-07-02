@@ -976,7 +976,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       }
       doc.font("Inter").fontSize(9).fillColor("#94a3b8").text("You scored higher than", 350, 255);
       doc.font("Inter-Bold").fontSize(18).fillColor(scoreAccentColor).text(isInsufficient ? "0%" : `${founderPercentile}%`, 350, 270);
-      doc.font("Inter").fontSize(8).fillColor("#94a3b8").text("of early-stage founders on PitchNest", 350, 292);
+      doc.font("Inter").fontSize(8).fillColor("#94a3b8").text("of PitchNest's readiness benchmark", 350, 292);
 
       // Category Scores
       doc.y = 370;
@@ -1331,14 +1331,14 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         });
       });
 
-      // Founder Benchmarking — Improved layout with card background
+      // Readiness Benchmark — score compared against our scoring rubric
       ty += 15;
       
       // Card background matching VC INVESTMENT PROBABILITY style
       doc.roundedRect(50, ty, 495, 140, 8).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
       doc.roundedRect(55, ty + 5, 485, 130, 6).fill(COLORS.indigoBg);
       
-      doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.primaryDark).text("BENCHMARKING AGAINST OTHER FOUNDERS", 65, ty + 15);
+      doc.font("Inter-Bold").fontSize(8.5).fillColor(COLORS.primaryDark).text("READINESS BENCHMARK", 65, ty + 15);
       
       // Gauge on its own WHITE card (matching the "Percentile Rank" card on the
       // right) so it reads as a distinct stat block instead of floating on the
@@ -1358,20 +1358,20 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       drawHalfGaugeChart(doc, benchCx, benchGaugeY, benchR, isInsufficient ? 0 : founderPercentile, "", COLORS.primary, 8, COLORS.dark, 17);
       doc.font("Inter-Bold").fontSize(6).fillColor(COLORS.textLight).text("0%", benchCx - benchR - 16, benchGaugeY - 3, { width: 14, align: "right" });
       doc.font("Inter-Bold").fontSize(6).fillColor(COLORS.textLight).text("100%", benchCx + benchR + 2, benchGaugeY - 3);
-      doc.font("Inter").fontSize(6).fillColor(COLORS.dark).text("of early-stage founders\non PitchNest", benchCardX + 4, benchGaugeY + 8, { width: benchCardW - 8, align: "center" });
+      doc.font("Inter").fontSize(6).fillColor(COLORS.dark).text("of PitchNest's\nreadiness benchmark", benchCardX + 4, benchGaugeY + 8, { width: benchCardW - 8, align: "center" });
 
       // Vertical Divider
       doc.moveTo(210, ty + 40).lineTo(210, ty + 125).strokeColor(COLORS.border).lineWidth(0.5).stroke();
 
       // Middle text
-      doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text("PitchNest analyzes thousands of founder pitches\nacross Africa and globally.", 225, ty + 35, { lineGap: 1.5 });
+      doc.font("Inter").fontSize(7.5).fillColor(COLORS.dark).text("Benchmarks reflect PitchNest's\ninvestor-readiness scoring rubric.", 225, ty + 35, { lineGap: 1.5 });
 
       // Horizontal bars on right
       const benchmarkData = [
         { label: "Your Overall Score", val: isInsufficient ? 0 : overallScore, color: COLORS.primary },
-        { label: "Average Score (All Founders)", val: AVERAGE_FOUNDER_SCORE, color: COLORS.textLight },
-        { label: "Top 25% Founders", val: 68, color: COLORS.textLight },
-        { label: "Top 10% Founders", val: 80, color: COLORS.textLight }
+        { label: "Readiness benchmark (average)", val: AVERAGE_FOUNDER_SCORE, color: COLORS.textLight },
+        { label: "Strong pitch benchmark", val: 68, color: COLORS.textLight },
+        { label: "Exceptional pitch benchmark", val: 80, color: COLORS.textLight }
       ];
 
       let barY = ty + 65;
@@ -1391,7 +1391,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       drawIcon(doc, "bar_chart", 488, ty + 70, 16, COLORS.primary);
       const topPct = isInsufficient ? 0 : founderPercentile;
       doc.font("Inter-Bold").fontSize(14).fillColor(COLORS.primaryDark).text(`${topPct}%`, 465, ty + 92, { width: 65, align: "center" });
-      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("scored higher than", 465, ty + 108, { width: 65, align: "center" });
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text("readiness benchmark", 465, ty + 108, { width: 65, align: "center" });
 
       // =======================================================================
       // PAGE 4 — COMPETITIVE LANDSCAPE
