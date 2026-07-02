@@ -27,6 +27,7 @@ const allowedOrigins = [
   'https://pitchnestapp.vercel.app',
   'https://www.pitchnest.app',
   'https://pitchnest.app',
+  ...config.corsExtraOrigins,
   ...(isProduction ? [] : ['http://localhost:5173', 'http://localhost:3000']),
 ].filter(Boolean);
 

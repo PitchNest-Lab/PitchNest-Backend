@@ -20,6 +20,60 @@ type Role = (typeof ALLOWED_ROLES)[number];
 const isValidRole = (value: unknown): value is Role =>
   typeof value === "string" && (ALLOWED_ROLES as readonly string[]).includes(value);
 
+// Sectors the AI-preferences panel offers. Kept server-side so `settings` can't
+// be populated with arbitrary values from the client.
+const ALLOWED_SECTORS = [
+  "Venture Capital",
+  "Angel Investor",
+  "Strategic Corporate",
+] as const;
+
+/**
+ * Shape a raw `users` row into the safe object we return to the client. Never
+ * includes the password hash. Maps the DB's snake_case `avatar_url` to the
+ * `avatarUrl` the frontend expects, and always returns a `settings` object.
+ */
+export function toPublicUser(u: any) {
+  return {
+    id: u?.id,
+    name: u?.name,
+    email: u?.email,
+    role: u?.role,
+    bio: u?.bio,
+    avatarUrl: u?.avatar_url ?? null,
+    settings: u?.settings ?? {},
+  };
+}
+
+/**
+ * Whitelist + coerce user-supplied settings so only known keys with valid types
+ * are ever persisted. Unknown keys are dropped.
+ */
+export function sanitizeSettings(input: unknown): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (!input || typeof input !== "object") return out;
+  const s = input as Record<string, any>;
+
+  if (s.notifications && typeof s.notifications === "object") {
+    out.notifications = {
+      pitchAlerts: !!s.notifications.pitchAlerts,
+      weeklyReport: !!s.notifications.weeklyReport,
+      investorInquiries: !!s.notifications.investorInquiries,
+    };
+  }
+  if (s.aiToughness !== undefined) {
+    const v = Number(s.aiToughness);
+    if (!Number.isNaN(v)) out.aiToughness = Math.min(100, Math.max(0, Math.round(v)));
+  }
+  if (
+    typeof s.activeSector === "string" &&
+    (ALLOWED_SECTORS as readonly string[]).includes(s.activeSector)
+  ) {
+    out.activeSector = s.activeSector;
+  }
+  return out;
+}
+
 /**
  * Signs a JWT token for the given user.
  */
@@ -157,13 +211,7 @@ export const login = async (req: Request, res: Response) => {
     const token = signToken({ id: user.id, email: user.email });
 
     res.status(200).json({
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        bio: user.bio,
-      },
+      user: toPublicUser(user),
       token,
     });
   } catch (error) {
@@ -221,25 +269,59 @@ export const updateMe = async (req: Request, res: Response) => {
       .from("users")
       .update(updates)
       .eq("id", userId)
-      .select("id, name, email, role, bio")
+      .select("*")
       .single();
 
     if (error || !updated) {
       return res.status(500).json({ error: "Failed to update profile." });
     }
 
-    res.status(200).json({
-      user: {
-        id: updated.id,
-        name: updated.name,
-        email: updated.email,
-        role: updated.role,
-        bio: updated.bio,
-      },
-    });
+    res.status(200).json({ user: toPublicUser(updated) });
   } catch (error) {
     console.error("updateMe error:", error);
     res.status(500).json({ error: "Failed to update profile." });
+  }
+};
+
+/**
+ * PATCH /api/auth/settings — persist the authenticated user's app preferences
+ * (notification toggles, AI "toughness", default sector). Values are whitelisted
+ * server-side via {@link sanitizeSettings} and merged with any existing settings
+ * so a partial update never drops unrelated keys. Requires the `settings` column
+ * added in migration 0003.
+ */
+export const updateSettings = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const clean = sanitizeSettings(req.body?.settings);
+
+    if (Object.keys(clean).length === 0) {
+      return res.status(400).json({ error: "No valid settings to update." });
+    }
+
+    const { data: existing } = await supabase
+      .from("users")
+      .select("settings")
+      .eq("id", userId)
+      .maybeSingle();
+
+    const merged = { ...(existing?.settings || {}), ...clean };
+
+    const { data: updated, error } = await supabase
+      .from("users")
+      .update({ settings: merged })
+      .eq("id", userId)
+      .select("settings")
+      .single();
+
+    if (error || !updated) {
+      return res.status(500).json({ error: "Failed to save settings." });
+    }
+
+    res.status(200).json({ settings: updated.settings });
+  } catch (error) {
+    console.error("updateSettings error:", error);
+    res.status(500).json({ error: "Failed to save settings." });
   }
 };
 
@@ -319,13 +401,7 @@ export const googleAuth = async (req: Request, res: Response) => {
 
     const token = signToken({ id: user.id, email: user.email });
     res.status(200).json({
-      user: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        bio: user.bio,
-      },
+      user: toPublicUser(user),
       token,
       // New (or not-yet-onboarded) Google users go through onboarding, exactly
       // like email users do after verifying. Returning users skip to dashboard.
@@ -389,7 +465,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
 
     try {
       const { data, error } = await resend.emails.send({
-        from: "PitchNest <hello@pitchnest.app>",
+        from: config.emailFrom,
         to: email,
         subject: "Reset your PitchNest password",
         html: `
@@ -474,13 +550,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
     const JwtToken = signToken({ id: user?.id, email: user?.email });
 
     res.json({
-      user: {
-        id: user?.id,
-        name: user?.name,
-        email: user?.email,
-        role: user?.role,
-        bio: user?.bio,
-      },
+      user: toPublicUser(user),
       token:JwtToken,
       message: "Email verified successfully",
       redirectTo: user?.onboardingCompleted ? "/dashboard" : "/onboarding",
@@ -519,7 +589,7 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
 /** Extract Supabase storage object path from a public URL, e.g. decks/foo.pdf */
 function storagePathFromUrl(url: string | null | undefined): string | null {
   if (!url || typeof url !== "string") return null;
-  const marker = "/pitchnest-media/";
+  const marker = `/${config.storageBucket}/`;
   const idx = url.indexOf(marker);
   if (idx === -1) return null;
   return url.slice(idx + marker.length).split("?")[0] || null;
@@ -538,6 +608,14 @@ async function purgeUserAccount(userId: number): Promise<void> {
     .select("video_url")
     .eq("user_id", userId);
 
+  // Best-effort avatar cleanup. The select is defensive: if the avatar_url column
+  // isn't present yet (migration 0003 not applied), this simply yields nothing.
+  const { data: userRow } = await supabase
+    .from("users")
+    .select("avatar_url")
+    .eq("id", userId)
+    .maybeSingle();
+
   const storagePaths = new Set<string>();
   for (const deck of decks || []) {
     const path = storagePathFromUrl(deck.file_url);
@@ -547,10 +625,12 @@ async function purgeUserAccount(userId: number): Promise<void> {
     const path = storagePathFromUrl(session.video_url);
     if (path) storagePaths.add(path);
   }
+  const avatarPath = storagePathFromUrl(userRow?.avatar_url);
+  if (avatarPath) storagePaths.add(avatarPath);
 
   if (storagePaths.size > 0) {
     const { error: storageError } = await supabase.storage
-      .from("pitchnest-media")
+      .from(config.storageBucket)
       .remove([...storagePaths]);
     if (storageError) {
       console.warn("⚠️ Storage cleanup partial failure:", storageError.message);

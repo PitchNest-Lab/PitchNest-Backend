@@ -19,7 +19,28 @@ export const config = {
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   nodeEnv: process.env.NODE_ENV || "development",
+  // Sender identity for transactional email (verification / password reset).
+  emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
+  // Supabase Storage bucket that holds uploaded media (decks, videos, avatars).
+  storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
+  // Extra CORS origins (comma-separated) merged with the built-in defaults so new
+  // deploy domains can be allowed without a code change.
+  corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean),
 };
+
+// In production the JWT secret must be provided explicitly — the built-in dev
+// default is public, so anyone could forge auth tokens for any account. We warn
+// loudly rather than crash the process, so a missing var can never take the
+// live API down; set JWT_SECRET on the server to silence this and be secure.
+if (config.nodeEnv === "production" && !process.env.JWT_SECRET) {
+  console.error(
+    "🚨 SECURITY: JWT_SECRET is not set in production — using the INSECURE development default. " +
+      "Anyone can forge login tokens until you set JWT_SECRET in the server environment.",
+  );
+}
 
 export function hasGoogleAuthConfig(): boolean {
   return !!config.googleClientId;

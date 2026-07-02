@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
+import { config } from "../config/env.ts";
 import { uploadDir } from "../services/storageService.ts";
 import path from "path";
 import fs from "fs";
@@ -36,7 +37,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
     }
 
     const { data, error } = await supabase.storage
-      .from("pitchnest-media")
+      .from(config.storageBucket)
       .upload(filePath, req.file.buffer, {
         contentType: req.file.mimetype,
         duplex: 'half'
@@ -51,7 +52,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
       publicUrl = `/uploads/${localFileName}`;
     } else {
       const { data: { publicUrl: pUrl } } = supabase.storage
-        .from("pitchnest-media")
+        .from(config.storageBucket)
         .getPublicUrl(filePath);
       publicUrl = pUrl;
     }

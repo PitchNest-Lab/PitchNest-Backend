@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
+import { config } from "../config/env.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -37,7 +38,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
 
   try {
     const { data, error } = await resend.emails.send({
-      from: "PitchNest <hello@pitchnest.app>", // Update with your verified domain
+      from: config.emailFrom,
       to: email,
       subject: "Verify your PitchNest account",
       html: `

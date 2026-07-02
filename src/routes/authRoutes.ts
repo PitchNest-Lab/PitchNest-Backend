@@ -5,6 +5,8 @@ import {
   login,
   googleAuth,
   updateMe,
+  updateSettings,
+  toPublicUser,
   wipeDb,
   forgotPassword,
   resetPassword,
@@ -46,19 +48,17 @@ router.get("/me", authMiddleware, async (req, res) => {
   // lookup fails transiently, fall back to the JWT identity so a healthy token
   // is never treated as logged-out — same liveness semantics as before.
   try {
+    // select("*") (never returning the password) keeps this resilient if the
+    // avatar_url / settings columns from migration 0003 aren't present yet.
     const { data: user } = await supabase
       .from("users")
-      .select("id, name, email, role, bio, isEmailVerified")
+      .select("*")
       .eq("id", req.user!.id)
       .maybeSingle();
 
     if (user) {
       return res.json({
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        role: user.role,
-        bio: user.bio,
+        ...toPublicUser(user),
         isEmailVerified: user.isEmailVerified,
       });
     }
@@ -69,6 +69,7 @@ router.get("/me", authMiddleware, async (req, res) => {
 });
 
 router.patch("/me", authMiddleware, updateMe);
+router.patch("/settings", authMiddleware, updateSettings);
 
 router.delete("/account", authMiddleware, authLimiter, deleteAccount);
 router.post("/delete-account", authLimiter, deleteAccountByCredentials);
