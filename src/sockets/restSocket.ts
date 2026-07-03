@@ -48,10 +48,67 @@ const COACH_GREETINGS = [
   "Welcome to the Nest — I'm Riley, your coach. Kick off {b} whenever you're ready.",
 ];
 
-function pickGreeting(isCoach: boolean, businessName: string): string {
-  const pool = isCoach ? COACH_GREETINGS : PANEL_GREETINGS;
+// Re-pitch greetings: the founder has pitched {b} to us before and chose
+// "Pitch Again", so the panel acknowledges the return instead of a cold open.
+const PANEL_GREETINGS_RETURN = [
+  "Welcome back to the Nest — we remember {b}. Show us what's changed since last time.",
+  "Good to see you again. The panel remembers your last pitch for {b} — let's see how it's evolved.",
+  "Welcome back — {b} left us with questions last time. The floor is yours whenever you're ready.",
+  "Back in the Nest. We've kept our notes on {b}, so pick it up whenever you're ready.",
+];
+const COACH_GREETINGS_RETURN = [
+  "Welcome back to the Nest — I'm glad you returned. Let's pick up where we left off with {b}.",
+  "Good to have you back. I remember our last session on {b} — show me what you've improved.",
+  "Welcome back — I've still got my notes on {b}. Start whenever you're ready and we'll build on last time.",
+];
+
+function pickGreeting(
+  isCoach: boolean,
+  businessName: string,
+  isReturning = false,
+): string {
+  const pool = isReturning
+    ? isCoach
+      ? COACH_GREETINGS_RETURN
+      : PANEL_GREETINGS_RETURN
+    : isCoach
+      ? COACH_GREETINGS
+      : PANEL_GREETINGS;
   const line = pool[Math.floor(Math.random() * pool.length)];
   return line.replace("{b}", businessName || "your startup");
+}
+
+// Clamp the client-supplied previous-session context to a compact, trusted
+// shape. The WS bypasses Express auth, so nothing from the client is trusted
+// as-is: strings are truncated, numbers coerced, arrays capped.
+function clampPreviousSession(raw: any): {
+  sessionId: number;
+  date: string;
+  overallScore: number;
+  scores: { delivery: number; clarity: number; scalability: number; readiness: number };
+  summary: string;
+  topRisks: string[];
+} | null {
+  if (!raw || typeof raw !== "object") return null;
+  const num = (v: any) => {
+    const n = Math.round(Number(v));
+    return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0;
+  };
+  return {
+    sessionId: Number(raw.sessionId) || 0,
+    date: String(raw.date || "").slice(0, 40),
+    overallScore: num(raw.overallScore),
+    scores: {
+      delivery: num(raw.scores?.delivery),
+      clarity: num(raw.scores?.clarity),
+      scalability: num(raw.scores?.scalability),
+      readiness: num(raw.scores?.readiness),
+    },
+    summary: String(raw.summary || "").slice(0, 400),
+    topRisks: (Array.isArray(raw.topRisks) ? raw.topRisks : [])
+      .slice(0, 3)
+      .map((r: any) => String(r || "").slice(0, 140)),
+  };
 }
 
 // Yields a fixed string as a single chunk so a canned line (e.g. the greeting)
@@ -175,6 +232,12 @@ export function initRestSocket(wss: WebSocketServer) {
     let isCoachMode = false;
     let isSoloMode = false;
     let sessionMode = "panel";
+    // Re-pitch: compact setup snapshot saved with the session so future
+    // "Pitch Again" clicks can prefill the setup form; parent link + clamped
+    // previous-attempt context when this session IS a re-pitch.
+    let pitchConfigSnapshot: any = null;
+    let parentSessionId: number | null = null;
+    let previousSessionCtx: ReturnType<typeof clampPreviousSession> = null;
     let sttRecognizer: StreamingRecognizer | null = null;
 
     const conversationHistory: any[] = [];
@@ -368,7 +431,7 @@ export function initRestSocket(wss: WebSocketServer) {
         // sentence/TTS pipeline via singleChunkStream.
         const stream = turn.isGreeting
           ? singleChunkStream(
-              `${isCoachMode ? "Riley" : "Marcus"}: ${pickGreeting(isCoachMode, currentBusinessName)}`,
+              `${isCoachMode ? "Riley" : "Marcus"}: ${pickGreeting(isCoachMode, currentBusinessName, !!previousSessionCtx)}`,
             )
           : streamPanelResponse(
               userInputToUse,
@@ -644,6 +707,54 @@ export function initRestSocket(wss: WebSocketServer) {
             }
           }
 
+          // Compact setup snapshot stored with the session row so a future
+          // "Pitch Again" can prefill the setup form. Deliberately excludes
+          // deck text — only ids/names, keeping the row small.
+          pitchConfigSnapshot = {
+            mode: sessionMode,
+            businessName: currentBusinessName,
+            description: clientConfig.description || "",
+            industry: clientConfig.industry || "",
+            investorArchetype: clientConfig.investorArchetype || "",
+            fundingStage: clientConfig.fundingStage || "",
+            aggressiveness: clientConfig.aggressiveness ?? null,
+            riskAppetite: clientConfig.riskAppetite ?? null,
+            duration: clientConfig.duration ?? null,
+            deckId: clientConfig.selectedDeck?.id ?? null,
+            deckName: clientConfig.selectedDeck?.name ?? null,
+          };
+
+          // Re-pitch context. The client claims which session this re-pitch
+          // continues from; verify the parent actually belongs to this user
+          // before trusting it (WS bypasses Express auth), and clamp the
+          // previous-session payload to a small fixed shape.
+          parentSessionId = Number(clientConfig.parentSessionId) || null;
+          previousSessionCtx = clampPreviousSession(clientConfig.previousSession);
+          if (parentSessionId && currentUserId) {
+            const { data: parentRow } = await supabase
+              .from("sessions")
+              .select("id")
+              .eq("id", parentSessionId)
+              .eq("user_id", currentUserId)
+              .maybeSingle();
+            if (!parentRow) {
+              console.warn(
+                `⚠️ Re-pitch parent session ${parentSessionId} not owned by user — ignoring re-pitch context.`,
+              );
+              parentSessionId = null;
+              previousSessionCtx = null;
+            }
+          } else if (parentSessionId && !currentUserId) {
+            // Anonymous sessions can't prove ownership of a previous session.
+            parentSessionId = null;
+            previousSessionCtx = null;
+          }
+          if (previousSessionCtx) {
+            console.log(
+              `🔁 Re-pitch of session ${parentSessionId} (prev score ${previousSessionCtx.overallScore}) — panel will welcome the founder back.`,
+            );
+          }
+
           // Solo (practice) mode has no live AI interaction at all — the founder
           // self-records and the session is reviewed only afterward. Skip the
           // greeting entirely so the room opens silently (no pickGreeting, no
@@ -689,7 +800,11 @@ export function initRestSocket(wss: WebSocketServer) {
             .then((text) => {
               resolvedDeckText = text;
               if (isSoloMode) return;
-              const enrichedConfig = { ...clientConfig, resolvedDeckText };
+              const enrichedConfig = {
+                ...clientConfig,
+                resolvedDeckText,
+                previousSession: previousSessionCtx,
+              };
               masterPrompt = getMasterPrompt(
                 isCoachMode,
                 currentBusinessName,
@@ -935,6 +1050,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 currentBusinessName,
                 resolvedDeckText,
                 sessionMode,
+                previousSessionCtx,
               ).catch((err) => {
                 console.error("❌ Background evaluation failed:", err);
                 return null;
@@ -992,6 +1108,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 currentBusinessName,
                 resolvedDeckText,
                 sessionMode,
+                previousSessionCtx,
               );
             }
             reportData = {
@@ -1007,6 +1124,21 @@ export function initRestSocket(wss: WebSocketServer) {
               "We could not generate a full evaluation right now. Your session was saved — try again or contact support if this persists.";
           }
 
+          // Persist the session mode both as a real column (for filtering) and
+          // inside evaluation_report (back-compat with rows that predate the column).
+          reportData.mode = sessionMode;
+
+          // Re-pitch: snapshot the previous attempt's numbers into the report so
+          // the frontend/PDF compute score deltas deterministically (never the LLM).
+          if (previousSessionCtx) {
+            reportData.previous_attempt = {
+              sessionId: parentSessionId,
+              date: previousSessionCtx.date,
+              overallScore: previousSessionCtx.overallScore,
+              scores: previousSessionCtx.scores,
+            };
+          }
+
           sessionId = 0;
           let shareId = crypto.randomUUID();
           try {
@@ -1016,14 +1148,34 @@ export function initRestSocket(wss: WebSocketServer) {
               evaluation_report: reportData,
               video_url: currentVideoUrl,
               share_id: shareId,
+              mode: sessionMode,
+              pitch_config: pitchConfigSnapshot,
+              parent_session_id: parentSessionId,
             };
             if (currentUserId) insertPayload.user_id = currentUserId;
 
-            const { data: dbData, error: dbError } = await supabase
+            let { data: dbData, error: dbError } = await supabase
               .from("sessions")
               .insert([insertPayload])
               .select()
               .single();
+
+            // Rollout safety: if the new columns (mode / pitch_config /
+            // parent_session_id) don't exist yet in Supabase, retry without
+            // them rather than losing the session entirely.
+            if (dbError && /column|schema/i.test(dbError.message || "")) {
+              console.warn(
+                "⚠️ Session insert failed (possibly missing new columns) — retrying with legacy payload:",
+                dbError.message,
+              );
+              const { mode, pitch_config, parent_session_id, ...legacyPayload } =
+                insertPayload;
+              ({ data: dbData, error: dbError } = await supabase
+                .from("sessions")
+                .insert([legacyPayload])
+                .select()
+                .single());
+            }
 
             if (!dbError && dbData) {
               sessionId = dbData.id;

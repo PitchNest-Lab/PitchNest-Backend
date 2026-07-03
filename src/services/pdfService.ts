@@ -731,6 +731,11 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
 
       const businessName = session?.business_name || "My Startup";
       const formattedDate = formatDate(session?.created_at || session?.timestamp);
+      const sessionMode = session?.mode || report.mode || "panel";
+      const sessionTypeLabel =
+        sessionMode === "coach" ? "AI Coach Session"
+        : sessionMode === "solo" ? "Solo Practice"
+        : "AI VC Panel";
       const strengths: string[] = Array.isArray(report.strengths) && report.strengths.length > 0
         ? report.strengths
         : [
@@ -939,7 +944,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       }
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.white).text("PITCHNEST", 84, 26);
       doc.font("Inter-Bold").fontSize(22).fillColor(COLORS.white).text(businessName, 50, 50);
-      doc.font("Inter").fontSize(9).fillColor("#94a3b8").text(`Pitch Date: ${formattedDate}   |   Session Type: AI VC Panel`, 50, 82);
+      doc.font("Inter").fontSize(9).fillColor("#94a3b8").text(`Pitch Date: ${formattedDate}   |   Session Type: ${sessionTypeLabel}`, 50, 82);
 
       // Verdict Box
       const verdict = getVerdict(overallScore, isInsufficient);
@@ -977,6 +982,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(9).fillColor("#94a3b8").text("You scored higher than", 350, 255);
       doc.font("Inter-Bold").fontSize(18).fillColor(scoreAccentColor).text(isInsufficient ? "0%" : `${founderPercentile}%`, 350, 270);
       doc.font("Inter").fontSize(8).fillColor("#94a3b8").text("of PitchNest's readiness benchmark", 350, 292);
+
+      // Re-pitch: score change vs the previous attempt (server-computed snapshot).
+      if (report.previous_attempt && !isInsufficient) {
+        const prevOverall = Math.round(Number(report.previous_attempt.overallScore) || 0);
+        const delta = overallScore - prevOverall;
+        const deltaColor = delta >= 0 ? COLORS.emerald : COLORS.rose;
+        doc.font("Inter-Bold").fontSize(9).fillColor(deltaColor)
+          .text(`vs previous attempt: ${prevOverall} → ${overallScore} (${delta >= 0 ? "+" : ""}${delta})`, 350, 310);
+      }
 
       // Category Scores
       doc.y = 370;
@@ -1919,6 +1933,177 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.switchToPage(i);
         drawFooter(doc, i + 1, totalPages);
       }
+
+      doc.end();
+    } catch (err) {
+      reject(err);
+    }
+  });
+}
+
+// ── Deck Check PDF ────────────────────────────────────────────────────────────
+// Report for a static deck-only audit. Clearly labelled as a document audit —
+// no live pitch session took place — so it can never be confused with a
+// session readiness report.
+export async function generateDeckAuditPDF(audit: any, deckName: string): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    try {
+      const doc = new PDFDocument({
+        bufferPages: true,
+        size: "A4",
+        margins: { top: 50, bottom: 50, left: 50, right: 50 },
+        info: {
+          Title: `PitchNest Deck Check — ${deckName || "Deck"}`,
+          Author: "PitchNest",
+          Subject: "Deck Check — Uploaded Deck Report",
+        },
+      });
+
+      try {
+        doc.registerFont("Inter", FONT_REGULAR);
+        doc.registerFont("Inter-Bold", FONT_BOLD);
+      } catch {
+        doc.registerFont("Inter", "Helvetica");
+        doc.registerFont("Inter-Bold", "Helvetica-Bold");
+      }
+
+      const chunks: Buffer[] = [];
+      doc.on("data", (chunk: Buffer) => chunks.push(chunk));
+      doc.on("end", () => resolve(Buffer.concat(chunks)));
+      doc.on("error", reject);
+
+      const report = audit?.report || {};
+      const score = clamp(report.fundability_score);
+      const verdict: string = ["Invest", "Watch", "Pass"].includes(report.verdict)
+        ? report.verdict
+        : "Watch";
+      const verdictColor =
+        verdict === "Invest" ? COLORS.emerald : verdict === "Pass" ? COLORS.rose : COLORS.amber;
+      const formattedDate = formatDate(audit?.created_at);
+      const strengths: string[] = Array.isArray(report.strengths) ? report.strengths : [];
+      const weaknesses: string[] = Array.isArray(report.weaknesses) ? report.weaknesses : [];
+      const risks: string[] = Array.isArray(report.risks) ? report.risks : [];
+      const vcConcerns: string[] = Array.isArray(report.vc_concerns) ? report.vc_concerns : [];
+      const redFlags: any[] = Array.isArray(report.red_flags) ? report.red_flags : [];
+      const sections: any[] = Array.isArray(report.sections) ? report.sections : [];
+
+      // ── Hero band ──────────────────────────────────────────────────────────
+      doc.rect(0, 0, doc.page.width, 130).fill(COLORS.primaryDark);
+      try {
+        doc.image(LOGO_PATH, 50, 22, { width: 28, height: 28 });
+      } catch {
+        doc.roundedRect(50, 24, 24, 24, 4).fill(COLORS.primary);
+        doc.font("Inter-Bold").fontSize(14).fillColor(COLORS.white).text("P", 50, 28, { width: 24, align: "center" });
+      }
+      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.white).text("PITCHNEST", 84, 26);
+      doc.font("Inter-Bold").fontSize(20).fillColor(COLORS.white).text("Deck Check — Uploaded Deck Report", 50, 52);
+      doc.font("Inter").fontSize(9).fillColor("#94a3b8")
+        .text(`Deck: ${deckName || "Untitled Deck"}   |   Audited: ${formattedDate}`, 50, 82);
+      doc.font("Inter").fontSize(8).fillColor("#94a3b8")
+        .text("AI audit of the uploaded deck document. No live pitch session took place.", 50, 100);
+
+      // ── Verdict + one-liner (left) / fundability score (right) ─────────────
+      doc.rect(50, 150, 300, 90).lineWidth(1.5).fillAndStroke(COLORS.bgLight, verdictColor);
+      doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.textLight).text("ANALYST VERDICT", 65, 162);
+      doc.font("Inter-Bold").fontSize(16).fillColor(verdictColor).text(verdict.toUpperCase(), 65, 176);
+      const oneLiner = fitTextBySentence(doc, report.one_liner || "", 270, "Inter", 8.5, 3, 2);
+      doc.font("Inter").fontSize(8.5).fillColor(COLORS.text).text(oneLiner, 65, 200, { width: 270, lineGap: 2 });
+
+      doc.rect(370, 150, 175, 90).fill(COLORS.primaryDark);
+      doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.secondary).text("FUNDABILITY SCORE", 385, 162);
+      const scoreColor = score >= 70 ? COLORS.emerald : score >= 45 ? COLORS.amber : COLORS.rose;
+      doc.font("Inter-Bold").fontSize(30).fillColor(COLORS.white).text(`${score}`, 385, 178);
+      doc.font("Inter").fontSize(10).fillColor(COLORS.textLight).text("/ 100", 430, 194);
+      doc.roundedRect(385, 218, 145, 6, 3).fill("#475569");
+      if (score > 0) {
+        doc.roundedRect(385, 218, Math.max(8, (score / 100) * 145), 6, 3).fill(scoreColor);
+      }
+
+      // ── Strengths / Weaknesses two-column ──────────────────────────────────
+      doc.y = 260;
+      const colW = 240;
+      const listBlock = (
+        title: string,
+        items: string[],
+        x: number,
+        y: number,
+        color: string,
+      ): number => {
+        doc.font("Inter-Bold").fontSize(9).fillColor(color).text(title.toUpperCase(), x, y);
+        let cy2 = y + 16;
+        for (const item of items.slice(0, 5)) {
+          const t = fitText(doc, item, colW - 12, "Inter", 8, 3, 1.5);
+          const h = doc.heightOfString(t, { width: colW - 12, lineGap: 1.5 });
+          doc.circle(x + 2.5, cy2 + 4, 2).fill(color);
+          doc.font("Inter").fontSize(8).fillColor(COLORS.text).text(t, x + 12, cy2, { width: colW - 12, lineGap: 1.5 });
+          cy2 += h + 7;
+        }
+        return cy2;
+      };
+      const sEnd = listBlock("Strengths", strengths, 50, doc.y, COLORS.emerald);
+      const wEnd = listBlock("Weaknesses", weaknesses, 50 + colW + 25, doc.y, COLORS.rose);
+      doc.y = Math.max(sEnd, wEnd) + 12;
+
+      // ── Section coverage ───────────────────────────────────────────────────
+      if (sections.length > 0) {
+        ensureSpace(doc, 40 + sections.length * 20, "Deck Check");
+        doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.dark).text("SECTION COVERAGE", 50, doc.y);
+        let y = doc.y + 8;
+        const secCols = [110, 70, 315];
+        y = drawTableRow(doc, 50, y, secCols, [
+          { text: "SECTION", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+          { text: "STATUS", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+          { text: "NOTE", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+        ], { fill: COLORS.dark });
+        for (const s of sections) {
+          const statusColor =
+            s.status === "strong" ? COLORS.emerald : s.status === "missing" ? COLORS.rose : COLORS.amber;
+          y = drawTableRow(doc, 50, y, secCols, [
+            { text: String(s.section || ""), font: "Inter-Bold", fontSize: 7.5 },
+            { text: String(s.status || "").toUpperCase(), font: "Inter-Bold", fontSize: 7.5, color: statusColor },
+            { text: String(s.note || ""), fontSize: 7.5 },
+          ], { border: COLORS.border });
+        }
+        doc.y = y + 14;
+      }
+
+      // ── Red flags ──────────────────────────────────────────────────────────
+      if (redFlags.length > 0) {
+        ensureSpace(doc, 60 + redFlags.length * 34, "Deck Check");
+        doc.font("Inter-Bold").fontSize(9).fillColor(COLORS.dark).text("RED FLAGS & FIXES", 50, doc.y);
+        let y = doc.y + 8;
+        const flagCols = [130, 180, 185];
+        y = drawTableRow(doc, 50, y, flagCols, [
+          { text: "FLAG", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+          { text: "WHY A VC CARES", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+          { text: "FIX", font: "Inter-Bold", fontSize: 7, color: COLORS.white },
+        ], { fill: COLORS.rose });
+        for (const f of redFlags) {
+          y = drawTableRow(doc, 50, y, flagCols, [
+            { text: String(f.flag || ""), font: "Inter-Bold", fontSize: 7.5, color: COLORS.rose },
+            { text: String(f.why || ""), fontSize: 7.5 },
+            { text: String(f.fix || ""), fontSize: 7.5, color: COLORS.emerald },
+          ], { border: COLORS.border, fill: COLORS.roseBg });
+        }
+        doc.y = y + 14;
+      }
+
+      // ── Risks + VC concerns ────────────────────────────────────────────────
+      if (risks.length > 0 || vcConcerns.length > 0) {
+        ensureSpace(doc, 120, "Deck Check");
+        const y0 = doc.y;
+        const rEnd = risks.length > 0 ? listBlock("Risks", risks, 50, y0, COLORS.amber) : y0;
+        const cEnd = vcConcerns.length > 0 ? listBlock("VC Concerns", vcConcerns, 50 + colW + 25, y0, COLORS.indigo) : y0;
+        doc.y = Math.max(rEnd, cEnd) + 10;
+      }
+
+      // ── Footer ─────────────────────────────────────────────────────────────
+      doc.font("Inter").fontSize(7).fillColor(COLORS.textLight).text(
+        "Generated by PitchNest Deck Check — an AI audit of the uploaded deck document only. Run a live pitch session for a full readiness report.",
+        50,
+        doc.page.height - 60,
+        { width: 495, align: "center" },
+      );
 
       doc.end();
     } catch (err) {

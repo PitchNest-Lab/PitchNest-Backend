@@ -481,6 +481,28 @@ function buildToneDirective(aggressiveness: number, riskAppetite: number): strin
   return `TONE: ${tone}\nRISK LENS: ${risk}`;
 }
 
+/**
+ * Prompt block injected when the founder is re-pitching a startup they already
+ * pitched here before ("Pitch Again"). Gives the panel/coach compact memory of
+ * the previous attempt so they can welcome the founder back and probe whether
+ * the old weaknesses were fixed — without carrying the full old transcript.
+ */
+function buildReturningFounderBlock(previousSession: any, businessName: string): string {
+  if (!previousSession) return "";
+  const risks = Array.isArray(previousSession.topRisks) ? previousSession.topRisks : [];
+  const riskLines = risks.map((r: string) => `- ${r}`).join("\n");
+  return `
+RETURNING FOUNDER CONTEXT:
+This founder has pitched ${businessName} to this panel before (on ${previousSession.date || "a previous session"}, overall score ${previousSession.overallScore}/100).
+Last session summary: ${previousSession.summary || "(no summary available)"}
+Biggest weaknesses last time:
+${riskLines || "- (none recorded)"}
+- Treat them as a returning founder: acknowledge the return naturally in conversation.
+- Probe specifically whether the previous weaknesses above were fixed — reference them conversationally ("Last time you struggled to justify your market size...").
+- Do NOT recite the old score or read the summary back verbatim.
+`;
+}
+
 function buildArchetypeDirective(archetype: string): string {
   if (archetype?.includes("Angel")) {
     return "PANEL STYLE: Warm angel group. Lead with encouragement, then dig into founder-market fit and early traction.";
@@ -524,6 +546,7 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
   const extractedDeckText = configData.selectedDeck?.extracted_text || configData.resolvedDeckText || "";
   const deckContext = buildDeckContext(deckName, extractedDeckText);
   const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
+  const returningBlock = buildReturningFounderBlock(configData.previousSession, currentBusinessName);
 
   if (isCoach) {
     return `${OUTPUT_RULES}
@@ -540,7 +563,7 @@ STARTUP CONTEXT:
 ${deckContext}
 
 ${toneBlock}
-` + `
+${returningBlock}` + `
 SESSION FLOW:
 1. OPENING (your first turn only): Welcome the founder warmly. Mention one specific detail from their deck or concept. Invite them to deliver their opening pitch.
 2. LISTENING: Stay quiet while they present. Do not interrupt or coach until they finish, say "that's my pitch", or ask for feedback.
@@ -567,7 +590,7 @@ ${deckContext}
 
 ${buildArchetypeDirective(archetype)}
 ${toneBlock}
-
+${returningBlock}
 SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
 - ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their one question, STOP IMMEDIATELY.
@@ -638,7 +661,14 @@ export async function evaluatePitch(
   transcript: any[],
   businessName: string,
   deckText?: string,
-  mode: string = "panel"
+  mode: string = "panel",
+  previous?: {
+    date?: string;
+    overallScore: number;
+    scores: { delivery: number; clarity: number; scalability: number; readiness: number };
+    summary: string;
+    topRisks: string[];
+  } | null
 ): Promise<EvaluationReport> {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => {
@@ -653,6 +683,17 @@ export async function evaluatePitch(
 
   const deckSection = deckText?.trim()
     ? `\nPITCH DECK CONTENT (compare against what founder said):\n${deckText.trim().slice(0, 4000)}\n`
+    : "";
+
+  // Re-pitch: give the evaluator compact context on the previous attempt so the
+  // written feedback can note improvement/regression. Numeric deltas are computed
+  // in code from previous_attempt, never by the model.
+  const previousSection = previous
+    ? `\nPREVIOUS ATTEMPT (context only — this founder pitched ${businessName} before, on ${previous.date || "an earlier date"}; overall score ${previous.overallScore}/100):
+Last attempt's summary: ${previous.summary || "(none)"}
+Last attempt's biggest weaknesses:
+${(previous.topRisks || []).map((r) => `- ${r}`).join("\n") || "- (none recorded)"}
+RE-PITCH RULE: In the summary and category_matrix, explicitly note where this attempt improved on or regressed from the previous weaknesses above. Judge THIS session's content on its own merits — do not copy the old scores.\n`
     : "";
 
   const isCoachOrSolo = mode === "coach" || mode === "solo";
@@ -673,7 +714,7 @@ export async function evaluatePitch(
   const coachPrompt = `${coachIntro}
 
 BUSINESS: ${businessName}
-${deckSection}
+${deckSection}${previousSection}
 SESSION TRANSCRIPT:
 ${transcriptText}
 
@@ -709,7 +750,7 @@ Return this exact JSON structure:
   // Faster than one 4096-token monolith (the calls run in parallel), and a parse
   // failure in one section no longer forces the entire report to regenerate.
   const panelCtx = `BUSINESS: ${businessName}
-${deckSection}
+${deckSection}${previousSection}
 TRANSCRIPT:
 ${transcriptText}`;
 
@@ -824,38 +865,12 @@ Return this exact JSON structure:
   "practice_plan": [ { "title": "Step tied to weak area", "seconds": "10 sec", "desc": "One concrete instruction for this pitch" }, { "title": "Step 2", "seconds": "10 sec", "desc": "One concrete instruction" }, { "title": "Step 3", "seconds": "10 sec", "desc": "One concrete instruction" } ]
 }`;
 
-  // One JSON call with a single fast retry. Before regenerating, we try to
-  // repair the response (strip code fences / surrounding prose) so a minor
-  // formatting hiccup doesn't cost a whole extra round-trip.
-  const callJSON = async (prompt: string, maxTokens: number, label: string): Promise<any> => {
-    const openai = getOpenAIClient();
-    let lastErr: any;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const response = await openai.chat.completions.create({
-          model: config.azureOpenAiDeployment || "gpt-4o",
-          messages: [{ role: "user", content: prompt }],
-          temperature: 0.15,
-          max_tokens: maxTokens,
-          response_format: { type: "json_object" },
-        });
-        const rawText = response.choices[0]?.message?.content?.trim() || "";
-        if (!rawText) throw new Error("empty response");
-        return parseJsonLoose(rawText);
-      } catch (err: any) {
-        lastErr = err;
-        console.error(`❌ Evaluation call "${label}" failed (attempt ${attempt}):`, err.message);
-      }
-    }
-    throw lastErr;
-  };
-
   const stated = extractStatedFigures(transcriptText);
   const finalize = (raw: any) =>
     validateEvaluationReport(scrubReportRaiseFigures(raw, stated));
 
   if (isCoachOrSolo) {
-    return finalize(await callJSON(coachPrompt, 2048, "coach"));
+    return finalize(await callJsonModel(coachPrompt, 2048, "coach"));
   }
 
   // Run the three panel sections concurrently. The core (scored) section is
@@ -864,12 +879,39 @@ Return this exact JSON structure:
   // gracefully: a failure leaves those fields absent and the PDF falls back to
   // its defaults rather than failing the whole report.
   const [core, intel, plan] = await Promise.all([
-    callJSON(corePrompt, 2048, "core"),
-    callJSON(intelPrompt, 1600, "intel").catch(() => ({})),
-    callJSON(planPrompt, 1400, "plan").catch(() => ({})),
+    callJsonModel(corePrompt, 2048, "core"),
+    callJsonModel(intelPrompt, 1600, "intel").catch(() => ({})),
+    callJsonModel(planPrompt, 1400, "plan").catch(() => ({})),
   ]);
 
   return finalize({ ...core, ...intel, ...plan });
+}
+
+// One JSON-mode model call with a single fast retry. Before regenerating, we
+// try to repair the response (strip code fences / surrounding prose) so a minor
+// formatting hiccup doesn't cost a whole extra round-trip. Shared by the pitch
+// evaluation sections and the deck audit.
+async function callJsonModel(prompt: string, maxTokens: number, label: string): Promise<any> {
+  const openai = getOpenAIClient();
+  let lastErr: any;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const response = await openai.chat.completions.create({
+        model: config.azureOpenAiDeployment || "gpt-4o",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.15,
+        max_tokens: maxTokens,
+        response_format: { type: "json_object" },
+      });
+      const rawText = response.choices[0]?.message?.content?.trim() || "";
+      if (!rawText) throw new Error("empty response");
+      return parseJsonLoose(rawText);
+    } catch (err: any) {
+      lastErr = err;
+      console.error(`❌ Evaluation call "${label}" failed (attempt ${attempt}):`, err.message);
+    }
+  }
+  throw lastErr;
 }
 
 // Tolerant JSON parser: handles a clean object, a ```json fenced block, or an
@@ -1088,4 +1130,113 @@ export async function checkApiKeyStatus(): Promise<void> {
   } catch (err: any) {
     console.error("\n⚠️ Failed to connect to OpenAI API during startup check:", err.message, "\n");
   }
+}
+
+// ── Deck Check: static deck-only audit (no live session) ─────────────────────
+
+export interface DeckAuditReport {
+  verdict: "Invest" | "Watch" | "Pass";
+  one_liner: string;
+  fundability_score: number;
+  strengths: string[];
+  weaknesses: string[];
+  risks: string[];
+  vc_concerns: string[];
+  red_flags: Array<{ flag: string; why: string; fix: string }>;
+  sections: Array<{ section: string; status: "strong" | "weak" | "missing"; note: string }>;
+}
+
+const DECK_AUDIT_TEXT_LIMIT = 12000;
+const DECK_SECTIONS = [
+  "Problem", "Solution", "Market", "Business Model",
+  "Traction", "Team", "Financials", "Ask",
+];
+
+/** Clamp/normalize the model output so a malformed field never 500s the endpoint. */
+export function validateDeckAudit(raw: any): DeckAuditReport {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const str = (v: any, max: number) => String(v ?? "").slice(0, max);
+  const strArr = (v: any, maxItems: number, maxLen: number) =>
+    (Array.isArray(v) ? v : []).slice(0, maxItems).map((x) => str(x, maxLen)).filter(Boolean);
+
+  const verdictRaw = String(src.verdict || "").toLowerCase();
+  const verdict: DeckAuditReport["verdict"] =
+    verdictRaw === "invest" ? "Invest" : verdictRaw === "pass" ? "Pass" : "Watch";
+
+  const score = Math.round(Number(src.fundability_score));
+  const fundability_score = Number.isFinite(score) ? Math.min(100, Math.max(0, score)) : 0;
+
+  const red_flags = (Array.isArray(src.red_flags) ? src.red_flags : [])
+    .slice(0, 6)
+    .map((r: any) => ({
+      flag: str(r?.flag, 120),
+      why: str(r?.why, 240),
+      fix: str(r?.fix, 240),
+    }))
+    .filter((r: any) => r.flag);
+
+  const sections = (Array.isArray(src.sections) ? src.sections : [])
+    .slice(0, DECK_SECTIONS.length)
+    .map((s: any) => ({
+      section: DECK_SECTIONS.includes(s?.section) ? s.section : str(s?.section, 40),
+      status: (["strong", "weak", "missing"].includes(s?.status) ? s.status : "weak") as
+        "strong" | "weak" | "missing",
+      note: str(s?.note, 160),
+    }))
+    .filter((s: any) => s.section);
+
+  return {
+    verdict,
+    one_liner: str(src.one_liner, 200),
+    fundability_score,
+    strengths: strArr(src.strengths, 5, 160),
+    weaknesses: strArr(src.weaknesses, 5, 160),
+    risks: strArr(src.risks, 5, 160),
+    vc_concerns: strArr(src.vc_concerns, 5, 160),
+    red_flags,
+    sections,
+  };
+}
+
+/**
+ * Deck Check: a VC-analyst style pre-screen of an uploaded deck document.
+ * No live pitch happened — the audit judges only what the document contains.
+ */
+export async function auditDeck(deckText: string, deckName: string): Promise<DeckAuditReport> {
+  const trimmed = (deckText || "").trim().slice(0, DECK_AUDIT_TEXT_LIMIT);
+  const wasTruncated = (deckText || "").trim().length > DECK_AUDIT_TEXT_LIMIT;
+
+  const prompt = `You are a VC analyst running a pre-screen audit on a founder's uploaded pitch deck. No live pitch session occurred — judge ONLY the document content below. Return ONLY valid JSON.
+
+DECK: "${deckName || "Untitled Deck"}"
+DECK TEXT (extracted from the uploaded file${wasTruncated ? "; truncated for length — do NOT mark sections missing solely because the text cuts off" : ""}):
+${trimmed}
+
+AUDIT RULES:
+- verdict: "Invest" (rare — genuinely fundable as-is), "Watch" (promising but gaps to fix), or "Pass" (significant problems). Judge like a real analyst pre-screening inbound decks.
+- fundability_score: integer 0-100 for how fundable this deck is as a document (story, evidence, completeness, credibility of claims).
+- one_liner: one blunt sentence a VC would say to a colleague about this deck.
+- strengths / weaknesses / risks / vc_concerns: 3-5 specific items each, citing actual claims or gaps from THIS deck — never generic advice.
+- red_flags: up to 5 serious issues; each with flag (short name), why (why a VC cares), fix (a concrete fix action).
+- sections: assess each of ${DECK_SECTIONS.join(", ")} as "strong", "weak" or "missing" with a short note. Infer sections from the text content — the deck may not label them.
+- If the text is thin or clearly not a pitch deck, score low and say so plainly in one_liner; do not invent content.
+
+LENGTH BUDGETS (rendered in fixed-size cards — stay within, end on complete sentences):
+- one_liner ≤ 180 chars; each list item ≤ 140 chars; red_flags why/fix ≤ 200 chars; section note ≤ 140 chars.
+
+Return this exact JSON structure:
+{
+  "verdict": "Watch",
+  "one_liner": "One blunt analyst sentence about this deck.",
+  "fundability_score": 55,
+  "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
+  "weaknesses": ["specific weakness 1", "specific weakness 2", "specific weakness 3"],
+  "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
+  "vc_concerns": ["specific concern 1", "specific concern 2", "specific concern 3"],
+  "red_flags": [ { "flag": "Short flag name", "why": "Why a VC cares", "fix": "Concrete fix action" } ],
+  "sections": [ { "section": "Problem", "status": "strong", "note": "Short note" }, { "section": "Solution", "status": "weak", "note": "Short note" } ]
+}`;
+
+  const raw = await callJsonModel(prompt, 2000, "deck-audit");
+  return validateDeckAudit(raw);
 }
