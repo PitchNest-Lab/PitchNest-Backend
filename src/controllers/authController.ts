@@ -26,6 +26,28 @@ const ALLOWED_SECTORS = [
   "Strategic Corporate",
 ] as const;
 
+// ── Sign-in method lock ──────────────────────────────────────────────────────
+// An account belongs to the method that created it (users.auth_provider:
+// 'form' | 'google'). Rows created before the column exists hold NULL — the
+// first successful sign-in after this change records and locks their method.
+const GOOGLE_ONLY_ERROR =
+  "This email is registered with Google Sign-In. Please continue with Google instead.";
+const FORM_ONLY_ERROR =
+  "This email was registered with a password. Please log in with your email and password instead.";
+
+/** Best-effort: lock a legacy (NULL-provider) row to the method just used. */
+function lockAuthProvider(userId: number, provider: "form" | "google") {
+  supabase
+    .from("users")
+    .update({ auth_provider: provider })
+    .eq("id", userId)
+    .is("auth_provider", null)
+    .then(({ error }) => {
+      if (error)
+        console.warn("auth_provider lock failed (non-fatal):", error.message);
+    });
+}
+
 export function toPublicUser(u: any) {
   return {
     id: u?.id,
@@ -121,8 +143,12 @@ export const signup = async (req: Request, res: Response) => {
 
     const is_verified = existingUser?.isEmailVerified;
 
-    if (existingUser && is_verified)
+    if (existingUser && is_verified) {
+      // A Google-created account can't be re-registered with a password.
+      if (existingUser.auth_provider === "google")
+        return res.status(400).json({ error: GOOGLE_ONLY_ERROR });
       return res.status(400).json({ error: "Email exists" });
+    }
     if (existingUser && !is_verified) {
       // Auto-resend verification email so user isn't stuck
       sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
@@ -141,11 +167,23 @@ export const signup = async (req: Request, res: Response) => {
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    const { data: newUser, error } = await supabase
+    let { data: newUser, error } = await supabase
       .from("users")
-      .insert([{ name, email: cleanEmail, password: hashedPassword }])
+      .insert([
+        { name, email: cleanEmail, password: hashedPassword, auth_provider: "form" },
+      ])
       .select()
       .single();
+
+    // Rollout safety: if the auth_provider column hasn't been added in
+    // Supabase yet, retry without it so signup never breaks.
+    if (error && /column|schema/i.test(error.message || "")) {
+      ({ data: newUser, error } = await supabase
+        .from("users")
+        .insert([{ name, email: cleanEmail, password: hashedPassword }])
+        .select()
+        .single());
+    }
 
     if (error || !newUser)
       return res.status(500).json({ error: "Signup failed" });
@@ -188,6 +226,11 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
+    // Method lock: Google-created accounts can't sign in with a password.
+    if (user.auth_provider === "google") {
+      return res.status(401).json({ error: GOOGLE_ONLY_ERROR });
+    }
+
     // Compare hashed password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
@@ -196,6 +239,9 @@ export const login = async (req: Request, res: Response) => {
     if (!user.isEmailVerified) {
       return res.status(403).json({ message: "Email not verified" });
     }
+
+    // First successful password login on a legacy row locks it to 'form'.
+    if (!user.auth_provider) lockAuthProvider(user.id, "form");
 
     const token = signToken({ id: user.id, email: user.email });
 
@@ -313,7 +359,9 @@ export const updateSettings = async (req: Request, res: Response) => {
  * obtained client-side via Google Identity Services. Verifies the token against
  * our OAuth client id, then finds-or-creates the matching user (linked by email)
  * and issues our own JWT. Google accounts have no password — a random hash is
- * stored to satisfy the column; users can set one later via "forgot password".
+ * stored to satisfy the column. Accounts are locked to the sign-in method that
+ * created them (users.auth_provider): a form account is rejected here, and a
+ * Google account is rejected by the password login/reset endpoints.
  */
 export const googleAuth = async (req: Request, res: Response) => {
   try {
@@ -361,7 +409,7 @@ export const googleAuth = async (req: Request, res: Response) => {
         crypto.randomBytes(32).toString("hex"),
         BCRYPT_ROUNDS,
       );
-      const { data: created, error } = await supabase
+      let { data: created, error } = await supabase
         .from("users")
         .insert([
           {
@@ -370,16 +418,40 @@ export const googleAuth = async (req: Request, res: Response) => {
             password: randomPassword,
             isEmailVerified: true,
             role: "Founder",
+            auth_provider: "google",
           },
         ])
         .select()
         .single();
+
+      // Rollout safety: retry without auth_provider if the column is missing.
+      if (error && /column|schema/i.test(error.message || "")) {
+        ({ data: created, error } = await supabase
+          .from("users")
+          .insert([
+            {
+              name,
+              email,
+              password: randomPassword,
+              isEmailVerified: true,
+              role: "Founder",
+            },
+          ])
+          .select()
+          .single());
+      }
 
       if (error || !created) {
         console.error("Google signup insert failed:", error);
         return res.status(500).json({ error: "Could not create account." });
       }
       user = created;
+    } else if (user.auth_provider === "form") {
+      // Method lock: this email was registered with a password.
+      return res.status(401).json({ error: FORM_ONLY_ERROR });
+    } else if (!user.auth_provider) {
+      // First Google sign-in on a legacy row locks it to 'google'.
+      lockAuthProvider(user.id, "google");
     }
 
     const token = signToken({ id: user.id, email: user.email });
@@ -414,12 +486,18 @@ export const forgotPassword = async (req: Request, res: Response) => {
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, email")
+      .select("id, email, auth_provider")
       .eq("email", cleanEmail)
       .maybeSingle();
 
     // Always return 200 to prevent email enumeration
     if (!user) return res.status(200).json({ message: "user does not exist" });
+
+    // Google accounts have no usable password — a reset would set one that
+    // still can't log in (method lock). Point the user at Google instead.
+    if (user.auth_provider === "google") {
+      return res.status(400).json({ error: GOOGLE_ONLY_ERROR });
+    }
 
     // Generate a reset token and store it
     const resetToken = crypto.randomBytes(32).toString("hex");

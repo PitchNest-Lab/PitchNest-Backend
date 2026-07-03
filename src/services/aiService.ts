@@ -435,7 +435,8 @@ const DECK_TEXT_LIMIT = 8000;
 const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
-- CRITICAL: Keep each turn to 1-2 short, conversational sentences MAXIMUM. One single question per turn.
+- CRITICAL: Keep each turn short and conversational — one or two spoken sentences. Ask AT MOST ONE question per turn; NEVER stack or chain a second question onto the same turn — hold it for a later turn. A statement plus one question is fine, and a brief reaction with no question at all is also fine.
+- The founder's words arrive via automatic speech recognition and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context instead of taking a garbled phrase literally; if a critical detail is truly unclear, ask a brief clarifying question rather than assuming.
 - CRITICAL FORMATTING: You MUST speak as EXACTLY ONE person per turn. DO NOT include multiple people talking in the same response. STOP GENERATING after your chosen panelist has spoken.
 - Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly.
 - Be aware of the remaining pitch time metadata (e.g., \`[PITCH TIME REMAINING: ...]\`). Do not start complex new topics when less than 2 minutes remain; instead, guide the founder to summarize, handle final remarks, or conclude.`;
@@ -674,7 +675,9 @@ export async function evaluatePitch(
     ? transcript.map(m => {
         if (m.type === 'user') {
           const method = m.inputMethod === 'voice' ? '[SPOKEN VIA MICROPHONE]' : '[TYPED IN CHAT]';
-          return `FOUNDER ${method}: ${m.text}`;
+          // Prefer the raw spoken words: sessions saved before the raw-transcript
+          // change stored an LLM summary in `text` and the raw STT in `fullText`.
+          return `FOUNDER ${method}: ${m.fullText || m.text}`;
         } else {
           return `${m.speaker || 'AI'}: ${m.text}`;
         }
@@ -720,6 +723,7 @@ ${transcriptText}
 
 COACHING EVALUATION RULES:
 - You are writing as a coach evaluating a ${isSolo ? "recorded practice run" : "student"}, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
+- The founder's spoken lines are raw automatic speech recognition output and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context and NEVER penalize apparent transcription artifacts — judge what the founder meant, not what the recognizer typed.
 - Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
 - IF THE FOUNDER WAS SILENT OR THE SESSION WAS TOO SHORT: Provide low scores and use the summary to gently encourage more participation next time.
 - delivery = vocal confidence, pacing, how well they handle coaching questions under pressure.
@@ -755,7 +759,8 @@ TRANSCRIPT:
 ${transcriptText}`;
 
   const sharedRules = `- NEVER invent a specific fundraising amount; only use a concrete raise figure if the founder explicitly stated it, otherwise say "your target raise".
-- Be specific — cite actual topics discussed, not generic advice. Cross-check against the deck when provided.`;
+- Be specific — cite actual topics discussed, not generic advice. Cross-check against the deck when provided.
+- The founder's spoken lines are raw automatic speech recognition output and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context and NEVER penalize apparent transcription artifacts — judge what the founder meant, not what the recognizer typed.`;
 
   const corePrompt = `You are an expert pitch evaluator. Analyze this investor pitch and return ONLY valid JSON (the scored core of the report).
 
@@ -1029,27 +1034,6 @@ RULES:
   } catch (err: any) {
     console.warn("Answer-tip generation failed (non-fatal):", err?.message || err);
     return null;
-  }
-}
-
-/**
- * Summarizes long voice input into a short sentence.
- */
-export async function summarizeVoiceInput(text: string): Promise<string> {
-  const openai = getOpenAIClient();
-  const prompt = `Summarize the following user voice input into a single, concise sentence (maximum 15 words). Maintain the user's core intent or question. If it's already short, just return it as is.\n\nInput: ${text}`;
-  
-  try {
-    const response = await openai.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      max_tokens: 40,
-    });
-    return response.choices[0]?.message?.content?.trim() || text;
-  } catch (err) {
-    console.error("Voice summarization failed:", err);
-    return text;
   }
 }
 

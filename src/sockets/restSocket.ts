@@ -6,7 +6,6 @@ import {
   getMasterPrompt,
   generatePanelResponse,
   streamPanelResponse,
-  summarizeVoiceInput,
   generateAnswerTip,
 } from "../services/aiService.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
@@ -28,6 +27,11 @@ const MIN_EVAL_DURATION_SEC = 60;
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
 // garbled and ask the founder to repeat instead of answering it.
 const LOW_STT_CONFIDENCE = 0.2;
+// Only the most recent messages are sent to the live model each turn — the
+// system prompt already carries the deck + setup, and an unbounded history
+// makes responses progressively slower as the session runs. The full history
+// stays in memory; the evaluation still sees the entire transcript.
+const MAX_LLM_HISTORY = 20;
 
 // ── Varied opening greetings ─────────────────────────────────────────────────
 // "Welcome to the Nest" (play on PitchNest). A fresh one is picked at random each
@@ -328,7 +332,7 @@ export function initRestSocket(wss: WebSocketServer) {
         if (turn.isVerdict) {
           const aiResponse = await generatePanelResponse(
             userInput,
-            conversationHistory,
+            conversationHistory.slice(-MAX_LLM_HISTORY),
             masterPrompt,
           );
           conversationHistory.push({ role: "user", text: userInput });
@@ -414,6 +418,12 @@ export function initRestSocket(wss: WebSocketServer) {
         const turnAbort = new AbortController();
         currentTurnAbort = turnAbort;
 
+        // Latency instrumentation: separates code-side delay (first token /
+        // first audio) from network or Azure-side delay when sessions feel slow.
+        const turnStartedAt = Date.now();
+        let firstTokenAt = 0;
+        let firstAudioAt = 0;
+
         let currentSentenceBuffer = "";
         let isFirstChunk = true;
         let activeSpeaker = isCoachMode ? "Riley" : "Marcus";
@@ -435,13 +445,14 @@ export function initRestSocket(wss: WebSocketServer) {
             )
           : streamPanelResponse(
               userInputToUse,
-              conversationHistory,
+              conversationHistory.slice(-MAX_LLM_HISTORY),
               promptToUse,
               turnAbort.signal,
             );
 
         for await (const token of stream) {
           if (turnAbort.signal.aborted) break;
+          if (!firstTokenAt) firstTokenAt = Date.now();
           currentSentenceBuffer += token;
 
           // 1. On the very first burst, extract the speaker identity if it exists
@@ -502,6 +513,7 @@ export function initRestSocket(wss: WebSocketServer) {
                     );
                     if (turnAbort.signal.aborted) return;
                     const base64Audio = Buffer.from(buf).toString("base64");
+                    if (!firstAudioAt) firstAudioAt = Date.now();
                     sendJson(ws, {
                       type: "audio",
                       data: base64Audio,
@@ -541,6 +553,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 );
                 if (turnAbort.signal.aborted) return;
                 const base64Audio = Buffer.from(buf).toString("base64");
+                if (!firstAudioAt) firstAudioAt = Date.now();
                 sendJson(ws, {
                   type: "audio",
                   data: base64Audio,
@@ -577,6 +590,12 @@ export function initRestSocket(wss: WebSocketServer) {
 
         // 4. Wait for the sequential TTS delivery pipeline to completely finish
         await ttsPromiseChain;
+
+        console.log(
+          `[turn] first token ${firstTokenAt ? firstTokenAt - turnStartedAt : -1}ms, ` +
+            `first audio ${firstAudioAt ? firstAudioAt - turnStartedAt : -1}ms, ` +
+            `total ${Date.now() - turnStartedAt}ms, history ${conversationHistory.length}${turn.isGreeting ? " (greeting)" : ""}`,
+        );
 
         const wasAborted = turnAbort.signal.aborted;
         if (currentTurnAbort === turnAbort) currentTurnAbort = null;
@@ -839,22 +858,20 @@ export function initRestSocket(wss: WebSocketServer) {
 
                 enqueueTurn({ text, inputMethod: "voice" });
 
-                summarizeVoiceInput(text)
-                  .then((summary) => {
-                    fullTranscript.push({
-                      type: "user",
-                      text: summary,
-                      inputMethod: "voice",
-                      fullText: text,
-                    });
-                    sendJson(ws, {
-                      type: "chat_message",
-                      role: "user",
-                      text: summary,
-                      inputMethod: "voice",
-                    });
-                  })
-                  .catch((err) => console.error("Summarization error:", err));
+                // Raw STT words, shown instantly — no LLM summarization pass.
+                // The prompts tell the AI this is speech-recognition output and
+                // to read mis-transcribed words from context.
+                fullTranscript.push({
+                  type: "user",
+                  text,
+                  inputMethod: "voice",
+                });
+                sendJson(ws, {
+                  type: "chat_message",
+                  role: "user",
+                  text,
+                  inputMethod: "voice",
+                });
               },
               (_partialText) => {
                 if (sessionEnded) return;
@@ -971,22 +988,18 @@ export function initRestSocket(wss: WebSocketServer) {
           });
 
           if (inputMethod === "voice") {
-            summarizeVoiceInput(data.text)
-              .then((summary) => {
-                fullTranscript.push({
-                  type: "user",
-                  text: summary,
-                  inputMethod,
-                  fullText: data.text,
-                });
-                sendJson(ws, {
-                  type: "chat_message",
-                  role: "user",
-                  text: summary,
-                  inputMethod,
-                });
-              })
-              .catch((err) => console.error("Summarization error:", err));
+            // Raw voice text, echoed back instantly — no summarization pass.
+            fullTranscript.push({
+              type: "user",
+              text: data.text,
+              inputMethod,
+            });
+            sendJson(ws, {
+              type: "chat_message",
+              role: "user",
+              text: data.text,
+              inputMethod,
+            });
           } else {
             fullTranscript.push({
               type: "user",
