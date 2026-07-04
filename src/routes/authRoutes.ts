@@ -14,6 +14,7 @@ import {
   deleteAccountByCredentials,
   verifyEmail,
   resendEmailVerification,
+  refreshToken,
 } from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
@@ -65,6 +66,10 @@ router.get("/me", authMiddleware, async (req, res) => {
   }
   res.json({ id: req.user!.id, email: req.user!.email, isEmailVerified: false });
 });
+
+// Deliberately not behind authLimiter — it fires on a timer for every active
+// user, and the shared 20-per-15-min cap would starve real logins.
+router.post("/refresh", authMiddleware, refreshToken);
 
 router.patch("/me", authMiddleware, updateMe);
 router.patch("/settings", authMiddleware, updateSettings);

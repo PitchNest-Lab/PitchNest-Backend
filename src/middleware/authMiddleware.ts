@@ -13,7 +13,7 @@ import { supabase } from "../config/supabase.ts";
 declare global {
   namespace Express {
     interface Request {
-      user?: { id: number; email: string };
+      user?: { id: number; email: string; rememberMe?: boolean };
     }
   }
 }
@@ -28,7 +28,7 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
   const token = authHeader.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+    const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string; rememberMe?: boolean };
     
     // Verify user still exists in the database
     const { data: user, error } = await supabase

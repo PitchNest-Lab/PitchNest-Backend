@@ -86,13 +86,34 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
 }
 
 /**
- * Signs a JWT token for the given user.
+ * Signs a JWT token for the given user. Sessions expire after 24 hours of
+ * inactivity (the frontend slides the window via /auth/refresh while the user
+ * is active); "Keep me logged in" extends the lifetime to 30 days.
  */
-function signToken(user: { id: number; email: string }): string {
-  return jwt.sign({ id: user.id, email: user.email }, config.jwtSecret, {
-    expiresIn: "7d",
-  });
+function signToken(
+  user: { id: number; email: string },
+  rememberMe = false,
+): string {
+  return jwt.sign(
+    { id: user.id, email: user.email, rememberMe },
+    config.jwtSecret,
+    { expiresIn: rememberMe ? "30d" : "24h" },
+  );
 }
+
+/**
+ * Re-issues a fresh token for an authenticated user so active sessions slide
+ * instead of hard-expiring. Keeps the rememberMe lifetime of the original.
+ */
+export const refreshToken = (req: Request, res: Response) => {
+  const user = req.user!;
+  res.status(200).json({
+    token: signToken(
+      { id: user.id, email: user.email },
+      user.rememberMe === true,
+    ),
+  });
+};
 
 export const wipeDb = async (req: Request, res: Response) => {
   try {
@@ -208,7 +229,7 @@ export const signup = async (req: Request, res: Response) => {
 
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
+    const { email, password, rememberMe } = req.body;
     if (!email || !password) {
       return res
         .status(400)
@@ -243,7 +264,10 @@ export const login = async (req: Request, res: Response) => {
     // First successful password login on a legacy row locks it to 'form'.
     if (!user.auth_provider) lockAuthProvider(user.id, "form");
 
-    const token = signToken({ id: user.id, email: user.email });
+    const token = signToken(
+      { id: user.id, email: user.email },
+      rememberMe === true,
+    );
 
     res.status(200).json({
       user: toPublicUser(user),
@@ -371,7 +395,7 @@ export const googleAuth = async (req: Request, res: Response) => {
         .json({ error: "Google sign-in is not configured on the server." });
     }
 
-    const { credential } = req.body;
+    const { credential, rememberMe } = req.body;
     if (!credential || typeof credential !== "string") {
       return res.status(400).json({ error: "Missing Google credential." });
     }
@@ -454,7 +478,10 @@ export const googleAuth = async (req: Request, res: Response) => {
       lockAuthProvider(user.id, "google");
     }
 
-    const token = signToken({ id: user.id, email: user.email });
+    const token = signToken(
+      { id: user.id, email: user.email },
+      rememberMe === true,
+    );
     res.status(200).json({
       user: toPublicUser(user),
       token,
