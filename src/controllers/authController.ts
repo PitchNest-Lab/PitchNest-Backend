@@ -429,9 +429,12 @@ export const googleAuth = async (req: Request, res: Response) => {
 
     if (!user) {
       // Random unusable password — Google is the auth method for this account.
+      // Use minimal rounds (4) since this hash is never verified at login;
+      // it only satisfies the NOT NULL column. BCRYPT_ROUNDS (12) added 2-5s
+      // of CPU time on serverless for zero security benefit.
       const randomPassword = await bcrypt.hash(
         crypto.randomBytes(32).toString("hex"),
-        BCRYPT_ROUNDS,
+        4,
       );
       let { data: created, error } = await supabase
         .from("users")
