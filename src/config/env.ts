@@ -25,6 +25,11 @@ export const config = {
     .split(",")
     .map((o) => o.trim())
     .filter(Boolean),
+  // Background web research (market snapshot for live panel + evaluation).
+  // Off unless explicitly enabled AND a search provider key is present.
+  researchEnabled: process.env.RESEARCH_ENABLED === "true",
+  tavilyApiKey: process.env.TAVILY_API_KEY || "",
+  serperApiKey: process.env.SERPER_API_KEY || "",
 };
 
 if (config.nodeEnv === "production" && !process.env.JWT_SECRET) {
@@ -52,6 +57,12 @@ export function hasOpenAiConfig(): boolean {
 
 export function hasAzureTtsConfig(): boolean {
   return !!(config.azureSpeechKey && config.azureSpeechRegion);
+}
+
+export function hasResearchConfig(): boolean {
+  return (
+    config.researchEnabled && !!(config.tavilyApiKey || config.serperApiKey)
+  );
 }
 
 if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {

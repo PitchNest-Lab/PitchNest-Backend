@@ -1,4 +1,5 @@
 import { config } from "../config/env.ts";
+import { buildInvestorPlaybook } from "../prompts/investorPlaybook.ts";
 
 /**
  * Interface representing standard evaluation metrics and sentiments returned by the AI model.
@@ -77,6 +78,14 @@ export interface EvaluationReport {
   }>;
   confidence_timeline?: Array<{ time: string; value: number }>;
   founder_percentile?: number;
+  // ── Phase 5: Founder–market fit ("why you") ──────────────────
+  // Reported as a standalone dimension; NEVER enters the overall
+  // score or the percentile (historical comparability).
+  founder_market_fit?: number;
+  founder_market_fit_note?: string;
+  // "Read the room" feedback — derived server-side from the live
+  // interest timeline (panel mode only); present only when it applies.
+  room_read_note?: string;
 }
 
 function clampScore(value: unknown): number {
@@ -377,6 +386,19 @@ function validateEvaluationReport(raw: any): EvaluationReport {
         }))
     : undefined;
 
+  // Founder–market fit is optional (solo sessions omit it when the founder's
+  // story never came up) and reported separately — it must never be folded
+  // into the overall score below.
+  const founderMarketFit =
+    typeof raw?.founder_market_fit === "number"
+      ? clampScore(raw.founder_market_fit)
+      : undefined;
+  const founderMarketFitNote =
+    typeof raw?.founder_market_fit_note === "string" &&
+    raw.founder_market_fit_note.trim()
+      ? raw.founder_market_fit_note.trim()
+      : undefined;
+
   const validatedScores = {
     delivery: clampScore(scores.delivery),
     clarity: clampScore(scores.clarity),
@@ -427,6 +449,8 @@ function validateEvaluationReport(raw: any): EvaluationReport {
     category_matrix: categoryMatrix,
     confidence_timeline: confidenceTimeline,
     founder_percentile: founderPercentile,
+    founder_market_fit: founderMarketFit,
+    founder_market_fit_note: founderMarketFitNote,
   };
 }
 
@@ -512,7 +536,7 @@ function buildArchetypeDirective(archetype: string): string {
     return "PANEL STYLE: Growth-stage investors. Focus on scalability, margins, and path to Series A metrics.";
   }
   if (archetype?.includes("Shark Tank")) {
-    return "PANEL STYLE: Fast-paced consumer investors. Focused on valuation and quick consumer adoption. Say 'I'm out' if the deal is not viable.";
+    return "PANEL STYLE: Fast-paced consumer investors. Focused on valuation and quick consumer adoption.";
   }
   if (archetype?.includes("Private Equity")) {
     return "PANEL STYLE: Private Equity analysts. Obsessed with cash flow, EBITDA, restructuring, and debt efficiency.";
@@ -568,7 +592,7 @@ ${returningBlock}` + `
 SESSION FLOW:
 1. OPENING (your first turn only): Welcome the founder warmly. Mention one specific detail from their deck or concept. Invite them to deliver their opening pitch.
 2. LISTENING: Stay quiet while they present. Do not interrupt or coach until they finish, say "that's my pitch", or ask for feedback.
-3. COACHING: Ask one focused question at a time. Tie each question to their deck content or a gap you noticed. Help them tighten narrative, metrics, and clarity.
+3. COACHING: Ask one focused question at a time. Tie each question to their deck content or a gap you noticed. Help them tighten narrative, metrics, and clarity. At some natural point, ask why THEY are the person to build this — their story matters to investors as much as the numbers.
 
 ACCENT & ADAPTABILITY RULES:
 - Be tolerant of various English accents, including Nigerian English and other regional variants. Do not ask the user to repeat unless the content is truly incomprehensible; use context and conversation history to interpret ambiguous statements.
@@ -597,6 +621,10 @@ SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their one question, STOP IMMEDIATELY.
 - Do not add any extra text or stage directions — only the words that panelist would actually say aloud.
 - When the founder asks a direct question, answer it before asking a new one. If the founder specifically asks for Sarah or Chen by name, that panelist responds immediately.
+- MACHINE TAG (the single exception to spoken-words-only; it is stripped before speech): end EVERY response with a final line of exactly this form: @@INTEREST <SpeakerName>=<warming|neutral|cooling|out>
+  It reports the SPEAKING panelist's honest current interest in this deal. Optionally append ONE short unresolved concern as a phrase with no periods: @@INTEREST Sarah=cooling | concern: gross margin still unclear
+  Keep "concern:" only while that panelist's raised concern remains unanswered; drop it once the founder addresses it. Once a panelist is out they stay out for the whole session. Everything BEFORE this line must still be only spoken words.
+- Turns may begin with [PANEL STATE: ...] metadata — each panelist's current stance from earlier turns. Stay consistent with it: a panelist marked out stays out, makes at most brief comments, and asks no new questions.
 
 PANEL CONVERSATION STYLE
 
@@ -604,7 +632,7 @@ You are three distinct investors having a real, flowing conversation with a foun
 
 Personalities (keep them distinct in voice and focus):
 - Marcus (Lead): blunt and direct. Owns market, competition, moat, and the overall "would I invest" call. Opens the session and delivers the closing direction.
-- Sarah (Partner): precise, numbers-first. Owns unit economics, financials, pricing, LTV/CAC, retention. Asks for specific figures.
+- Sarah (Partner): precise, numbers-first. Owns unit economics, financials, pricing, LTV/CAC, retention — and the ask itself: raise amount, equity offered, and the implied valuation. Asks for specific figures.
 - Chen (Tech Investor): calm and technical. Owns product, architecture, build-vs-buy, data, and execution feasibility.
 
 How the conversation flows:
@@ -619,13 +647,16 @@ Turn discipline (strict):
 
 Session arc (pacing):
 - A session runs roughly 6–10 questions total.
+- Scale question count and depth to the pitch time remaining metadata: a short session gets fewer, sharper questions on the biggest issues; a longer session can explore more threads.
 - Early: explore breadth across problem, market, model, product, and team.
 - Middle: drill into the 1–2 biggest weaknesses you've found.
 - Late: Marcus moves toward closing direction and the verdict.
 - Do not grill endlessly and do not wrap before covering the core areas.
 
+${buildInvestorPlaybook(aggressiveness, archetype, industry)}
+
 No scripts, no repetition:
-- Do NOT pull from a fixed bank of stock questions. Every question must come from what the founder ACTUALLY just said — challenge their specific claim, number, assumption, or the gap they left.
+- Do NOT recite stock questions. The investor concerns above are what you CARE about, not what you say — every question must still come from what the founder ACTUALLY just said: challenge their specific claim, number, assumption, or the gap they left.
 - Vary phrasing, depth, and angle. Pursue what is genuinely interesting or weak in THIS specific pitch.
 
 Interrupting (use sparingly):
@@ -645,7 +676,7 @@ ACCENT & ADAPTABILITY RULES:
 
 import { OpenAI, AzureOpenAI } from "openai";
 
-function getOpenAIClient() {
+export function getOpenAIClient() {
   if (config.azureOpenAiEndpoint && config.azureOpenAiApiKey) {
     // Use AzureOpenAI client which handles the correct headers and paths automatically
     return new AzureOpenAI({
@@ -669,7 +700,10 @@ export async function evaluatePitch(
     scores: { delivery: number; clarity: number; scalability: number; readiness: number };
     summary: string;
     topRisks: string[];
-  } | null
+  } | null,
+  // Market snapshot from the session's background web research (or null).
+  // Grounds the competitive-intel section in real, dated web results.
+  researchContext?: { text: string; retrievedAt: string } | null,
 ): Promise<EvaluationReport> {
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => {
@@ -734,11 +768,13 @@ COACHING EVALUATION RULES:
 - risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
 - next_steps: 3-4 concrete practice actions (NEVER fewer than 3) the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
 ${rileyObservation}
+- founder_market_fit: 0-100 with founder_market_fit_note — how convincingly the founder showed why THEY are the right person for this problem (background, earned insight, origin story). Reported separately; it does not affect the four scores.${isSolo ? " IMPORTANT: this was a solo recording — include these two fields ONLY if the founder's background or story actually came up; otherwise OMIT both keys entirely." : ""}
 - Keep summary to 2-3 sentences framed as a coach's overall assessment of the ${sessionWord}.
 
 LENGTH BUDGETS (rendered in fixed-size report cards — stay within and always end on a complete sentence):
 - summary: ≤ 320 characters. each strengths / risks item: ≤ 140 characters.
 - next_steps: 3-4 items (never fewer than 3); title ≤ 28 characters, desc ≤ 110 characters. sentiments quote: ≤ 140 characters.
+- founder_market_fit_note: ≤ 140 characters.
 
 Return this exact JSON structure:
 {
@@ -747,7 +783,9 @@ Return this exact JSON structure:
   "strengths": ["specific strength 1 from the session", "specific strength 2", "specific strength 3"],
   "risks": ["specific gap or weakness 1", "gap 2", "gap 3"],
   "next_steps": [ { "title": "First practice action", "desc": "Short actionable coaching instruction", "priority": "High Priority" }, { "title": "Second practice action", "desc": "Short actionable coaching instruction", "priority": "High Priority" }, { "title": "Third practice action", "desc": "Short actionable coaching instruction", "priority": "Medium Priority" } ],
-  "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ]
+  "sentiments": [ { "persona": "Riley", "quote": "One honest, encouraging coach observation." } ],
+  "founder_market_fit": 60,
+  "founder_market_fit_note": "One sentence on the founder's why-you story."
 }`;
 
   // ── Panel evaluation: split into 3 concurrent calls ──────────────────────
@@ -776,7 +814,8 @@ RULES:
 - ACCENT FAIRNESS: Focus on the substance and clarity of the pitch content. Do not penalize pronunciation, grammatical variations, or speech patterns due to non-native accents or regional English variants (e.g. Nigerian English, Indian English).
 - Keep summary to 2-3 sentences. Include one sentiment quote each for Marcus, Sarah, and Chen.
 - next_steps: provide 3-4 concrete action items, NEVER fewer than 3. Each must address a specific weakness or gap from THIS pitch (not generic advice).
-- topic_coverage: percentage 0-100 for each topic: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details.
+- topic_coverage: percentage 0-100 for each topic: Problem Definition, Solution Overview, Market Size, Business Model, Go-to-Market, Traction, Team, Financials, Technical Details, Use of Funds, Regulatory / Validation, Founder-Market Fit.
+- founder_market_fit: 0-100 — how convincingly THIS founder showed they are the right person for THIS problem (relevant background, earned insight, origin story). Judge only what surfaced in this session; if it never came up, score it low and say so in founder_market_fit_note. Reported separately — it does NOT affect the four scores above.
 - transcript_summary: 3-5 sentence summary of what was discussed and what was missed.
 - question_difficulty: integer counts {easy, medium, hard} of the panel's questions.
 - vc_investment_probability: 0-100 chance this pitch earns a VC follow-up meeting.
@@ -791,6 +830,7 @@ LENGTH BUDGETS (these fields are rendered in fixed-size report cards — stay wi
 - each sentiments quote: ≤ 140 characters.
 - next_steps: 3-4 items (never fewer than 3); title ≤ 28 characters, desc ≤ 110 characters.
 - category_matrix went_well / needs_improvement: ≤ 90 characters each.
+- founder_market_fit_note: ≤ 140 characters.
 
 Return this exact JSON structure:
 {
@@ -800,7 +840,9 @@ Return this exact JSON structure:
   "risks": ["specific risk 1", "specific risk 2", "specific risk 3"],
   "next_steps": [ { "title": "First action title", "desc": "Short actionable description", "priority": "High Priority" }, { "title": "Second action title", "desc": "Short actionable description", "priority": "High Priority" }, { "title": "Third action title", "desc": "Short actionable description", "priority": "Medium Priority" } ],
   "sentiments": [ { "persona": "Marcus", "quote": "One sentence reaction." }, { "persona": "Sarah", "quote": "One sentence reaction." }, { "persona": "Chen", "quote": "One sentence reaction." } ],
-  "topic_coverage": [ { "topic": "Problem Definition", "percentage": 90 }, { "topic": "Solution Overview", "percentage": 80 }, { "topic": "Market Size", "percentage": 30 }, { "topic": "Business Model", "percentage": 20 }, { "topic": "Go-to-Market", "percentage": 10 }, { "topic": "Traction", "percentage": 0 }, { "topic": "Team", "percentage": 0 }, { "topic": "Financials", "percentage": 0 }, { "topic": "Technical Details", "percentage": 5 } ],
+  "topic_coverage": [ { "topic": "Problem Definition", "percentage": 90 }, { "topic": "Solution Overview", "percentage": 80 }, { "topic": "Market Size", "percentage": 30 }, { "topic": "Business Model", "percentage": 20 }, { "topic": "Go-to-Market", "percentage": 10 }, { "topic": "Traction", "percentage": 0 }, { "topic": "Team", "percentage": 0 }, { "topic": "Financials", "percentage": 0 }, { "topic": "Technical Details", "percentage": 5 }, { "topic": "Use of Funds", "percentage": 0 }, { "topic": "Regulatory / Validation", "percentage": 0 }, { "topic": "Founder-Market Fit", "percentage": 40 } ],
+  "founder_market_fit": 55,
+  "founder_market_fit_note": "One sentence on why this founder is (or is not yet) the right person for this problem.",
   "transcript_summary": "3-5 sentence summary of the session",
   "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
   "vc_investment_probability": 25,
@@ -808,12 +850,16 @@ Return this exact JSON structure:
   "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ]
 }`;
 
+  const researchSection = researchContext?.text
+    ? `\nWEB RESEARCH (retrieved ${researchContext.retrievedAt} — real search results for this space; prefer these over your own recall when they conflict):\n${researchContext.text}\n`
+    : "";
+
   const intelPrompt = `You are a market intelligence analyst. Based on this pitch, return ONLY valid JSON with competitive analysis.
 
 ${panelCtx}
-
+${researchSection}
 RULES:
-- competitors: 4 REAL competitors in this founder's specific space (not generic tools). Each: name (real company), similarity (0-100), strength, weakness, size. You do NOT have verified financials — express size as a HEDGED RANGE clearly marked as an estimate (e.g. "Est. ~$10M–$50M ARR" or "approx. mid-market"), never a single precise figure. Use "N/A" if you cannot estimate.
+- competitors: 4 REAL competitors in this founder's specific space (not generic tools). Each: name (real company), similarity (0-100), strength, weakness, size. ${researchContext?.text ? "Ground names and figures in the WEB RESEARCH above where it covers them; fall back to hedged estimates only for what it does not cover." : ""}You do NOT have verified financials — express size as a HEDGED RANGE clearly marked as an estimate (e.g. "Est. ~$10M–$50M ARR" or "approx. mid-market"), never a single precise figure. Use "N/A" if you cannot estimate.
 - companies_to_study: 4 companies (not necessarily competitors) this founder should learn from, each with a one-sentence why tailored to this business.
 - market_gaps: 3-4 gaps competitors are NOT addressing. Each: title (3-5 words) + desc (one sentence specific to this business).
 - collaboration_opportunities: 4 specific strategic collaboration opportunities for this business.
@@ -847,7 +893,7 @@ Return this exact JSON structure:
 ${panelCtx}
 
 RULES:
-- questions_to_prepare: 6 tough investor questions to practice, based on weak areas from this session.
+- questions_to_prepare: 6 tough investor questions to practice, based on weak areas from this session. When valuation defense or use of funds was weak or never addressed, include at least one question on it (e.g. how they derived the valuation, or exactly what the raise buys).
 - top_priorities: exactly 5 priority improvements. Each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority"/"Medium Priority"), impact ("Very High"/"High"/"Medium").
 - answer_framework: pick the single hardest/most-avoided question from this session; build a 5-step answer framework. question = exact text; steps = [{label, text}].
 - practice_drills: 4 drills with title, desc, reps, time.
@@ -889,7 +935,15 @@ Return this exact JSON structure:
     callJsonModel(planPrompt, 1400, "plan").catch(() => ({})),
   ]);
 
-  return finalize({ ...core, ...intel, ...plan });
+  const report = finalize({ ...core, ...intel, ...plan });
+
+  // When the competitive section was grounded in real web results, say so —
+  // the default disclaimer ("AI-generated estimates") would understate it.
+  if (researchContext?.text && Array.isArray(report.competitors) && report.competitors.length > 0) {
+    report.competitors_disclaimer = `Grounded in web results retrieved ${researchContext.retrievedAt}. Figures are directional, not audited.`;
+  }
+
+  return report;
 }
 
 // One JSON-mode model call with a single fast retry. Before regenerating, we

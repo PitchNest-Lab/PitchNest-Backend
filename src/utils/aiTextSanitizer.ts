@@ -20,6 +20,12 @@ export function sanitizeAiSpeech(rawText: string): string | null {
 
   let text = rawText.trim();
 
+  // Backstop: the @@INTEREST machine tag is normally intercepted by the
+  // streaming layer before it gets here — strip any remnant so it can never
+  // be spoken or shown.
+  text = text.replace(/@@INTEREST[^\n]*/gi, "").trim();
+  if (!text) return null;
+
   if (META_TALK_PREFIX.test(text)) return null;
 
   // Remove bracketed stage directions like [pause] or [thinking]

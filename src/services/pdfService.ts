@@ -777,6 +777,9 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
           "Team": "#f97316",
           "Financials": "#ec4899",
           "Technical Details": "#06b6d4",
+          "Use of Funds": "#84cc16",
+          "Regulatory / Validation": "#a855f7",
+          "Founder-Market Fit": "#14b8a6",
         };
         if (Array.isArray(report.topic_coverage) && report.topic_coverage.length > 0) {
           return report.topic_coverage.map((t: any) => ({
@@ -1125,9 +1128,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       drawHalfGaugeChart(doc, 445, 392, 45, invProb, "", COLORS.primary, 8, COLORS.dark);
       doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.rose).text("Low Probability", 395, 398, { width: 100, align: "center" });
 
+      // Insight box: shows the session's read-the-room feedback when the live
+      // interest timeline produced one; otherwise the generic line.
+      const gaugeInsight =
+        typeof report.room_read_note === "string" && report.room_read_note
+          ? report.room_read_note
+          : "Investors need more evidence of market demand, unit economics, and technical feasibility before considering an investment.";
       doc.roundedRect(355, 410, 180, 28, 4).fill(COLORS.indigoBg);
       doc.font("Inter").fontSize(6.5).fillColor(COLORS.dark).text(
-        "Investors need more evidence of market demand, unit economics, and technical feasibility before considering an investment.",
+        fitText(doc, gaugeInsight, 170, "Inter", 6.5, 3, 1.5),
         360, 415, { width: 170, lineGap: 1.5 }
       );
 
@@ -1596,6 +1605,23 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         doc.font("Inter").fontSize(7.5).fillColor(COLORS.textLight).text(`${t.percentage}%`, 235, tLegY, { align: "right", width: 35 });
         tLegY += 15;
       });
+
+      // ── Founder–Market Fit — standalone stat (never part of the overall
+      // score). Old reports without the field show a graceful placeholder. ──
+      const fmfScore = typeof report.founder_market_fit === "number"
+        ? Math.min(100, Math.max(0, Math.round(report.founder_market_fit)))
+        : null;
+      const fmfColor = fmfScore === null ? COLORS.textLight
+        : fmfScore >= 70 ? COLORS.emerald
+        : fmfScore >= 40 ? COLORS.amber
+        : COLORS.rose;
+      doc.font("Inter-Bold").fontSize(7).fillColor(COLORS.primaryDark).text("FOUNDER-MARKET FIT", 290, 103, { width: 110 });
+      doc.font("Inter-Bold").fontSize(20).fillColor(fmfColor).text(fmfScore === null ? "—" : `${fmfScore}`, 290, 116, { width: 110 });
+      const fmfNote = fmfScore === null
+        ? "Not assessed in this session."
+        : String(report.founder_market_fit_note || "How convincingly you showed why YOU are the one to build this.");
+      const fmfNoteText = fitText(doc, fmfNote, 108, "Inter", 6, 5, 1.5);
+      doc.font("Inter").fontSize(6).fillColor(COLORS.textLight).text(fmfNoteText, 290, 142, { width: 108, lineGap: 1.5 });
 
       // ── AI Summary (y=208–278) ─────────────────────────────────────────────
       doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primaryDark).text("AI SUMMARY OF TRANSCRIPT", 50, 208);

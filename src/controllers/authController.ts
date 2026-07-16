@@ -82,6 +82,14 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
   ) {
     out.activeSector = s.activeSector;
   }
+  // Page tours the user has completed/skipped — stored on the account so a
+  // tour seen on one device never reappears on another. Short slug strings
+  // only, capped so the column can't grow unbounded.
+  if (Array.isArray(s.toursSeen)) {
+    out.toursSeen = s.toursSeen
+      .filter((t: unknown) => typeof t === "string" && (t as string).length <= 64)
+      .slice(0, 50);
+  }
   return out;
 }
 
@@ -359,6 +367,17 @@ export const updateSettings = async (req: Request, res: Response) => {
       .maybeSingle();
 
     const merged = { ...(existing?.settings || {}), ...clean };
+
+    // toursSeen is a set that only grows: union with what's already stored so
+    // two devices can't clobber each other's completions.
+    if (Array.isArray(clean.toursSeen)) {
+      const prior = Array.isArray(existing?.settings?.toursSeen)
+        ? existing!.settings.toursSeen
+        : [];
+      merged.toursSeen = Array.from(
+        new Set([...prior, ...(clean.toursSeen as string[])]),
+      ).slice(0, 50);
+    }
 
     const { data: updated, error } = await supabase
       .from("users")

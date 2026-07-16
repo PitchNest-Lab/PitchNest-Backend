@@ -20,6 +20,11 @@ import {
   StreamingRecognizer,
 } from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
+import {
+  researchStartup,
+  buildMarketSnapshotBlock,
+  type MarketSnapshot,
+} from "../services/researchService.ts";
 import crypto from "crypto";
 
 const MIN_EVAL_USER_CHARS = 150;
@@ -167,6 +172,46 @@ function buildUserTurnInput(text: string, timeLeft?: number): string {
   return `[PITCH TIME REMAINING: ${formatTimeLeft(timeLeft)}]\n${text}`;
 }
 
+// ── Panel interest side-channel (@@INTEREST machine tag) ────────────────────
+// The panel prompt instructs the model to end every turn with a non-spoken
+// line like "@@INTEREST Sarah=cooling | concern: gross margin still unclear".
+// The streaming layer intercepts it at both emit sites (mid-stream sentence
+// and final-buffer flush) so it never reaches TTS or the visible transcript;
+// sanitizeAiSpeech strips any remnant as a reactive backstop.
+const PANELIST_NAMES = ["Marcus", "Sarah", "Chen"] as const;
+type InterestState = "warming" | "neutral" | "cooling" | "out";
+
+const INTEREST_TAG_RE = /@@INTEREST\b([^\n]*)/i;
+
+function splitInterestTag(text: string): {
+  spoken: string;
+  tagBody: string | null;
+} {
+  const m = text.match(INTEREST_TAG_RE);
+  if (!m || m.index === undefined) return { spoken: text, tagBody: null };
+  return {
+    spoken: text.slice(0, m.index).trim(),
+    tagBody: (m[1] || "").trim(),
+  };
+}
+
+function parseInterestTag(tagBody: string): {
+  panelist: string;
+  state: InterestState;
+  concern: string | null;
+} | null {
+  const m = tagBody.match(
+    /^[\s:=-]*([A-Za-z]+)\s*=\s*(warming|neutral|cooling|out)\s*(?:\|\s*concern:\s*(.+))?/i,
+  );
+  if (!m) return null;
+  const panelist = m[1].charAt(0).toUpperCase() + m[1].slice(1).toLowerCase();
+  return {
+    panelist,
+    state: m[2].toLowerCase() as InterestState,
+    concern: m[3]?.trim() || null,
+  };
+}
+
 function parseSpeakerResponse(
   aiResponse: string,
   isCoach: boolean,
@@ -233,6 +278,11 @@ export function initRestSocket(wss: WebSocketServer) {
     let sessionId = 0;
     let resolvedDeckText = "";
     let masterPrompt = "";
+    // Background web research. Fired without awaiting at client_ready; when it
+    // resolves, the master prompt is recomposed so LATER turns can ground
+    // market/competitor talk in real, dated web results. No turn ever waits.
+    let marketSnapshot: MarketSnapshot | null = null;
+    let liveConfig: any = null;
     let isCoachMode = false;
     let isSoloMode = false;
     let sessionMode = "panel";
@@ -257,6 +307,15 @@ export function initRestSocket(wss: WebSocketServer) {
     let initialDurationSeconds = 15 * 60;
     let sessionEnded = false;
 
+    // Server clock is the authority for AI time metadata; the client clock
+    // ends phases. time_sync pushes (idle interval below) bound the drift.
+    const getTimeLeftSeconds = () =>
+      Math.max(
+        0,
+        initialDurationSeconds -
+          Math.floor((Date.now() - sessionStartTimestamp) / 1000),
+      );
+
     // Evaluation can be pre-started (in parallel with the verdict phase) so the
     // report is ready by the time the panel finishes speaking. See the
     // `prepare_evaluation` handler and `end_session` below.
@@ -266,6 +325,100 @@ export function initRestSocket(wss: WebSocketServer) {
     // Set when processing a standard turn; triggered by an `interrupt` message
     // or an STT partial transcript. See processAiTurn and the message handler.
     let currentTurnAbort: AbortController | null = null;
+
+    // ── Phase 2: per-panelist interest state (panel mode only) ─────────────
+    // Fed by the @@INTEREST machine tag on each panel turn. "out" is sticky.
+    // The timeline + the unprompted-selling counter feed the report's
+    // room_read_note; panelConcerns grounds the circle-back behavior.
+    const panelInterest: Record<string, InterestState> = {
+      Marcus: "neutral",
+      Sarah: "neutral",
+      Chen: "neutral",
+    };
+    const panelConcerns: Record<string, string | null> = {
+      Marcus: null,
+      Sarah: null,
+      Chen: null,
+    };
+    const interestTimeline: Array<{
+      atSeconds: number;
+      panelist: string;
+      state: InterestState;
+    }> = [];
+    // The greeting invites the pitch, so the founder's first turn is prompted.
+    let lastPanelTurnHadQuestion = true;
+    let unpromptedSellingTurns = 0;
+
+    // One-shot proactive time cues (halfway check-in, two-minute wrap-up) —
+    // fired from the idle interval so the AI manages the clock out loud
+    // instead of the session just hitting 0:00 mid-conversation.
+    let halfwayCueSent = false;
+    let wrapUpCueSent = false;
+
+    const handleInterestTag = (tagBody: string) => {
+      if (isCoachMode || isSoloMode) return;
+      const parsed = parseInterestTag(tagBody);
+      if (!parsed || !(parsed.panelist in panelInterest)) return;
+      const { panelist, state, concern } = parsed;
+      if (panelInterest[panelist] === "out") return; // out is permanent
+      const changed = panelInterest[panelist] !== state;
+      panelInterest[panelist] = state;
+      panelConcerns[panelist] = state === "out" ? null : concern;
+      if (changed) {
+        interestTimeline.push({
+          atSeconds: Math.floor((Date.now() - sessionStartTimestamp) / 1000),
+          panelist,
+          state,
+        });
+        sendJson(ws, { type: "panel_interest", states: { ...panelInterest } });
+      }
+    };
+
+    // "[PANEL STATE: ...]" metadata prepended to founder turns once any
+    // panelist has moved off neutral — grounded memory of who is warming,
+    // cooling, or out, and which concerns are still open.
+    const buildPanelStateLine = (): string => {
+      const anySignal = PANELIST_NAMES.some(
+        (p) => panelInterest[p] !== "neutral" || panelConcerns[p],
+      );
+      if (!anySignal) return "";
+      const parts = PANELIST_NAMES.map((p) => {
+        const c = panelConcerns[p]
+          ? ` (unresolved concern: ${panelConcerns[p]})`
+          : "";
+        return `${p}=${panelInterest[p]}${c}`;
+      });
+      return `[PANEL STATE: ${parts.join(", ")}]`;
+    };
+
+    // Room-read signal (Derek Cousins failure mode): the founder volunteering
+    // NEW selling content with no open question while ≥2 panelists have
+    // cooled is overselling a dead room. Answering a question never counts.
+    const noteFounderTurnForRoomRead = () => {
+      if (isCoachMode || isSoloMode || sessionEnded) return;
+      const lowInterest = PANELIST_NAMES.filter(
+        (p) => panelInterest[p] === "cooling" || panelInterest[p] === "out",
+      ).length;
+      if (!lastPanelTurnHadQuestion && lowInterest >= 2) {
+        unpromptedSellingTurns++;
+      }
+    };
+
+    const buildRoomReadNote = (): string | undefined => {
+      if (isCoachMode || isSoloMode) return undefined;
+      if (unpromptedSellingTurns >= 2) {
+        return `You kept pitching new selling points after the panel had cooled. When investors disengage, pause and ask what's holding them back.`;
+      }
+      // Praise path: a panelist cooled and was later won back.
+      const cooledAt: Record<string, number> = {};
+      for (const e of interestTimeline) {
+        if (e.state === "cooling") cooledAt[e.panelist] = e.atSeconds;
+        if (e.state === "warming" && cooledAt[e.panelist] !== undefined) {
+          return `Good room-reading: when ${e.panelist} cooled on the deal, you adjusted and won back interest instead of pushing harder.`;
+        }
+      }
+      return undefined;
+    };
 
     console.log(
       "✅ Client connected to PitchNest Brain (Azure OpenAI + Azure TTS)",
@@ -330,11 +483,15 @@ export function initRestSocket(wss: WebSocketServer) {
         // Removed hardcoded greeting block to let it fall through to streaming pipeline
 
         if (turn.isVerdict) {
-          const aiResponse = await generatePanelResponse(
-            userInput,
-            conversationHistory.slice(-MAX_LLM_HISTORY),
-            masterPrompt,
-          );
+          const aiResponse = (
+            await generatePanelResponse(
+              userInput,
+              conversationHistory.slice(-MAX_LLM_HISTORY),
+              masterPrompt,
+            )
+          )
+            .replace(/@@INTEREST[^\n]*/gi, "")
+            .trim();
           conversationHistory.push({ role: "user", text: userInput });
           conversationHistory.push({ role: "assistant", text: aiResponse });
 
@@ -435,6 +592,13 @@ export function initRestSocket(wss: WebSocketServer) {
         let promptToUse = masterPrompt;
         let userInputToUse = userInput;
 
+        // Panel-state metadata: grounded memory of who is warming/cooling/out
+        // and which concerns are still open. Panel turns only.
+        if (!isCoachMode && !turn.isGreeting) {
+          const stateLine = buildPanelStateLine();
+          if (stateLine) userInputToUse = `${stateLine}\n${userInputToUse}`;
+        }
+
         // Greeting: speak a varied, code-chosen "Welcome to the Nest" line
         // directly (no LLM call) so the opening is consistent on brand, varied
         // each session, and instant. It still flows through the normal
@@ -493,8 +657,16 @@ export function initRestSocket(wss: WebSocketServer) {
               .substring(boundaryIndex)
               .trimStart();
 
-            if (sentence.length > 0) {
-              const cleanSentence = sanitizeAiSpeech(sentence) || sentence;
+            // Intercept the @@INTEREST machine tag before anything reaches
+            // TTS or the transcript (its line has no sentence punctuation, so
+            // it normally surfaces in the final-buffer flush — this guard
+            // covers the rare mid-stream case too).
+            const { spoken: spokenPart, tagBody: midTag } =
+              splitInterestTag(sentence);
+            if (midTag !== null) handleInterestTag(midTag);
+
+            if (spokenPart.length > 0) {
+              const cleanSentence = sanitizeAiSpeech(spokenPart) || spokenPart;
               fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
               chunksProcessed++;
 
@@ -535,11 +707,18 @@ export function initRestSocket(wss: WebSocketServer) {
           }
         }
 
-        // 3. Process the final remaining chunk in the buffer (skip if barged in)
-        if (!turnAbort.signal.aborted && currentSentenceBuffer.trim().length > 0) {
-          const finalSentence = currentSentenceBuffer.trim();
+        // 3. Process the final remaining chunk in the buffer (skip if barged in).
+        // The @@INTEREST tag has no sentence punctuation, so this is where it
+        // normally lands — split it off before the text can reach TTS.
+        const { spoken: finalSpokenPart, tagBody: finalTag } = splitInterestTag(
+          currentSentenceBuffer.trim(),
+        );
+        if (!turnAbort.signal.aborted && finalTag !== null) {
+          handleInterestTag(finalTag);
+        }
+        if (!turnAbort.signal.aborted && finalSpokenPart.length > 0) {
           const cleanSentence =
-            sanitizeAiSpeech(finalSentence) || finalSentence;
+            sanitizeAiSpeech(finalSpokenPart) || finalSpokenPart;
           fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
           chunksProcessed++;
 
@@ -599,6 +778,13 @@ export function initRestSocket(wss: WebSocketServer) {
 
         const wasAborted = turnAbort.signal.aborted;
         if (currentTurnAbort === turnAbort) currentTurnAbort = null;
+
+        // Room-read tracking: does the panel currently have a question on the
+        // table? A founder speaking after a statement-only panel turn while
+        // the room has cooled counts as unprompted selling.
+        if (!isCoachMode && !turn.isGreeting && fullSpokenText.trim()) {
+          lastPanelTurnHadQuestion = /\?/.test(fullSpokenText);
+        }
 
         // 5. Update histories (record whatever was actually spoken, even if the
         // turn was cut short by a barge-in, so context stays coherent)
@@ -815,22 +1001,54 @@ export function initRestSocket(wss: WebSocketServer) {
           // live AI turn to drive (panel/coach); solo never runs one, so leaving
           // masterPrompt empty avoids accidentally arming the panel prompt for a
           // solo session if a turn path is ever added later.
+          //
+          // rebuildMasterPrompt handles the deck/research race in either order:
+          // whichever resolves last recomposes the prompt with everything
+          // available at that moment.
+          const rebuildMasterPrompt = () => {
+            if (isSoloMode || !liveConfig) return;
+            masterPrompt = getMasterPrompt(
+              isCoachMode,
+              currentBusinessName,
+              liveConfig,
+            );
+            if (marketSnapshot) {
+              masterPrompt += "\n" + buildMarketSnapshotBlock(marketSnapshot);
+            }
+          };
+
           resolveDeckText(clientConfig)
             .then((text) => {
               resolvedDeckText = text;
               if (isSoloMode) return;
-              const enrichedConfig = {
+              liveConfig = {
                 ...clientConfig,
                 resolvedDeckText,
                 previousSession: previousSessionCtx,
               };
-              masterPrompt = getMasterPrompt(
-                isCoachMode,
-                currentBusinessName,
-                enrichedConfig,
-              );
+              rebuildMasterPrompt();
             })
             .catch((err) => console.error("Error resolving deck text:", err));
+
+          // Fire-and-forget web research (panel + coach; solo has no live
+          // turns and its coach-style report has no competitor section).
+          // researchStartup never throws and resolves null when disabled.
+          if (!isSoloMode) {
+            researchStartup({
+              businessName: currentBusinessName,
+              description: clientConfig.description || "",
+              industry: clientConfig.industry || "",
+            })
+              .then((snap) => {
+                if (!snap || sessionEnded) return;
+                marketSnapshot = snap;
+                rebuildMasterPrompt();
+                console.log(
+                  `🔎 [research] Market snapshot ready (${snap.text.length} chars, retrieved ${snap.retrievedAt}) — panel grounded for later turns.`,
+                );
+              })
+              .catch(() => {});
+          }
 
           if (hasAzureSttConfig()) {
             sttRecognizer = createStreamingRecognizer(
@@ -856,7 +1074,12 @@ export function initRestSocket(wss: WebSocketServer) {
                   return;
                 }
 
-                enqueueTurn({ text, inputMethod: "voice" });
+                noteFounderTurnForRoomRead();
+                enqueueTurn({
+                  text,
+                  inputMethod: "voice",
+                  timeLeft: getTimeLeftSeconds(),
+                });
 
                 // Raw STT words, shown instantly — no LLM summarization pass.
                 // The prompts tell the AI this is speech-recognition output and
@@ -908,6 +1131,15 @@ export function initRestSocket(wss: WebSocketServer) {
           lastUserActivityTime = Date.now();
           sessionStartTimestamp = Date.now();
           initialDurationSeconds = Number(clientConfig.duration || 15) * 60;
+          // On resume (reconnect after refresh) the client reports how much
+          // time was actually left — otherwise the server clock would restart
+          // at the full duration and time_sync would extend the session.
+          if (isResume && Number.isFinite(Number(data.timeLeftSeconds))) {
+            initialDurationSeconds = Math.min(
+              initialDurationSeconds,
+              Math.max(0, Math.floor(Number(data.timeLeftSeconds))),
+            );
+          }
           hasNudged = false;
 
           idleCheckInterval = setInterval(() => {
@@ -915,15 +1147,46 @@ export function initRestSocket(wss: WebSocketServer) {
             const NUDGE_THRESHOLD = 60 * 1000; // 60 seconds
             const END_THRESHOLD = 5 * 60 * 1000; // 5 minutes
 
-            const elapsedSeconds = Math.floor(
-              (Date.now() - sessionStartTimestamp) / 1000,
-            );
-            const timeLeftSeconds = Math.max(
-              0,
-              initialDurationSeconds - elapsedSeconds,
-            );
+            const timeLeftSeconds = getTimeLeftSeconds();
             const mins = Math.floor(timeLeftSeconds / 60);
             const secs = timeLeftSeconds % 60;
+
+            // Keep the client's displayed countdown aligned with the server
+            // clock (background-tab throttling can slow the client timer).
+            sendJson(ws, { type: "time_sync", timeLeftSeconds });
+
+            // ── Proactive time management (one-shot cues, not nudges — they
+            // must survive the founder speaking and fire exactly once). The
+            // AI otherwise only sees the clock when the founder talks, which
+            // is why sessions used to just hit 0:00 mid-conversation. ──
+            if (!isSoloMode && !sessionEnded && timeLeftSeconds > 0) {
+              // Halfway check-in — only for sessions long enough that a
+              // mid-point marker is useful (≥ 8 minutes).
+              if (
+                !halfwayCueSent &&
+                initialDurationSeconds >= 8 * 60 &&
+                timeLeftSeconds <= initialDurationSeconds / 2
+              ) {
+                halfwayCueSent = true;
+                enqueueTurn({
+                  text: `[SYSTEM: Time check — about half the session remains (${mins}:${String(secs).padStart(2, "0")} left). ${isCoachMode ? "Riley" : "The most natural panelist"} should acknowledge the time in ONE short spoken sentence and steer toward the most important area not yet covered. Keep it natural — no lecture about time.]`,
+                  inputMethod: "chat",
+                  timeLeft: timeLeftSeconds,
+                });
+              }
+              // Two-minute wrap-up — start landing the plane so the hard stop
+              // never cuts anyone off mid-thought.
+              if (!wrapUpCueSent && timeLeftSeconds <= 120) {
+                wrapUpCueSent = true;
+                enqueueTurn({
+                  text: isCoachMode
+                    ? `[SYSTEM: Only ${mins}:${String(secs).padStart(2, "0")} remains. Riley — tell the founder time is almost up, invite their closing summary, and prepare one final encouraging takeaway. Short spoken sentences only.]`
+                    : `[SYSTEM: Only ${mins}:${String(secs).padStart(2, "0")} remains. Panel — say so out loud and begin wrapping up: no new complex topics, one final clarification at most, then Marcus steers toward closing remarks so the verdict doesn't cut anyone off. ONE speaker, 1-2 sentences.]`,
+                  inputMethod: "chat",
+                  timeLeft: timeLeftSeconds,
+                });
+              }
+            }
 
             if (idleMs >= END_THRESHOLD) {
               console.log("⏱️ User idle for 5+ minutes. Auto-ending session.");
@@ -980,6 +1243,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
 
+          noteFounderTurnForRoomRead();
           enqueueTurn({
             text: data.text,
             timeLeft:
@@ -1064,6 +1328,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 resolvedDeckText,
                 sessionMode,
                 previousSessionCtx,
+                marketSnapshot,
               ).catch((err) => {
                 console.error("❌ Background evaluation failed:", err);
                 return null;
@@ -1122,6 +1387,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 resolvedDeckText,
                 sessionMode,
                 previousSessionCtx,
+                marketSnapshot,
               );
             }
             reportData = {
@@ -1129,6 +1395,12 @@ export function initRestSocket(wss: WebSocketServer) {
               ...evaluated,
               evaluationStatus: "complete",
             };
+
+            // Room-read feedback is derived server-side from the interest
+            // timeline (never model-estimated); only attached when it applies.
+            const roomReadNote = buildRoomReadNote();
+            if (roomReadNote) reportData.room_read_note = roomReadNote;
+
             console.log("✅ Evaluation succeeded! Scores:", reportData.scores);
           } catch (evalErr) {
             console.error("❌ Evaluation failed:", evalErr);
