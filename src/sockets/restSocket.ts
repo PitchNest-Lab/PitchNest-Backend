@@ -3,6 +3,7 @@ import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import {
   evaluatePitch,
+  hasSubstantivePitch,
   getMasterPrompt,
   generatePanelResponse,
   streamPanelResponse,
@@ -1282,9 +1283,6 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           // The founder ended the session — cut the panel off immediately.
-          // Abort any in-flight turn and drop everything still queued so the
-          // verdict is the very next thing spoken (no "let me finish my point
-          // first" before the verdicts).
           if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
             currentTurnAbort.abort();
           }
@@ -1295,6 +1293,56 @@ export function initRestSocket(wss: WebSocketServer) {
             { name: "Sarah", role: "Financial Analyst" },
             { name: "Chen", role: "Technical Partner" },
           ];
+
+          // If no substantive pitch was given, send non-hallucinated PASS verdicts directly
+          if (!hasSubstantivePitch(fullTranscript)) {
+            console.log("ℹ️ Empty pitch detected for verdict request — returning non-hallucinated PASS verdicts.");
+            const emptyVerdicts = [
+              {
+                speaker: "Marcus",
+                text: "PASS — You didn't present your pitch or outline your problem and solution during this session.",
+                verdict: "pass" as const,
+              },
+              {
+                speaker: "Sarah",
+                text: "PASS — No business model, traction, or financial details were presented for evaluation.",
+                verdict: "pass" as const,
+              },
+              {
+                speaker: "Chen",
+                text: "PASS — No product details or technical execution plan were presented.",
+                verdict: "pass" as const,
+              },
+            ];
+
+            for (const v of emptyVerdicts) {
+              sendJson(ws, {
+                type: "verdict_message",
+                speaker: v.speaker,
+                text: v.text,
+                verdict: v.verdict,
+              });
+
+              if (isTtsConfigured()) {
+                try {
+                  const vName = resolveVoiceName(v.speaker);
+                  const buf = await synthesizeSpeech(v.text, vName);
+                  const base64Audio = Buffer.from(buf).toString("base64");
+                  sendJson(ws, {
+                    type: "audio",
+                    data: base64Audio,
+                    speaker: v.speaker,
+                  });
+                } catch (e) {
+                  console.error("Verdict TTS error:", e);
+                }
+              }
+            }
+
+            sendJson(ws, { type: "verdict_complete" });
+            return;
+          }
+
           const panelistNames = panelists
             .map((p: any) => `${p.name} (${p.role})`)
             .join(", ");
@@ -1315,10 +1363,7 @@ export function initRestSocket(wss: WebSocketServer) {
             const t = Array.isArray(data.transcript)
               ? data.transcript
               : fullTranscript;
-            const hasUserContent = t.some(
-              (m: any) => m.type === "user" && (m.text || "").trim().length > 0,
-            );
-            if (hasUserContent) {
+            if (hasSubstantivePitch(t)) {
               console.log(
                 "🧠 Pre-starting evaluation in background (parallel with verdicts)...",
               );

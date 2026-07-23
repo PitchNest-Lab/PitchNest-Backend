@@ -486,13 +486,13 @@ DECK INSTRUCTIONS:
 
 function buildToneDirective(aggressiveness: number, riskAppetite: number): string {
   const tone =
-    aggressiveness >= 80
-      ? "Analytical and direct. Focus purely on the data, metrics, and financials."
-      : aggressiveness >= 60
-      ? "Direct and professional. Ask about unit economics and growth."
-      : aggressiveness >= 40
-        ? "Professional and probing. Balance support with follow-ups."
-        : "Supportive and patient. Ask clarifying questions before challenging.";
+    aggressiveness >= 81
+      ? "EXTREMELY DEMANDING. Skeptical by default. Ask rapid-fire follow-ups and expect concise, sharp answers — low patience for vague or rambling responses. Override the default interrupt threshold: interject after ~15 seconds of a non-answer instead of waiting 30."
+      : aggressiveness >= 61
+      ? "TOUGH. Frequently follow up and challenge assumptions rather than accepting a first answer. Push back at least once on any unsupported claim or number."
+      : aggressiveness >= 31
+        ? "REALISTIC INVESTOR MEETING. Balanced challenge — professional and probing, follow up on weak points, but don't pile on."
+        : "FRIENDLY / COACHING. Supportive and patient. Ask clarifying questions before challenging, and it's fine to give a founder a gentle hint if they're visibly stuck.";
 
   const risk =
     riskAppetite >= 80
@@ -528,32 +528,160 @@ ${riskLines || "- (none recorded)"}
 `;
 }
 
+interface PersonaProfile {
+  label: string;
+  /** 1-2 sentence framing of what this panel is optimizing for. */
+  mindset: string;
+  /** What Marcus (lead) focuses on and how he talks, for THIS persona. */
+  marcus: string;
+  /** What Sarah focuses on and how she talks, for THIS persona. */
+  sarah: string;
+  /** What Chen focuses on and how he talks, for THIS persona. */
+  chen: string;
+  /** Optional distinctive behavior instruction unique to this persona. */
+  signature?: string;
+}
+
+const PERSONA_PROFILES: Record<string, PersonaProfile> = {
+  "Seed Stage - Venture Capital": {
+    label: "Seed VC",
+    mindset:
+      "You are a professional early-stage VC fund. You bet on team and market timing over current traction — the question you're really answering is whether this can be a venture-scale (billion-dollar) outcome.",
+    marcus:
+      "Marcus (Lead): blunt and direct. Owns market sizing, competition, moat, and the overall 'is this venture-scale' call. Pushes on TAM/SAM/SOM logic and why-now.",
+    sarah:
+      "Sarah (Partner): precise, numbers-first. Owns unit economics, pricing, LTV/CAC potential, and runway. Comfortable if numbers are projections, not just asks for the underlying logic.",
+    chen:
+      "Chen (Tech Investor): calm and technical. Owns founder-market fit, product defensibility, and execution feasibility over an 18-month horizon.",
+  },
+  "Angel Investor Group": {
+    label: "Angel Group",
+    mindset:
+      "You are a syndicate of individual angel investors, not an institutional fund. You invest personally, care about the founder as a person, and don't need a billion-dollar outcome — a solid, honest return is enough. You are warmer and more conversational than a VC panel.",
+    marcus:
+      "Marcus (Lead Angel): warm, story-driven. Opens by inviting the founder's personal story — why THEY are building this — before touching numbers. Reacts with genuine encouragement when something resonates.",
+    sarah:
+      "Sarah (Angel): asks about early traction and resilience rather than fund-return math. Interested in how a smaller, personal check would be used, and whether the founder can execute without a large team.",
+    chen:
+      "Chen (Angel): curious about the product in plain, non-technical language — asks the founder to explain it 'like I'm not an engineer,' and cares whether the founder can clearly explain their own product.",
+    signature:
+      "Avoid institutional VC jargon (no 'fund economics', 'reserve ratio', etc). Keep the tone personal and relationship-driven throughout.",
+  },
+  "Growth Stage - Venture Capital": {
+    label: "Growth Fund",
+    mindset:
+      "You are a later-stage growth investor writing larger checks into companies with PROVEN traction. You are numbers-obsessed and skeptical of vision-only narratives — you want evidence, not hockey-stick projections.",
+    marcus:
+      "Marcus (Lead): blunt, impatient with narrative fluff. Pushes past the pitch story straight to 'what's the growth rate and why raise now vs later.'",
+    sarah:
+      "Sarah (Partner): drills into CAC, LTV, churn, gross margin, and burn multiple. Wants specific numbers, not ranges, and will ask the founder to defend any number that sounds soft.",
+    chen:
+      "Chen (Tech Investor): focused on whether the tech/ops can scale 5-10x without breaking — infra cost curve, team scaling, technical debt.",
+  },
+  "Shark Tank Judge": {
+    label: "Shark Tank Judge",
+    mindset:
+      "This is a Shark-Tank-style panel: theatrical, blunt, deal-focused. You want a deal RIGHT NOW, not a strategic discussion. You enjoy playing devil's advocate and being direct, even a little harsh — this should feel entertaining and high-pressure, not cruel.",
+    marcus:
+      "Marcus (Lead Shark): combative and valuation-obsessed. Immediately challenges the ask ('why is this worth what you say it's worth'), and demands equity/deal-term clarity.",
+    sarah:
+      "Sarah (Shark): pushes for sales numbers on the spot ('what did you sell last month, exact number') and tests whether the founder can be copied easily.",
+    chen:
+      "Chen (Shark): tests founder conviction directly — 'what's stopping someone from doing this cheaper' — and wants punchy, confident answers, not long strategic explanations.",
+    signature:
+      "Any panelist may say 'I'm out' bluntly if unconvinced, or 'I'm in, but I want more equity' if interested. Reward founders who answer fast and concisely; visibly lose patience with long-winded answers.",
+  },
+  "Private Equity": {
+    label: "Private Equity",
+    mindset:
+      "You evaluate mature, cash-flow businesses, not speculative vision. You are risk-averse and focused on downside protection, predictable returns, and control — formal and methodical, not excitable.",
+    marcus:
+      "Marcus (Lead): formal and conservative. Focused on operational efficiency, management depth beyond just the founder, and governance.",
+    sarah:
+      "Sarah (Partner): owns cash flow stability, EBITDA, margin structure, and capital efficiency. Uncomfortable with pure growth-at-all-costs framing — asks how the business survives a downturn.",
+    chen:
+      "Chen (Partner): focused on operational/technical risk and exit strategy — how does this business get bought or IPO'd eventually.",
+  },
+  "Strategic Corporate VC": {
+    label: "Corporate VC",
+    mindset:
+      "You represent the investment arm of a large corporation. Financial return matters, but strategic fit with your parent company matters just as much — you keep tying the conversation back to 'what's in it for us.'",
+    marcus:
+      "Marcus (Lead): corporate and cautious. Asks how this threatens or helps the parent company's core industry, and probes partnership/integration potential.",
+    sarah:
+      "Sarah (Partner): focused on IP protection, exclusivity terms, and integration risk with existing corporate systems.",
+    chen:
+      "Chen (Partner): technical due diligence on how this would actually integrate with the parent company's stack or distribution.",
+  },
+  "Family Office": {
+    label: "Family Office",
+    mindset:
+      "You manage long-term wealth for a single family. Capital preservation matters as much as growth, you are patient (not rushed by FOMO), and personal trust/character matters enormously — measured and low-key, sometimes reserved.",
+    marcus:
+      "Marcus (Lead): measured, unhurried. Cares about founder character and integrity as much as the business plan — asks questions that reveal how the founder handles setbacks.",
+    sarah:
+      "Sarah (Advisor): focused on long-term durability and downside risk — how does this business survive a bad decade, not just a good year.",
+    chen:
+      "Chen (Advisor): interested in values alignment and whether the founder is building something they'll still care about in 10 years.",
+  },
+  "Y Combinator Partner": {
+    label: "Y Combinator Partner",
+    mindset:
+      "You are YC-style operator-investors who have seen thousands of pitches. You are obsessed with clarity, speed, and 'make something people want.' Fast-paced and efficient — you cut through fluff without being rude.",
+    marcus:
+      "Marcus (Lead): fast, direct, slightly informal. Opens with 'explain this in one sentence' energy and pushes for concision over polish.",
+    sarah:
+      "Sarah (Partner): focused on week-over-week growth signals, retention, and user love — wants specifics ('how many users, what's the number') not adjectives.",
+    chen:
+      "Chen (Partner): asks 'what have you actually shipped' and 'why you, why now' — testing founder-market fit and execution speed.",
+  },
+  "ESG & Impact Investor": {
+    label: "ESG & Impact Investor",
+    mindset:
+      "You invest for financial return AND measurable social/environmental impact — 'doing well by doing good,' not charity. You're thoughtful and values-driven, and you push back on impact-washing.",
+    marcus:
+      "Marcus (Lead): thoughtful, asks for the founder's theory of change and how impact is actually measured, not just claimed.",
+    sarah:
+      "Sarah (Partner): checks whether the business model itself is sustainable (not just the mission) — does monetization align with or undercut the impact goal.",
+    chen:
+      "Chen (Partner): probes for unintended negative externalities and whether impact claims are backed by real metrics.",
+  },
+  "Demo Presentation": {
+    label: "Demo Presentation",
+    mindset:
+      "IMPORTANT — this is a product/feature DEMO, not a general fundraising pitch. Judge what is being shown, not fund-level economics. Do not open with TAM, CAC, or valuation questions — focus on the product itself, with only light business questions near the end.",
+    marcus:
+      "Marcus (Lead): product-focused. Asks 'show me that again' or 'what happens if I do X' — reacting to what's actually being demonstrated on screen, not abstract claims.",
+    sarah:
+      "Sarah: checks whether the demo's claims match what's actually shown — asks what's real/functional vs mocked or simulated, and about user experience quality.",
+    chen:
+      "Chen: focused on technical feasibility of what's shown — architecture behind the demo, what's next on the roadmap, and whether this scales past a demo environment.",
+    signature:
+      "Only ask 1-2 light business questions (e.g. rough plan to monetize) near the END of the session, after the product itself has been thoroughly explored.",
+  },
+};
+
+const DEFAULT_PERSONA = PERSONA_PROFILES["Seed Stage - Venture Capital"];
+
+function getPersonaProfile(archetype: string): PersonaProfile {
+  if (archetype && PERSONA_PROFILES[archetype]) return PERSONA_PROFILES[archetype];
+  // Back-compat fallback for any old saved sessions with slightly different strings.
+  const a = archetype || "";
+  if (a.includes("Angel")) return PERSONA_PROFILES["Angel Investor Group"];
+  if (a.includes("Growth") || a.includes("Series")) return PERSONA_PROFILES["Growth Stage - Venture Capital"];
+  if (a.includes("Shark")) return PERSONA_PROFILES["Shark Tank Judge"];
+  if (a.includes("Private Equity")) return PERSONA_PROFILES["Private Equity"];
+  if (a.includes("Corporate")) return PERSONA_PROFILES["Strategic Corporate VC"];
+  if (a.includes("Family")) return PERSONA_PROFILES["Family Office"];
+  if (a.includes("Combinator")) return PERSONA_PROFILES["Y Combinator Partner"];
+  if (a.includes("Impact") || a.includes("ESG")) return PERSONA_PROFILES["ESG & Impact Investor"];
+  if (a.includes("Demo")) return PERSONA_PROFILES["Demo Presentation"];
+  return DEFAULT_PERSONA;
+}
+
 function buildArchetypeDirective(archetype: string): string {
-  if (archetype?.includes("Angel")) {
-    return "PANEL STYLE: Warm angel group. Lead with encouragement, then dig into founder-market fit and early traction.";
-  }
-  if (archetype?.includes("Series") || archetype?.includes("Growth")) {
-    return "PANEL STYLE: Growth-stage investors. Focus on scalability, margins, and path to Series A metrics.";
-  }
-  if (archetype?.includes("Shark Tank")) {
-    return "PANEL STYLE: Fast-paced consumer investors. Focused on valuation and quick consumer adoption.";
-  }
-  if (archetype?.includes("Private Equity")) {
-    return "PANEL STYLE: Private Equity analysts. Obsessed with cash flow, EBITDA, restructuring, and debt efficiency.";
-  }
-  if (archetype?.includes("Corporate VC")) {
-    return "PANEL STYLE: Strategic Corporate VC. Focused on synergies with your parent company and M&A potential.";
-  }
-  if (archetype?.includes("Family Office")) {
-    return "PANEL STYLE: Wealthy Family Office. Patient capital, focused on generational wealth preservation and sustainable growth.";
-  }
-  if (archetype?.includes("Y Combinator")) {
-    return "PANEL STYLE: Y Combinator partners. Fast-paced, focused on launch velocity, product-market fit, and user growth.";
-  }
-  if (archetype?.includes("Impact") || archetype?.includes("ESG")) {
-    return "PANEL STYLE: ESG/Impact investors. Focused on sustainability, ethical metrics, and social/environmental impact alongside returns.";
-  }
-  return "PANEL STYLE: Seed-stage VC boardroom. Prioritize TAM, moat, team, and 18-month milestones.";
+  const p = getPersonaProfile(archetype);
+  return `PANEL STYLE — ${p.label.toUpperCase()}: ${p.mindset}${p.signature ? `\nSIGNATURE BEHAVIOR: ${p.signature}` : ""}`;
 }
 
 /**
@@ -571,6 +699,7 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
   const extractedDeckText = configData.selectedDeck?.extracted_text || configData.resolvedDeckText || "";
   const deckContext = buildDeckContext(deckName, extractedDeckText);
   const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
+  const persona = getPersonaProfile(archetype);
   const returningBlock = buildReturningFounderBlock(configData.previousSession, currentBusinessName);
 
   if (isCoach) {
@@ -630,10 +759,10 @@ PANEL CONVERSATION STYLE
 
 You are three distinct investors having a real, flowing conversation with a founder. You are not running a script.
 
-Personalities (keep them distinct in voice and focus):
-- Marcus (Lead): blunt and direct. Owns market, competition, moat, and the overall "would I invest" call. Opens the session and delivers the closing direction.
-- Sarah (Partner): precise, numbers-first. Owns unit economics, financials, pricing, LTV/CAC, retention — and the ask itself: raise amount, equity offered, and the implied valuation. Asks for specific figures.
-- Chen (Tech Investor): calm and technical. Owns product, architecture, build-vs-buy, data, and execution feasibility.
+Personalities (keep them distinct in voice and focus — this is what makes THIS panel type feel different from other investor types):
+- ${persona.marcus}
+- ${persona.sarah}
+- ${persona.chen}
 
 How the conversation flows:
 - After the founder gives their opening (problem + solution), engage as a genuine discussion, not a fixed Q&A list.
@@ -689,6 +818,21 @@ export function getOpenAIClient() {
   return new OpenAI({ apiKey: config.openAiApiKey });
 }
 
+export function hasSubstantivePitch(transcript: any[]): boolean {
+  if (!Array.isArray(transcript) || transcript.length === 0) return false;
+  const userTurns = transcript.filter(
+    (m: any) => m && (m.type === "user" || m.role === "user"),
+  );
+  if (userTurns.length === 0) return false;
+
+  const totalUserText = userTurns
+    .map((m: any) => String(m.fullText || m.text || "").trim())
+    .join(" ");
+
+  const words = totalUserText.match(/\S+/g) || [];
+  return totalUserText.length >= 80 || words.length >= 15;
+}
+
 export async function evaluatePitch(
   transcript: any[],
   businessName: string,
@@ -705,6 +849,39 @@ export async function evaluatePitch(
   // Grounds the competitive-intel section in real, dated web results.
   researchContext?: { text: string; retrievedAt: string } | null,
 ): Promise<EvaluationReport> {
+  if (!hasSubstantivePitch(transcript)) {
+    console.log("ℹ️ Skipping evaluation LLM calls: transcript has no substantive pitch content.");
+    return {
+      summary:
+        "No pitch delivered. To receive pitch scores, competitor analysis, and actionable feedback, please present your startup during the session (at minimum defining your problem and solution).",
+      scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 },
+      strengths: [],
+      risks: ["No pitch presented — problem and solution were not communicated during the session."],
+      next_steps: [
+        {
+          title: "Define the Problem",
+          desc: "Clearly state the core pain point your startup solves in your opening pitch.",
+          priority: "High Priority",
+        },
+        {
+          title: "Present Your Solution",
+          desc: "Explain how your product solves the problem efficiently.",
+          priority: "High Priority",
+        },
+        {
+          title: "Outline Target Market",
+          desc: "Share who your target customers are and how you generate revenue.",
+          priority: "Medium Priority",
+        },
+      ],
+      sentiments: [
+        { persona: "Marcus", quote: "No pitch was presented during this session to evaluate." },
+      ],
+      evaluationStatus: "insufficient_data",
+      transcript: Array.isArray(transcript) ? transcript : [],
+    };
+  }
+
   const transcriptText = Array.isArray(transcript) && transcript.length > 0
     ? transcript.map(m => {
         if (m.type === 'user') {
