@@ -26,6 +26,7 @@
     "express": "^4.21.2",
     "express-rate-limit": "^8.5.2",
     "google-auth-library": "^10.6.1",
+    "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.546.0",
     "microsoft-cognitiveservices-speech-sdk": "^1.50.0",

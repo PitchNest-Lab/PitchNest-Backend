@@ -63,9 +63,14 @@ export const handleSurvey = async (req: Request, res: Response) => {
     const cleanEmail = email.toLowerCase().trim();
 
     const row: Record<string, string> = { email: cleanEmail };
-    if (pitch_type) row.pitch_type = pitch_type;
-    if (frustration) row.frustration = frustration;
-    if (next_pitch) row.next_pitch = next_pitch;
+    // Validate and truncate optional survey fields.
+    const MAX_SURVEY_LEN = 500;
+    if (pitch_type && typeof pitch_type === "string")
+      row.pitch_type = pitch_type.slice(0, MAX_SURVEY_LEN);
+    if (frustration && typeof frustration === "string")
+      row.frustration = frustration.slice(0, MAX_SURVEY_LEN);
+    if (next_pitch && typeof next_pitch === "string")
+      row.next_pitch = next_pitch.slice(0, MAX_SURVEY_LEN);
 
     // Upsert so repeat submissions update existing rows
     const { error } = await supabase

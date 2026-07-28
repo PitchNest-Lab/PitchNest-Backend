@@ -1,4 +1,6 @@
 import { WebSocket, WebSocketServer } from "ws";
+import type { IncomingMessage } from "http";
+import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import {
@@ -270,11 +272,57 @@ type QueuedTurn = {
   panelists?: any[];
 };
 
+// ── Per-user concurrency cap ───────────────────────────────────────────────
+// Prevents a single user from running many concurrent sessions (billing abuse).
+const MAX_WS_PER_USER = 3;
+const activeWsByUser = new Map<number, Set<WebSocket>>();
+
+function trackUserWs(userId: number, ws: WebSocket) {
+  if (!activeWsByUser.has(userId)) activeWsByUser.set(userId, new Set());
+  activeWsByUser.get(userId)!.add(ws);
+}
+function untrackUserWs(userId: number, ws: WebSocket) {
+  const set = activeWsByUser.get(userId);
+  if (set) {
+    set.delete(ws);
+    if (set.size === 0) activeWsByUser.delete(userId);
+  }
+}
+
 export function initRestSocket(wss: WebSocketServer) {
-  wss.on("connection", async (ws) => {
+  wss.on("connection", async (ws, req: IncomingMessage) => {
+    // ── JWT Authentication ──────────────────────────────────────────────────
+    // Clients must pass ?token=<JWT> as a query param on the WS URL.
+    // Without a valid token the connection is closed immediately.
+    let authenticatedUserId: number | null = null;
+    try {
+      const url = new URL(req.url || "", `http://${req.headers.host}`);
+      const token = url.searchParams.get("token");
+      if (!token) {
+        sendJson(ws, { type: "error", message: "Authentication required.", code: "AUTH_REQUIRED" });
+        ws.close(4001, "Authentication required");
+        return;
+      }
+      const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+      authenticatedUserId = decoded.id;
+
+      // Concurrency cap
+      const existing = activeWsByUser.get(authenticatedUserId);
+      if (existing && existing.size >= MAX_WS_PER_USER) {
+        sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
+        ws.close(4002, "Too many sessions");
+        return;
+      }
+      trackUserWs(authenticatedUserId, ws);
+    } catch (err) {
+      sendJson(ws, { type: "error", message: "Invalid or expired token.", code: "AUTH_FAILED" });
+      ws.close(4001, "Authentication failed");
+      return;
+    }
+
     let currentVideoUrl = "";
     let currentBusinessName = "Unknown Pitch";
-    let currentUserId: number | null = null;
+    let currentUserId: number | null = authenticatedUserId;
     let hasSentSetup = false;
     let sessionId = 0;
     let resolvedDeckText = "";
@@ -449,6 +497,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("close", () => {
       console.log("🔌 Client disconnected.");
+      if (authenticatedUserId) untrackUserWs(authenticatedUserId, ws);
       if (idleCheckInterval) clearInterval(idleCheckInterval);
       if (sttRecognizer) sttRecognizer.stop();
     });
@@ -813,7 +862,7 @@ export function initRestSocket(wss: WebSocketServer) {
         console.error("❌ Error generating AI response:", err);
         sendJson(ws, {
           type: "error",
-          message: err.message || "Failed to generate AI response",
+          message: "Failed to generate AI response. Please try again.",
           code: "AI_FAILED",
         });
         sendJson(ws, { type: "turn_complete" });

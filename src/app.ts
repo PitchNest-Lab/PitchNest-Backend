@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 import path from "path";
 import fs from "fs";
 import { config } from "./config/env.ts";
@@ -47,6 +48,19 @@ app.use(cors({
   },
   credentials: true,
 }));
+
+// ── Security headers ────────────────────────────────────────────────────────
+// helmet sets sensible defaults: X-Content-Type-Options, X-Frame-Options,
+// Strict-Transport-Security, Referrer-Policy, X-DNS-Prefetch-Control, etc.
+app.use(
+  helmet({
+    // CSP is relaxed because the backend may serve the frontend SPA.
+    contentSecurityPolicy: false,
+    // Allow framing from same origin (needed for embedded previews).
+    frameguard: { action: "sameorigin" },
+  }),
+);
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 

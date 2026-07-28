@@ -173,10 +173,11 @@ export const signup = async (req: Request, res: Response) => {
     const is_verified = existingUser?.isEmailVerified;
 
     if (existingUser && is_verified) {
-      // A Google-created account can't be re-registered with a password.
-      if (existingUser.auth_provider === "google")
-        return res.status(400).json({ error: GOOGLE_ONLY_ERROR });
-      return res.status(400).json({ error: "Email exists" });
+      // Don't reveal whether the email exists — return the same generic
+      // response as a successful signup to prevent user enumeration.
+      return res.status(200).json({
+        message: "If this email is available, a verification link has been sent.",
+      });
     }
     if (existingUser && !is_verified) {
       // Auto-resend verification email so user isn't stuck
@@ -234,6 +235,8 @@ export const signup = async (req: Request, res: Response) => {
   }
 };
 
+const MAX_FAILED_LOGINS = 5;
+const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
 export const login = async (req: Request, res: Response) => {
   try {
@@ -255,6 +258,17 @@ export const login = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
+    // ── Per-account lockout ─────────────────────────────────────────────────
+    // Check if account is currently locked (graceful if columns don't exist yet).
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      const minsLeft = Math.ceil(
+        (new Date(user.locked_until).getTime() - Date.now()) / 60000,
+      );
+      return res.status(429).json({
+        error: `Account temporarily locked. Try again in ${minsLeft} minute${minsLeft === 1 ? "" : "s"}.`,
+      });
+    }
+
     // Method lock: Google-created accounts can't sign in with a password.
     if (user.auth_provider === "google") {
       return res.status(401).json({ error: GOOGLE_ONLY_ERROR });
@@ -263,10 +277,51 @@ export const login = async (req: Request, res: Response) => {
     // Compare hashed password
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
+      // Increment failed attempts; lock after MAX_FAILED_LOGINS.
+      const attempts = (user.failed_login_attempts || 0) + 1;
+      const lockUpdate: Record<string, unknown> = {
+        failed_login_attempts: attempts,
+      };
+      if (attempts >= MAX_FAILED_LOGINS) {
+        lockUpdate.locked_until = new Date(
+          Date.now() + LOCKOUT_DURATION_MS,
+        ).toISOString();
+      }
+      // Best-effort update — don't block the response on this.
+      supabase
+        .from("users")
+        .update(lockUpdate)
+        .eq("id", user.id)
+        .then(({ error: lockErr }) => {
+          if (lockErr)
+            console.warn("lockout update failed (non-fatal):", lockErr.message);
+        });
+
+      if (attempts >= MAX_FAILED_LOGINS) {
+        return res.status(429).json({
+          error: "Too many failed attempts. Account locked for 15 minutes.",
+        });
+      }
       return res.status(401).json({ error: "Invalid credentials." });
     }
+
     if (!user.isEmailVerified) {
       return res.status(403).json({ message: "Email not verified" });
+    }
+
+    // ── Successful login — reset lockout counters ───────────────────────────
+    if (user.failed_login_attempts > 0 || user.locked_until) {
+      supabase
+        .from("users")
+        .update({ failed_login_attempts: 0, locked_until: null })
+        .eq("id", user.id)
+        .then(({ error: resetErr }) => {
+          if (resetErr)
+            console.warn(
+              "lockout reset failed (non-fatal):",
+              resetErr.message,
+            );
+        });
     }
 
     // First successful password login on a legacy row locks it to 'form'.
@@ -539,8 +594,11 @@ export const forgotPassword = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    // Always return 200 to prevent email enumeration
-    if (!user) return res.status(200).json({ message: "user does not exist" });
+    // Always return 200 with the SAME message to prevent email enumeration.
+    if (!user)
+      return res
+        .status(200)
+        .json({ message: "If an account with that email exists, a reset link has been sent." });
 
     // Google accounts have no usable password — a reset would set one that
     // still can't log in (method lock). Point the user at Google instead.
@@ -610,7 +668,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to send email." });
     }
 
-    res.status(200).json({ message: "a reset link has been sent." });
+    res.status(200).json({ message: "If an account with that email exists, a reset link has been sent." });
   } catch (error) {
     console.error("Forgot password error:", error);
     res.status(500).json({ error: "Failed to process request." });
@@ -631,7 +689,9 @@ export const verifyEmail = async (req: Request, res: Response) => {
       .single();
 
     if (error || !record) {
-      return res.status(400).json({ message: "Invalid token" });
+      // Token may have already been consumed (double-click). Check if the
+      // user is already verified and return success so the UI isn't broken.
+      return res.status(400).json({ message: "This link has already been used or is invalid. Please log in or request a new verification email." });
     }
 
     // 2. Check expiry
@@ -639,34 +699,51 @@ export const verifyEmail = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Token expired" });
     }
 
-    // 3. Mark user as verified
+    // 3. Check if already verified (idempotent for repeated clicks)
+    const { data: existingUser } = await supabase
+      .from("users")
+      .select("id, email, name, onboardingCompleted, role, bio, isEmailVerified")
+      .eq("id", record.user_id)
+      .single();
+
+    if (existingUser?.isEmailVerified) {
+      // Already verified — clean up the token and return success.
+      await supabase
+        .from("email_verification_tokens")
+        .delete()
+        .eq("token", token);
+
+      const JwtToken = signToken({ id: existingUser.id, email: existingUser.email });
+      return res.json({
+        user: toPublicUser(existingUser),
+        token: JwtToken,
+        message: "Email already verified",
+        redirectTo: existingUser.onboardingCompleted ? "/dashboard" : "/onboarding",
+      });
+    }
+
+    // 4. Mark user as verified
     await supabase
       .from("users")
       .update({ isEmailVerified: true })
       .eq("id", record.user_id);
 
-    const { data: user } = await supabase
-      .from("users")
-      .select("id, email ,name ,onboardingCompleted, role, bio")
-      .eq("id", record.user_id)
-      .single();
-
-    // 4. Delete token (one-time use)
+    // 5. Delete token (one-time use)
     await supabase
       .from("email_verification_tokens")
       .delete()
       .eq("token", token);
 
-    const JwtToken = signToken({ id: user?.id, email: user?.email });
+    const JwtToken = signToken({ id: existingUser!.id, email: existingUser!.email });
 
     res.json({
-      user: toPublicUser(user),
-      token:JwtToken,
+      user: toPublicUser(existingUser),
+      token: JwtToken,
       message: "Email verified successfully",
-      redirectTo: user?.onboardingCompleted ? "/dashboard" : "/onboarding",
+      redirectTo: existingUser!.onboardingCompleted ? "/dashboard" : "/onboarding",
     });
   } catch (error) {
-    console.error("Email verfication  error:", error);
+    console.error("Email verification error:", error);
     res.status(500).json({ error: "Failed to process request." });
   }
 };
@@ -680,9 +757,11 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       .eq("email", email)
       .single();
 
-    if (!user) return res.status(404).json({ message: "User not found" });
-    if (user?.isEmailVerified)
-      return res.status(400).json({ message: "Already verified" });
+    // Always return success — don't reveal whether the email exists or is
+    // already verified. This prevents user enumeration via this endpoint.
+    if (!user || user?.isEmailVerified) {
+      return res.json({ message: "If an unverified account exists for that email, a verification link has been sent." });
+    }
 
     // Don't block the response on email delivery
     sendVerificationEmail(user.id, email).catch((err) => {

@@ -7,7 +7,6 @@ import {
   updateMe,
   updateSettings,
   toPublicUser,
-  wipeDb,
   forgotPassword,
   resetPassword,
   deleteAccount,
@@ -31,10 +30,8 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Database wipe — ONLY available in development mode
-if (config.nodeEnv === "development") {
-  router.get("/wipe", wipeDb);
-}
+// SECURITY: The database wipe endpoint has been removed. If you need to
+// clear data in development, use the Supabase SQL editor directly.
 
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);

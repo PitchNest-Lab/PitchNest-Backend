@@ -13,6 +13,19 @@ export const saveProfile = async (req: Request, res: Response) => {
 
     const { startup_name, industry, goal, funding_stage } = req.body;
 
+    // Server-side validation — enforce types and length limits.
+    const MAX_FIELD_LEN = 200;
+    for (const [name, val] of Object.entries({ startup_name, industry, goal, funding_stage })) {
+      if (val !== undefined && val !== null && val !== "") {
+        if (typeof val !== "string") {
+          return res.status(400).json({ error: `${name} must be text.` });
+        }
+        if ((val as string).length > MAX_FIELD_LEN) {
+          return res.status(400).json({ error: `${name} is too long (max ${MAX_FIELD_LEN} characters).` });
+        }
+      }
+    }
+
     // Upsert: insert if not exists, update if exists
     const { data, error } = await supabase
       .from("profiles")
