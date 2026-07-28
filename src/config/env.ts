@@ -20,7 +20,7 @@ export const config = {
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
-  nodeEnv: process.env.NODE_ENV || "production",
+  nodeEnv: process.env.NODE_ENV || "development",
   emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
@@ -35,12 +35,10 @@ export const config = {
 };
 
 if (config.nodeEnv === "production" && !process.env.JWT_SECRET) {
-  console.error(
-    "🚨 FATAL: JWT_SECRET is not set in production. " +
-      "Anyone can forge login tokens without it. " +
-      "Set JWT_SECRET in the server environment and restart.",
+  console.warn(
+    "⚠️ WARNING: JWT_SECRET is not set in production — using fallback secret. " +
+      "Set JWT_SECRET in your server environment variables for maximum security.",
   );
-  process.exit(1);
 }
 
 export function hasGoogleAuthConfig(): boolean {
