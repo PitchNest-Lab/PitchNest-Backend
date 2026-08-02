@@ -24,6 +24,10 @@ import {
 } from "../services/sttService.ts";
 import { detectSpeaker, sanitizeAiSpeech } from "../utils/aiTextSanitizer.ts";
 import {
+  detectEndSessionIntent,
+  classifyConfirmationReply,
+} from "../utils/endSessionIntent.ts";
+import {
   researchStartup,
   buildMarketSnapshotBlock,
   type MarketSnapshot,
@@ -88,6 +92,34 @@ function pickGreeting(
       : PANEL_GREETINGS;
   const line = pool[Math.floor(Math.random() * pool.length)];
   return line.replace("{b}", businessName || "your startup");
+}
+
+// ── Voice end-session: canned confirmation + closing lines ──────────────────
+// Spoken by the lead (Marcus / Riley) when the founder's transcript signals
+// they want to end. The confirmation MUST be an explicit question so nothing
+// ends without an affirmative reply. Kept canned (not LLM-generated) so it is
+// instant, reliable, and can never accidentally ask a new pitch question.
+const PANEL_END_CONFIRM = [
+  "Just to confirm — would you like to end the session here and go to your verdicts?",
+  "Before we wrap — do you want to end the session here and hear our final verdicts?",
+  "Got it — shall we end the session here and move to the panel's verdicts?",
+];
+const COACH_END_CONFIRM = [
+  "Just to confirm — would you like to end the session here and see your report?",
+  "Before we wrap — do you want to finish up here and go to your coaching report?",
+  "Got it — shall we end the session here and pull together your feedback?",
+];
+const PANEL_CLOSING = [
+  "Thanks for pitching to us today — nice work getting through it. Let's bring the panel together for final verdicts.",
+  "Good session — thank you for walking us through it. We'll take it from here and share our verdicts.",
+];
+const COACH_CLOSING = [
+  "Great work today — thanks for putting in the reps. Let me pull your feedback together now.",
+  "Nice session — you should be proud of that effort. I'll get your report ready now.",
+];
+
+function pickLine(pool: string[]): string {
+  return pool[Math.floor(Math.random() * pool.length)];
 }
 
 // Clamp the client-supplied previous-session context to a compact, trusted
@@ -270,6 +302,11 @@ type QueuedTurn = {
   isGreeting?: boolean;
   isNudge?: boolean;
   panelists?: any[];
+  // Voice end-session: a canned line spoken directly (no LLM), reusing the
+  // greeting's singleChunkStream path. `endAfter` marks the closing remark —
+  // after its audio is queued, the server signals the client to conclude.
+  isCanned?: boolean;
+  endAfter?: boolean;
 };
 
 // ── Per-user concurrency cap ───────────────────────────────────────────────
@@ -355,6 +392,18 @@ export function initRestSocket(wss: WebSocketServer) {
     let sessionStartTimestamp = Date.now();
     let initialDurationSeconds = 15 * 60;
     let sessionEnded = false;
+
+    // ── Voice-triggered end-of-session (additive; parallel to the manual End
+    // Session button) ──────────────────────────────────────────────────────
+    // When the founder's transcript expresses end-intent, the lead panelist
+    // asks them to confirm out loud — the session NEVER ends on the trigger
+    // alone. While this flag is set, the founder's next utterance is routed to
+    // the confirmation classifier instead of a normal pitch turn:
+    //   affirm  → panel gives a short closing remark, then we signal the client
+    //             to run its existing conclusion/report flow.
+    //   decline → flag clears and that utterance is processed as a normal turn.
+    // Panel/coach only — solo mode has no live panel to confirm with.
+    let awaitingEndConfirm = false;
 
     // Server clock is the authority for AI time metadata; the client clock
     // ends phases. time_sync pushes (idle interval below) bound the drift.
@@ -653,16 +702,21 @@ export function initRestSocket(wss: WebSocketServer) {
         // directly (no LLM call) so the opening is consistent on brand, varied
         // each session, and instant. It still flows through the normal
         // sentence/TTS pipeline via singleChunkStream.
-        const stream = turn.isGreeting
-          ? singleChunkStream(
-              `${isCoachMode ? "Riley" : "Marcus"}: ${pickGreeting(isCoachMode, currentBusinessName, !!previousSessionCtx)}`,
-            )
-          : streamPanelResponse(
-              userInputToUse,
-              conversationHistory.slice(-MAX_LLM_HISTORY),
-              promptToUse,
-              turnAbort.signal,
-            );
+        // Canned (voice end-session confirm / closing): same direct-speak path
+        // as the greeting — turn.text already holds the exact line + speaker.
+        const stream =
+          turn.isGreeting
+            ? singleChunkStream(
+                `${isCoachMode ? "Riley" : "Marcus"}: ${pickGreeting(isCoachMode, currentBusinessName, !!previousSessionCtx)}`,
+              )
+            : turn.isCanned
+              ? singleChunkStream(turn.text)
+              : streamPanelResponse(
+                  userInputToUse,
+                  conversationHistory.slice(-MAX_LLM_HISTORY),
+                  promptToUse,
+                  turnAbort.signal,
+                );
 
         for await (const token of stream) {
           if (turnAbort.signal.aborted) break;
@@ -806,9 +860,10 @@ export function initRestSocket(wss: WebSocketServer) {
         // for THIS question and stream it to the client. Fired here so it runs
         // in parallel with the TTS playback below — it is NEVER awaited, so it
         // adds zero latency to the panel's voice. Skipped for greetings/nudges
-        // (not real questions). The client falls back to its local keyword card
-        // if this never arrives (slow/failed), so the tip layer can't break.
-        if (!turn.isGreeting && !turn.isNudge && fullSpokenText.trim()) {
+        // and canned end-session lines (none are real pitch questions). The
+        // client falls back to its local keyword card if this never arrives
+        // (slow/failed), so the tip layer can't break.
+        if (!turn.isGreeting && !turn.isNudge && !turn.isCanned && fullSpokenText.trim()) {
           const tipQuestion = fullSpokenText;
           generateAnswerTip(tipQuestion, currentBusinessName)
             .then((tip) => {
@@ -837,11 +892,16 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         // 5. Update histories (record whatever was actually spoken, even if the
-        // turn was cut short by a barge-in, so context stays coherent)
-        if (!turn.isGreeting) {
+        // turn was cut short by a barge-in, so context stays coherent).
+        // Greetings and canned lines have no founder input to record; canned
+        // lines (end-confirm/closing) are also kept out of the LLM history so
+        // they never bias a later pitch turn.
+        if (!turn.isGreeting && !turn.isCanned) {
           conversationHistory.push({ role: "user", text: userInput });
         }
-        conversationHistory.push({ role: "assistant", text: fullSpokenText });
+        if (!turn.isCanned) {
+          conversationHistory.push({ role: "assistant", text: fullSpokenText });
+        }
         if (fullSpokenText.trim()) {
           fullTranscript.push({
             type: "model",
@@ -856,6 +916,14 @@ export function initRestSocket(wss: WebSocketServer) {
           sendJson(ws, { type: "turn_aborted" });
         } else {
           sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
+        }
+
+        // Voice end-session: the closing remark has now finished streaming to
+        // the client. Signal it to run its EXISTING conclusion flow (the same
+        // one the manual End Session button triggers) — we reuse, never
+        // duplicate, the verdict/report path. Skipped if the founder barged in.
+        if (turn.endAfter && !wasAborted) {
+          sendJson(ws, { type: "voice_end_session" });
         }
       } catch (err: any) {
         if (currentTurnAbort) currentTurnAbort = null;
@@ -888,6 +956,46 @@ export function initRestSocket(wss: WebSocketServer) {
     const enqueueTurn = (turn: QueuedTurn) => {
       turnQueue.push(turn);
       void drainTurnQueue();
+    };
+
+    // ── Voice end-session router ────────────────────────────────────────────
+    // Called with each FINAL founder utterance (STT voice + typed chat) before
+    // it becomes a normal pitch turn. Returns true when it has consumed the
+    // utterance (the caller must then NOT enqueue a normal turn for it).
+    // Solo mode has no live panel, so it never intercepts there.
+    const handleEndSessionVoiceFlow = (text: string): boolean => {
+      if (isSoloMode || sessionEnded) return false;
+      const speaker = isCoachMode ? "Riley" : "Marcus";
+
+      // Step 2: we already asked the founder to confirm — classify their reply.
+      if (awaitingEndConfirm) {
+        awaitingEndConfirm = false;
+        const reply = classifyConfirmationReply(text);
+        if (reply === "affirm") {
+          // Speak a short closing remark, then signal the client to conclude.
+          const closing = isCoachMode ? pickLine(COACH_CLOSING) : pickLine(PANEL_CLOSING);
+          enqueueTurn({
+            text: `${speaker}: ${closing}`,
+            isCanned: true,
+            endAfter: true,
+          });
+          return true; // consumed — do not run this reply as a pitch turn
+        }
+        // Declined or ambiguous → resume the pitch. Fall through so the
+        // utterance is processed as a normal turn (the founder kept talking).
+        return false;
+      }
+
+      // Step 1: detect end-intent in a normal utterance. Ask to confirm — never
+      // end here. The trigger phrase itself is NOT sent to the LLM as a turn.
+      if (detectEndSessionIntent(text)) {
+        awaitingEndConfirm = true;
+        const confirm = isCoachMode ? pickLine(COACH_END_CONFIRM) : pickLine(PANEL_END_CONFIRM);
+        enqueueTurn({ text: `${speaker}: ${confirm}`, isCanned: true });
+        return true; // consumed
+      }
+
+      return false;
     };
 
     ws.on("message", async (message, isBinary) => {
@@ -935,7 +1043,11 @@ export function initRestSocket(wss: WebSocketServer) {
           hasSentSetup = true;
           const clientConfig = data.config || {};
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
-          currentUserId = clientConfig.userId || null;
+          // SECURITY: the session owner is the JWT-authenticated user established
+          // at connection time — NEVER the client-supplied config.userId, which a
+          // caller could set to another user's id to write sessions into their
+          // account. The client value is ignored here.
+          currentUserId = authenticatedUserId;
           sessionMode = clientConfig.mode || "panel";
           isCoachMode = sessionMode === "coach";
           isSoloMode = sessionMode === "solo";
@@ -1124,12 +1236,19 @@ export function initRestSocket(wss: WebSocketServer) {
                   return;
                 }
 
-                noteFounderTurnForRoomRead();
-                enqueueTurn({
-                  text,
-                  inputMethod: "voice",
-                  timeLeft: getTimeLeftSeconds(),
-                });
+                // Voice end-session: if this utterance drives the end-session
+                // confirm flow, it is consumed here — do NOT run it as a pitch
+                // turn. The founder's words are still echoed to the transcript
+                // below so they see what they said.
+                const consumedByEndFlow = handleEndSessionVoiceFlow(text);
+                if (!consumedByEndFlow) {
+                  noteFounderTurnForRoomRead();
+                  enqueueTurn({
+                    text,
+                    inputMethod: "voice",
+                    timeLeft: getTimeLeftSeconds(),
+                  });
+                }
 
                 // Raw STT words, shown instantly — no LLM summarization pass.
                 // The prompts tell the AI this is speech-recognition output and
@@ -1293,13 +1412,20 @@ export function initRestSocket(wss: WebSocketServer) {
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
 
-          noteFounderTurnForRoomRead();
-          enqueueTurn({
-            text: data.text,
-            timeLeft:
-              typeof data.timeLeft === "number" ? data.timeLeft : undefined,
-            inputMethod,
-          });
+          // Voice end-session: same interception as the STT path. If consumed,
+          // the message drives the confirm flow instead of a normal pitch turn,
+          // but is still recorded/echoed to the transcript below.
+          const consumedByEndFlow =
+            typeof data.text === "string" && handleEndSessionVoiceFlow(data.text);
+          if (!consumedByEndFlow) {
+            noteFounderTurnForRoomRead();
+            enqueueTurn({
+              text: data.text,
+              timeLeft:
+                typeof data.timeLeft === "number" ? data.timeLeft : undefined,
+              inputMethod,
+            });
+          }
 
           if (inputMethod === "voice") {
             // Raw voice text, echoed back instantly — no summarization pass.

@@ -123,18 +123,6 @@ export const refreshToken = (req: Request, res: Response) => {
   });
 };
 
-export const wipeDb = async (req: Request, res: Response) => {
-  try {
-    await supabase.from("users").delete().neq("id", 0);
-    await supabase.from("sessions").delete().neq("id", 0);
-    await supabase.from("decks").delete().neq("id", 0);
-    await supabase.from("profiles").delete().neq("id", 0);
-    res.status(200).send("<h1>Database wiped</h1>");
-  } catch (e) {
-    res.status(500).json({ error: "Error wiping database." });
-  }
-};
-
 export const signup = async (req: Request, res: Response) => {
   try {
     const { name, email, password } = req.body;

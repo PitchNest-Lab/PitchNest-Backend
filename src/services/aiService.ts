@@ -941,6 +941,7 @@ COACHING EVALUATION RULES:
 - clarity = how clearly they explain the problem, solution, and value proposition.
 - scalability = how well they understand market size, growth potential, and business model.
 - readiness = how prepared they are to face a real investor panel based on this session.
+- TECHNICAL-DEPTH FAIRNESS: Not every founder is an engineer. Judge "how the product works" at a FUNCTIONAL level — a clear explanation of what it does and the key technical concepts a smart non-expert would expect, NOT engineering-level implementation depth (architecture, algorithms, infra). Reward a clear functional explanation fully; only expect deeper technical detail if the startup's core claim is itself a deep-tech breakthrough. Keep market, traction, and business-model expectations as rigorous as ever.
 - strengths: Specific things the founder did well — cite real moments from the transcript.
 - risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
 - next_steps: 3-4 concrete practice actions (NEVER fewer than 3) the founder should do before their next session (e.g. "Sharpen your TAM/SAM/SOM numbers", "Prepare a 30-second revenue model summary").
@@ -988,6 +989,7 @@ RULES:
 - clarity = problem/solution narrative, structure, jargon control.
 - scalability = market size, growth model, unit economics, GTM scalability.
 - readiness = overall investability for the stated funding stage.
+- TECHNICAL-DEPTH FAIRNESS: Not every founder is an engineer. The bar for "how the product works" is FUNCTIONAL, not engineering-level: the founder should clearly explain what the product does, how it delivers value, and speak sensibly to the key technical concepts a smart non-expert would expect. Reward that clear functional explanation fully. Do NOT lower delivery, clarity, or readiness merely because they lack implementation-level depth (architecture, algorithms, code, infra) UNLESS the pitch's own core claim is a deep-tech breakthrough that depends on it. Judge market, traction, business model, and financials with full rigor — this fairness note applies ONLY to technical/engineering depth.
 - ACCENT FAIRNESS: Focus on the substance and clarity of the pitch content. Do not penalize pronunciation, grammatical variations, or speech patterns due to non-native accents or regional English variants (e.g. Nigerian English, Indian English).
 - Keep summary to 2-3 sentences. Include one sentiment quote each for Marcus, Sarah, and Chen.
 - next_steps: provide 3-4 concrete action items, NEVER fewer than 3. Each must address a specific weakness or gap from THIS pitch (not generic advice).

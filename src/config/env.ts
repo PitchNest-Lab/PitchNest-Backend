@@ -34,10 +34,17 @@ export const config = {
   serperApiKey: process.env.SERPER_API_KEY || "",
 };
 
-if (config.nodeEnv === "production" && !process.env.JWT_SECRET) {
-  console.warn(
-    "⚠️ WARNING: JWT_SECRET is not set in production — using fallback secret. " +
-      "Set JWT_SECRET in your server environment variables for maximum security.",
+// In production, a missing JWT_SECRET means every JWT is signed with the
+// publicly-known fallback string below — i.e. anyone can forge a token for any
+// user (and the WebSocket auth relies entirely on this secret). Refuse to boot
+// rather than run with a forgeable secret. Dev keeps the fallback for frictionless
+// local setup.
+const FALLBACK_JWT_SECRET = "pitchnest-dev-secret-change-in-production";
+if (config.nodeEnv === "production" && config.jwtSecret === FALLBACK_JWT_SECRET) {
+  throw new Error(
+    "FATAL: JWT_SECRET is not set in production. Refusing to start with the " +
+      "public fallback secret (all tokens would be forgeable). Set JWT_SECRET " +
+      "in your server environment variables.",
   );
 }
 
