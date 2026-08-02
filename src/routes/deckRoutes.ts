@@ -8,6 +8,7 @@ import {
   runDeckAudit,
   listDeckAudits,
   downloadDeckAuditPDF,
+  getDeckSignedUrl,
 } from "../controllers/deckController.ts";
 import { upload } from "../services/storageService.ts";
 
@@ -29,6 +30,7 @@ router.get("/", authMiddleware, listDecks);
 
 // Deck Check — static registered before "/:id"-shaped routes for clarity.
 router.get("/audits/:auditId/pdf", authMiddleware, downloadDeckAuditPDF);
+router.get("/:id/signed-url", authMiddleware, getDeckSignedUrl);
 router.post("/:id/audit", authMiddleware, auditLimiter, runDeckAudit);
 router.get("/:id/audits", authMiddleware, listDeckAudits);
 

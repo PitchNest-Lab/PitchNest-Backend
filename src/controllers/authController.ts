@@ -7,6 +7,7 @@ import { config } from "../config/env.ts";
 import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
+import { storagePathFromUrl } from "../utils/storagePath.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -763,15 +764,6 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
   }
 };
 
-/** Extract Supabase storage object path from a public URL, e.g. decks/foo.pdf */
-function storagePathFromUrl(url: string | null | undefined): string | null {
-  if (!url || typeof url !== "string") return null;
-  const marker = `/${config.storageBucket}/`;
-  const idx = url.indexOf(marker);
-  if (idx === -1) return null;
-  return url.slice(idx + marker.length).split("?")[0] || null;
-}
-
 /**
  * Permanently delete a user and associated data (App Store 5.1.1(v) / Google Play).
  */
@@ -791,24 +783,35 @@ async function purgeUserAccount(userId: number): Promise<void> {
     .eq("id", userId)
     .maybeSingle();
 
-  const storagePaths = new Set<string>();
+  const mediaPaths = new Set<string>();
   for (const deck of decks || []) {
-    const path = storagePathFromUrl(deck.file_url);
-    if (path) storagePaths.add(path);
+    const path = storagePathFromUrl(deck.file_url); // main media bucket
+    if (path) mediaPaths.add(path);
   }
   for (const session of sessions || []) {
-    const path = storagePathFromUrl(session.video_url);
-    if (path) storagePaths.add(path);
+    const path = storagePathFromUrl(session.video_url); // main media bucket
+    if (path) mediaPaths.add(path);
   }
-  const avatarPath = storagePathFromUrl(userRow?.avatar_url);
-  if (avatarPath) storagePaths.add(avatarPath);
 
-  if (storagePaths.size > 0) {
+  // Avatars live in a SEPARATE public bucket — extract with that bucket's marker
+  // and remove from THAT bucket, never from the private media bucket.
+  const avatarPath = storagePathFromUrl(userRow?.avatar_url, config.avatarBucket);
+  const avatarPaths = avatarPath ? [avatarPath] : [];
+
+  if (mediaPaths.size > 0) {
     const { error: storageError } = await supabase.storage
       .from(config.storageBucket)
-      .remove([...storagePaths]);
+      .remove([...mediaPaths]);
     if (storageError) {
-      console.warn("⚠️ Storage cleanup partial failure:", storageError.message);
+      console.warn("⚠️ Media storage cleanup partial failure:", storageError.message);
+    }
+  }
+  if (avatarPaths.length > 0) {
+    const { error: avatarError } = await supabase.storage
+      .from(config.avatarBucket)
+      .remove(avatarPaths);
+    if (avatarError) {
+      console.warn("⚠️ Avatar storage cleanup partial failure:", avatarError.message);
     }
   }
 

@@ -26,11 +26,11 @@ export const uploadVideo = async (req: Request, res: Response) => {
       return res.status(200).json({ videoUrl: `/uploads/${localName}` });
     }
 
-    const { data: { publicUrl } } = supabase.storage
-      .from(config.storageBucket)
-      .getPublicUrl(filePath);
-
-    res.status(200).json({ videoUrl: publicUrl });
+    // Item A: the bucket is private, so return the BARE object path — never a
+    // public URL. Videos are write-only (uploaded, never replayed in the app),
+    // so a private bucket alone fully protects them; the deletion path derives
+    // the same path to clean up on account purge.
+    res.status(200).json({ videoUrl: filePath });
   } catch (error) {
     res.status(500).json({ error: "Upload failed" });
   }
@@ -51,8 +51,11 @@ export const uploadAvatar = async (req: Request, res: Response) => {
       .replace(/[^a-z0-9]/g, "");
     const filePath = `avatars/${userId}_${Date.now()}.${ext || "png"}`;
 
+    // Item A: avatars live in a SEPARATE public bucket so the main media bucket
+    // (decks + pitch videos) can be fully private. Avatars stay public and load
+    // unsigned via getPublicUrl.
     const { error } = await supabase.storage
-      .from(config.storageBucket)
+      .from(config.avatarBucket)
       .upload(filePath, req.file.buffer, {
         contentType: req.file.mimetype,
         upsert: true,
@@ -65,7 +68,7 @@ export const uploadAvatar = async (req: Request, res: Response) => {
     }
 
     const { data: { publicUrl } } = supabase.storage
-      .from(config.storageBucket)
+      .from(config.avatarBucket)
       .getPublicUrl(filePath);
 
     const { error: dbError } = await supabase

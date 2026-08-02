@@ -27,6 +27,7 @@ import {
   detectEndSessionIntent,
   classifyConfirmationReply,
 } from "../utils/endSessionIntent.ts";
+import { detectFloorHandback } from "../utils/floorControl.ts";
 import {
   researchStartup,
   buildMarketSnapshotBlock,
@@ -116,6 +117,20 @@ const PANEL_CLOSING = [
 const COACH_CLOSING = [
   "Great work today — thanks for putting in the reps. Let me pull your feedback together now.",
   "Nice session — you should be proud of that effort. I'll get your report ready now.",
+];
+
+// Two-step interruption (Item D): spoken by the interjecting panelist when the
+// founder keeps pitching through the intent line instead of handing the floor
+// back. Canned (not LLM) so it is instant and can never accidentally ask the
+// held question early — the whole point is to wait for the hand-back.
+const PANEL_FLOOR_RESIGNAL = [
+  "Sorry — I really do need to jump in for a second. Can I ask my question?",
+  "Hold on, if you don't mind — I have a quick question before you go on.",
+  "Let me stop you there for just a moment — may I ask something?",
+];
+const COACH_FLOOR_RESIGNAL = [
+  "Sorry to cut in — can I ask you something real quick before you continue?",
+  "Hold that thought for one second — I'd like to ask a quick question.",
 ];
 
 function pickLine(pool: string[]): string {
@@ -218,6 +233,28 @@ type InterestState = "warming" | "neutral" | "cooling" | "out";
 
 const INTEREST_TAG_RE = /@@INTEREST\b([^\n]*)/i;
 
+// ── Two-step interruption side-channel (@@FLOOR machine tag) ────────────────
+// Item D. When a panelist interjects, its turn is ONLY a short intent line
+// ("Sorry, can I jump in?") followed by this non-spoken tag on its own line:
+//   @@FLOOR hold
+// The server strips it (exactly like @@INTEREST) and, seeing it, holds the
+// conversational floor: the founder's next utterance is not treated as pitch
+// content until they hand the floor back. See the message handler's floor-hold
+// routing and floorControl.ts.
+const FLOOR_TAG_RE = /@@FLOOR\b[^\n]*/i;
+
+function splitFloorTag(text: string): { spoken: string; floorHold: boolean } {
+  const m = text.match(FLOOR_TAG_RE);
+  if (!m || m.index === undefined) return { spoken: text, floorHold: false };
+  const before = text.slice(0, m.index);
+  const after = text.slice(m.index + m[0].length);
+  return {
+    spoken: (before + after).replace(/\s{2,}/g, " ").trim(),
+    floorHold: /\bhold\b/i.test(m[0]),
+  };
+}
+
+
 function splitInterestTag(text: string): {
   spoken: string;
   tagBody: string | null;
@@ -228,6 +265,33 @@ function splitInterestTag(text: string): {
     spoken: text.slice(0, m.index).trim(),
     tagBody: (m[1] || "").trim(),
   };
+}
+
+// ── One-speaker-per-turn runtime guard ──────────────────────────────────────
+// The prompt says exactly one panelist speaks per turn, but the model very
+// occasionally emits a second "Name:" prefix mid-response ("...makes sense.
+// Sarah: But what about churn?"). The streaming pipeline locks the speaker/voice
+// on the FIRST prefix only, so without this guard the second panelist's words
+// would be spoken aloud in the FIRST panelist's voice — a wrong-persona line.
+// This detects an intruding panelist prefix that is NOT the current speaker and
+// cuts the text just before it, dropping the stray second turn. Conservative:
+// only the three known panel names are treated as speaker prefixes, and only
+// when followed by a colon, so ordinary mentions ("as Sarah said") never match.
+const SECOND_SPEAKER_RE = new RegExp(
+  `(?:^|[\\s"'([-])(${PANELIST_NAMES.join("|")})\\s*:`,
+  "i",
+);
+
+function cutAtSecondSpeaker(text: string, currentSpeaker: string): string {
+  const m = text.match(SECOND_SPEAKER_RE);
+  if (!m || m.index === undefined) return text;
+  const intruder = m[1];
+  // A prefix for the SAME speaker (model repeating its own name) is harmless —
+  // let the normal prefix-strip handle it; only cut on a DIFFERENT panelist.
+  if (intruder.toLowerCase() === currentSpeaker.toLowerCase()) return text;
+  // Keep everything up to (not including) the intruding prefix.
+  const cutAt = m.index + (m[0].length - m[0].trimStart().length);
+  return text.slice(0, cutAt).trim();
 }
 
 function parseInterestTag(tagBody: string): {
@@ -245,6 +309,41 @@ function parseInterestTag(tagBody: string): {
     state: m[2].toLowerCase() as InterestState,
     concern: m[3]?.trim() || null,
   };
+}
+
+// ── Verdict classification (invest / pass / maybe) ──────────────────────────
+// The verdict prompt tells each panelist to say "I'm in because…" or "I'm out
+// because…". Tier 1 reads those canonical stance phrases first, so a double-
+// negative like "I won't pass on this opportunity — I'm in" correctly resolves
+// to invest (the explicit "I'm in" wins over the earlier "pass"). Tier 2 then
+// applies keyword heuristics for natural phrasings that don't use the exact
+// canonical form. Returns "maybe" (amber, genuinely on the fence) when neither
+// tier fires.
+function classifyPanelVerdict(lowerText: string): "invest" | "pass" | "maybe" {
+  // Tier 1 — canonical stance phrases (highest confidence).
+  const hasCanonicalIn = /\b(i'?m in|i am in|count me in|we'?re in)\b/.test(
+    lowerText,
+  );
+  const hasCanonicalOut = /\b(i'?m out|i am out)\b/.test(lowerText);
+  if (hasCanonicalIn && !hasCanonicalOut) return "invest";
+  if (hasCanonicalOut && !hasCanonicalIn) return "pass";
+
+  // Tier 2 — keyword heuristics for natural but non-canonical phrasings.
+  if (
+    /\b(not invest|can'?t invest|cannot invest|won'?t invest|decline|pass on this|i'?ll pass|i pass|a pass\b|to pass\b|hard pass|no deal(?![\s\-–—]*[-–—]?\s*(killer|breaker))|walk away|not a fit|no thanks)\b/i.test(
+      lowerText,
+    )
+  ) {
+    return "pass";
+  }
+  if (
+    /\b(invest|fund|back this|green light|sign me up|let'?s do it)\b/i.test(
+      lowerText,
+    )
+  ) {
+    return "invest";
+  }
+  return "maybe";
 }
 
 function parseSpeakerResponse(
@@ -404,6 +503,20 @@ export function initRestSocket(wss: WebSocketServer) {
     //   decline → flag clears and that utterance is processed as a normal turn.
     // Panel/coach only — solo mode has no live panel to confirm with.
     let awaitingEndConfirm = false;
+
+    // ── Two-step AI interruption (Item D) ──────────────────────────────────
+    // When a panelist interjects, it signals INTENT ONLY ("hold on, I have a
+    // question") and sets floorHeldByPanel via the @@FLOOR hold tag. While the
+    // floor is held, the founder's next utterance is routed through the
+    // hand-back matcher instead of the LLM: it is NOT treated as pitch content
+    // until the founder explicitly yields ("go ahead", "ask away"). Only then
+    // does the panel ask the actual question and the founder's answer resumes
+    // as normal pitch content. This mirrors the founder-interrupts-AI barge-in
+    // (one side holds the floor, the other releases it). floorReSignaled bounds
+    // the mechanic: if the founder keeps pitching through the intent line, the
+    // panel re-signals once, then asks anyway — never an infinite ping-pong.
+    let floorHeldByPanel = false;
+    let floorReSignaled = false;
 
     // Server clock is the authority for AI time metadata; the client clock
     // ends phases. time_sync pushes (idle interval below) bound the drift.
@@ -625,20 +738,8 @@ export function initRestSocket(wss: WebSocketServer) {
             panelistText = sanitizeAiSpeech(panelistText) || panelistText;
 
             const lowerText = panelistText.toLowerCase();
-            let verdictVerdict: "invest" | "pass" | "maybe" = "maybe";
-            if (
-              /\b(invest|i'm in|i am in|fund|back this|green light)\b/i.test(
-                lowerText,
-              )
-            ) {
-              verdictVerdict = "invest";
-            } else if (
-              /\b(pass|i'm out|i am out|decline|not invest|no deal|walk away)\b/i.test(
-                lowerText,
-              )
-            ) {
-              verdictVerdict = "pass";
-            }
+            let verdictVerdict: "invest" | "pass" | "maybe" =
+              classifyPanelVerdict(lowerText);
 
             // Send verdict text to UI
             sendJson(ws, {
@@ -687,6 +788,11 @@ export function initRestSocket(wss: WebSocketServer) {
         let fullSpokenText = "";
         let chunksProcessed = 0;
         let ttsPromiseChain = Promise.resolve();
+
+        // Two-step interruption (Item D): set when this turn's @@FLOOR hold tag
+        // is seen. Committed to floorHeldByPanel after the turn completes, only
+        // if the panel actually held back its question (no "?" was spoken).
+        let floorHoldSignaled = false;
 
         let promptToUse = masterPrompt;
         let userInputToUse = userInput;
@@ -765,12 +871,29 @@ export function initRestSocket(wss: WebSocketServer) {
             // TTS or the transcript (its line has no sentence punctuation, so
             // it normally surfaces in the final-buffer flush — this guard
             // covers the rare mid-stream case too).
+            const { spoken: afterFloor, floorHold: midFloor } =
+              splitFloorTag(sentence);
+            if (midFloor) floorHoldSignaled = true;
             const { spoken: spokenPart, tagBody: midTag } =
-              splitInterestTag(sentence);
+              splitInterestTag(afterFloor);
             if (midTag !== null) handleInterestTag(midTag);
 
-            if (spokenPart.length > 0) {
-              const cleanSentence = sanitizeAiSpeech(spokenPart) || spokenPart;
+            // One-speaker-per-turn guard: if a second panelist's prefix leaked
+            // into this sentence, cut it off and stop the turn so the intruding
+            // line is never spoken in the current speaker's voice.
+            let guardedSpoken = spokenPart;
+            let secondSpeakerHit = false;
+            if (!isCoachMode && spokenPart) {
+              const cut = cutAtSecondSpeaker(spokenPart, activeSpeaker);
+              if (cut !== spokenPart) {
+                guardedSpoken = cut;
+                secondSpeakerHit = true;
+              }
+            }
+
+            if (guardedSpoken.length > 0) {
+              const cleanSentence =
+                sanitizeAiSpeech(guardedSpoken) || guardedSpoken;
               fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
               chunksProcessed++;
 
@@ -808,21 +931,38 @@ export function initRestSocket(wss: WebSocketServer) {
                 });
               }
             }
+
+            // Drop the rest of the model output for this turn — the buffer from
+            // here on belongs to a second panelist that must not speak now.
+            if (secondSpeakerHit) {
+              currentSentenceBuffer = "";
+              break;
+            }
           }
         }
 
         // 3. Process the final remaining chunk in the buffer (skip if barged in).
         // The @@INTEREST tag has no sentence punctuation, so this is where it
         // normally lands — split it off before the text can reach TTS.
-        const { spoken: finalSpokenPart, tagBody: finalTag } = splitInterestTag(
+        const { spoken: finalAfterFloor, floorHold: finalFloor } = splitFloorTag(
           currentSentenceBuffer.trim(),
+        );
+        if (finalFloor) floorHoldSignaled = true;
+        const { spoken: finalSpokenPart, tagBody: finalTag } = splitInterestTag(
+          finalAfterFloor,
         );
         if (!turnAbort.signal.aborted && finalTag !== null) {
           handleInterestTag(finalTag);
         }
-        if (!turnAbort.signal.aborted && finalSpokenPart.length > 0) {
+        // Same one-speaker-per-turn guard as the mid-stream path: a short second
+        // panelist interjection with no sentence punctuation lands here.
+        const finalGuardedPart =
+          !isCoachMode && finalSpokenPart
+            ? cutAtSecondSpeaker(finalSpokenPart, activeSpeaker)
+            : finalSpokenPart;
+        if (!turnAbort.signal.aborted && finalGuardedPart.length > 0) {
           const cleanSentence =
-            sanitizeAiSpeech(finalSpokenPart) || finalSpokenPart;
+            sanitizeAiSpeech(finalGuardedPart) || finalGuardedPart;
           fullSpokenText += (fullSpokenText ? " " : "") + cleanSentence;
           chunksProcessed++;
 
@@ -889,6 +1029,32 @@ export function initRestSocket(wss: WebSocketServer) {
         // the room has cooled counts as unprompted selling.
         if (!isCoachMode && !turn.isGreeting && fullSpokenText.trim()) {
           lastPanelTurnHadQuestion = /\?/.test(fullSpokenText);
+        }
+
+        // Two-step interruption (Item D): commit the floor hold. The panel
+        // signals intent with @@FLOOR hold AND keeps STEP 1 to a short intent
+        // line (no substantive question yet). We hold only when the spoken line
+        // is short — an intent line ("Sorry, can I jump in?") is a handful of
+        // words, whereas a full pitch question is long. If the model tagged the
+        // turn but asked a real question anyway, the length guard declines the
+        // hold so the founder's answer is never mistaken for a hand-back.
+        const floorHoldWordCount = fullSpokenText.trim()
+          ? fullSpokenText.trim().split(/\s+/).length
+          : 0;
+        if (
+          floorHoldSignaled &&
+          !wasAborted &&
+          !turn.isGreeting &&
+          !turn.isCanned &&
+          !isCoachMode &&
+          floorHoldWordCount > 0 &&
+          floorHoldWordCount <= 16
+        ) {
+          floorHeldByPanel = true;
+          floorReSignaled = false;
+          console.log(
+            "🎙 Two-step interruption: panel signaled intent, floor held until founder hands it back.",
+          );
         }
 
         // 5. Update histories (record whatever was actually spoken, even if the
@@ -958,6 +1124,43 @@ export function initRestSocket(wss: WebSocketServer) {
       void drainTurnQueue();
     };
 
+    // ── Per-connection AI-turn rate limiting (Item B) ──────────────────────
+    // Each founder-driven turn triggers an expensive LLM stream + TTS synthesis,
+    // and turns drain serially. A buggy or malicious client that floods
+    // `chat_message` frames could bury the founder's real input behind a huge
+    // backlog and amplify cost. A token bucket smooths bursts; a hard pending-
+    // queue cap bounds the serial-drain backlog. Both gate ONLY typed chat_message
+    // turns — the sole client-rate-controlled AI-turn vector. Server-generated
+    // turns (greeting, nudges, time cues, closing) are self-paced and never
+    // throttled, and final STT turns are paced by Azure's recognizer (gating them
+    // would risk silently dropping a fast talker's recognized speech). Capacities
+    // sit far above any real human chat cadence, so a legitimate founder — who
+    // sends at most a message every few seconds — can never hit them.
+    const TURN_BUCKET_CAPACITY = 12;
+    const TURN_BUCKET_REFILL_PER_SEC = 1;
+    const MAX_PENDING_FOUNDER_TURNS = 8;
+    let turnTokens = TURN_BUCKET_CAPACITY;
+    let lastTokenRefill = Date.now();
+
+    // Returns true if a founder chat turn is allowed, false if it should be
+    // dropped as a flood. A dropped turn skips only the expensive AI response —
+    // the founder's text is still recorded and echoed by the caller.
+    const allowFounderChatTurn = (): boolean => {
+      const now = Date.now();
+      const elapsedSec = (now - lastTokenRefill) / 1000;
+      if (elapsedSec > 0) {
+        turnTokens = Math.min(
+          TURN_BUCKET_CAPACITY,
+          turnTokens + elapsedSec * TURN_BUCKET_REFILL_PER_SEC,
+        );
+        lastTokenRefill = now;
+      }
+      if (turnQueue.length >= MAX_PENDING_FOUNDER_TURNS) return false;
+      if (turnTokens < 1) return false;
+      turnTokens -= 1;
+      return true;
+    };
+
     // ── Voice end-session router ────────────────────────────────────────────
     // Called with each FINAL founder utterance (STT voice + typed chat) before
     // it becomes a normal pitch turn. Returns true when it has consumed the
@@ -996,6 +1199,74 @@ export function initRestSocket(wss: WebSocketServer) {
       }
 
       return false;
+    };
+
+    // ── Two-step interruption: floor-hold router (Item D) ───────────────────
+    // Called with each FINAL founder utterance (STT voice + typed chat) while
+    // floorHeldByPanel is true — i.e. right after the panel signaled intent but
+    // has not yet asked its held question. Returns true when the utterance was
+    // consumed (the caller must then NOT enqueue it as a normal pitch turn, and
+    // must still record + echo it so the founder sees they were heard).
+    //
+    //   hand-back  → clear the hold; enqueue a SYSTEM turn telling the panel to
+    //                now ask the question it held. The hand-back words are not
+    //                pitch content.
+    //   kept going → the founder's words are NOT pitch content while the floor
+    //                is held: not fed to the LLM as input. The panel re-signals
+    //                intent once (canned); if the founder STILL does not hand
+    //                back, the panel asks anyway (bounded, no ping-pong).
+    const handleFloorHeldUtterance = (text: string, inputMethod: "voice" | "chat"): boolean => {
+      if (!floorHeldByPanel) return false;
+
+      if (detectFloorHandback(text)) {
+        floorHeldByPanel = false;
+        floorReSignaled = false;
+        // A [SYSTEM] turn is a normal LLM turn (not canned) so the panel
+        // generates the actual question, grounded in what the founder said
+        // before the interruption — not a stock line.
+        enqueueTurn({
+          text: isCoachMode
+            ? `[SYSTEM: The founder just handed you the floor back. Riley — now ask the question you were going to interrupt with. ONE short spoken question, then stop.]`
+            : `[SYSTEM: The founder just handed the floor back to the panel. The panelist who interrupted — ask the question you were holding. ONE short spoken question, one speaker, then stop.]`,
+          inputMethod: "chat",
+        });
+        console.log(
+          "🎙 Two-step interruption: founder handed the floor back — panel asks its held question.",
+        );
+        return true; // consumed — the hand-back is not pitch content
+      }
+
+      // Founder kept talking (or answered the wrong thing) without yielding.
+      // Their words are not pitch content: do not feed them to the LLM.
+      if (floorReSignaled) {
+        // Already re-signaled once and still no hand-back — ask anyway.
+        floorHeldByPanel = false;
+        floorReSignaled = false;
+        enqueueTurn({
+          text: isCoachMode
+            ? `[SYSTEM: The founder kept talking after your interruption. Riley — go ahead and ask your question now. ONE short spoken question, one speaker, then stop.]`
+            : `[SYSTEM: The founder kept talking after the interruption without handing the floor back. The interrupting panelist — go ahead and ask your question now. ONE short spoken question, one speaker, then stop.]`,
+          inputMethod: "chat",
+        });
+        console.log(
+          "🎙 Two-step interruption: founder did not hand back after re-signal — panel asks anyway.",
+        );
+        return true; // consumed — still not pitch content
+      }
+
+      // First no-handback: re-signal intent once (canned, instant).
+      floorReSignaled = true;
+      const speaker = isCoachMode ? "Riley" : "Marcus";
+      enqueueTurn({
+        text: `${speaker}: ${
+          isCoachMode ? pickLine(COACH_FLOOR_RESIGNAL) : pickLine(PANEL_FLOOR_RESIGNAL)
+        }`,
+        isCanned: true,
+      });
+      console.log(
+        "🎙 Two-step interruption: founder kept talking — re-signaling intent once.",
+      );
+      return true; // consumed — this utterance is not pitch content
     };
 
     ws.on("message", async (message, isBinary) => {
@@ -1236,12 +1507,23 @@ export function initRestSocket(wss: WebSocketServer) {
                   return;
                 }
 
+                // Two-step interruption: if the panel is holding the floor, this
+                // utterance is routed to the hand-back logic and is NOT pitch
+                // content. It is still echoed to the transcript below.
+                // End-session intent still wins over a floor hold: if the founder
+                // clearly wants to end, honor that instead of the hand-back.
+                const consumedByFloor =
+                  floorHeldByPanel && !detectEndSessionIntent(text)
+                    ? handleFloorHeldUtterance(text, "voice")
+                    : false;
+
                 // Voice end-session: if this utterance drives the end-session
                 // confirm flow, it is consumed here — do NOT run it as a pitch
                 // turn. The founder's words are still echoed to the transcript
                 // below so they see what they said.
-                const consumedByEndFlow = handleEndSessionVoiceFlow(text);
-                if (!consumedByEndFlow) {
+                const consumedByEndFlow =
+                  !consumedByFloor && handleEndSessionVoiceFlow(text);
+                if (!consumedByFloor && !consumedByEndFlow) {
                   noteFounderTurnForRoomRead();
                   enqueueTurn({
                     text,
@@ -1364,7 +1646,20 @@ export function initRestSocket(wss: WebSocketServer) {
                 message:
                   "Session ended due to inactivity. The panel noticed you've been silent for over 5 minutes.",
               });
-              if (idleCheckInterval) clearInterval(idleCheckInterval);
+              // Release the Azure Speech connection immediately — an abandoned
+              // session must not hold the recognizer open. sessionEnded stays
+              // false on purpose: the client answers idle_end by sending
+              // prepare_evaluation + end_session ~1.5s later, and both handlers
+              // early-return when sessionEnded is true, which would kill the
+              // report. end_session performs the real teardown.
+              if (sttRecognizer) {
+                sttRecognizer.stop();
+                sttRecognizer = null;
+              }
+              if (idleCheckInterval) {
+                clearInterval(idleCheckInterval);
+                idleCheckInterval = null;
+              }
             } else if (idleMs >= NUDGE_THRESHOLD && !hasNudged) {
               hasNudged = true;
               console.log(
@@ -1412,12 +1707,45 @@ export function initRestSocket(wss: WebSocketServer) {
 
           const inputMethod = data.inputMethod === "chat" ? "chat" : "voice";
 
+          // Two-step interruption: while the panel holds the floor, this message
+          // is routed to the hand-back logic and is NOT pitch content (still
+          // echoed below). End-session intent still wins over a floor hold.
+          const consumedByFloor =
+            typeof data.text === "string" &&
+            floorHeldByPanel &&
+            !detectEndSessionIntent(data.text)
+              ? handleFloorHeldUtterance(data.text, inputMethod)
+              : false;
+
           // Voice end-session: same interception as the STT path. If consumed,
           // the message drives the confirm flow instead of a normal pitch turn,
           // but is still recorded/echoed to the transcript below.
           const consumedByEndFlow =
-            typeof data.text === "string" && handleEndSessionVoiceFlow(data.text);
-          if (!consumedByEndFlow) {
+            !consumedByFloor &&
+            typeof data.text === "string" &&
+            handleEndSessionVoiceFlow(data.text);
+
+          // Typed chat is the only client-rate-controlled AI-turn vector, so it
+          // carries the full token-bucket throttle. Capacities sit far above human
+          // cadence, so only a scripted flood trips it. A tripped turn is dropped
+          // whole — no AI response, no transcript record (recording spam would
+          // pollute the evaluation) — and the client keeps its own optimistic
+          // bubble. A hostile client could forge inputMethod:"voice" to dodge the
+          // bucket, so the pending-queue depth cap is enforced on EVERY
+          // chat_message turn as a backstop regardless of the claimed method.
+          if (!consumedByFloor && !consumedByEndFlow && typeof data.text === "string") {
+            const overQueueCap = turnQueue.length >= MAX_PENDING_FOUNDER_TURNS;
+            const throttled =
+              inputMethod === "chat" ? !allowFounderChatTurn() : overQueueCap;
+            if (throttled) {
+              console.warn(
+                "[rate-limit] chat_message burst dropped (token bucket empty / queue deep)",
+              );
+              return;
+            }
+          }
+
+          if (!consumedByFloor && !consumedByEndFlow) {
             noteFounderTurnForRoomRead();
             enqueueTurn({
               text: data.text,
@@ -1462,6 +1790,10 @@ export function initRestSocket(wss: WebSocketServer) {
             currentTurnAbort.abort();
           }
           turnQueue.length = 0;
+          // Drop any pending two-step interruption hold — the session is ending,
+          // so there is no floor left to hand back.
+          floorHeldByPanel = false;
+          floorReSignaled = false;
 
           const panelists = data.panelists || [
             { name: "Marcus", role: "Lead Investor" },
@@ -1523,7 +1855,7 @@ export function initRestSocket(wss: WebSocketServer) {
             .join(", ");
 
           enqueueTurn({
-            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:"), state INVEST or PASS, and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Use phrases like "I'm in because…" or "I'm out because…". Avoid generic phrases — each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
+            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:") and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Weigh this fairly: actively look for the reasons to say YES, not just the reasons to say no. If the pitch genuinely supports it, say you are IN ("I'm in because…") — a conditional yes is allowed ("I'm in, provided you can prove out the retention numbers"). Only say you are OUT ("I'm out because…") when there is a specific, concrete blocker you cannot get past — never as a reflex. If you are genuinely on the fence, say so honestly and name the ONE thing that would tip you. Do not invent flaws to justify a pass, and do not manufacture enthusiasm you do not feel. Each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
             isVerdict: true,
             panelists: panelists,
           });
@@ -1549,6 +1881,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 sessionMode,
                 previousSessionCtx,
                 marketSnapshot,
+                pitchConfigSnapshot?.fundingStage || "",
               ).catch((err) => {
                 console.error("❌ Background evaluation failed:", err);
                 return null;
@@ -1608,6 +1941,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 sessionMode,
                 previousSessionCtx,
                 marketSnapshot,
+                pitchConfigSnapshot?.fundingStage || "",
               );
             }
             reportData = {

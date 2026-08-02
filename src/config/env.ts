@@ -23,6 +23,9 @@ export const config = {
   nodeEnv: process.env.NODE_ENV || "development",
   emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
+  // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
+  // in a SEPARATE bucket, so the main media bucket can be fully private.
+  avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || "pitchnest-avatars",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
     .split(",")
     .map((o) => o.trim())

@@ -4,6 +4,7 @@ import { config } from "../config/env.ts";
 import { uploadDir } from "../services/storageService.ts";
 import { auditDeck } from "../services/aiService.ts";
 import { generateDeckAuditPDF } from "../services/pdfService.ts";
+import { storagePathFromUrl } from "../utils/storagePath.ts";
 import path from "path";
 import fs from "fs";
 
@@ -57,10 +58,10 @@ export const uploadDeck = async (req: Request, res: Response) => {
       fs.writeFileSync(path.join(uploadDir, localFileName), req.file.buffer);
       publicUrl = `/uploads/${localFileName}`;
     } else {
-      const { data: { publicUrl: pUrl } } = supabase.storage
-        .from(config.storageBucket)
-        .getPublicUrl(filePath);
-      publicUrl = pUrl;
+      // Item A: the bucket is private, so store the BARE object path (not a
+      // public URL). Deck rendering goes through GET /:id/signed-url, which
+      // signs this path on demand; the deletion path derives the same path.
+      publicUrl = filePath;
     }
 
     const insertData: any = { 
@@ -115,9 +116,67 @@ export const listDecks = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to fetch decks" });
     }
     res.json(decks);
-  } catch (error) { 
+  } catch (error) {
     console.error("❌ listDecks exception:", error);
-    res.status(500).json({ error: "Failed to fetch decks" }); 
+    res.status(500).json({ error: "Failed to fetch decks" });
+  }
+};
+
+// ── Signed deck URL (Item A: private-bucket access) ──────────────────────────
+// The pitch-media bucket is private, so decks can no longer be loaded via a
+// public URL. This returns a short-lived signed URL for the OWNER's deck only.
+// Ownership is enforced by the user_id match — a signed URL is never issued for
+// a deck the caller does not own. Local-fallback decks ("/uploads/..") and any
+// non-storage value are returned as-is so dev and legacy rows still render.
+const SIGNED_URL_TTL_SECONDS = 300; // 5 min — long enough for a pitch to load it
+
+export const getDeckSignedUrl = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: deck, error } = await supabase
+      .from("decks")
+      .select("file_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in getDeckSignedUrl:", error);
+      return res.status(500).json({ error: "Failed to load deck" });
+    }
+    if (!deck) return res.status(404).json({ error: "Deck not found" });
+
+    const stored = deck.file_url as string | null;
+
+    // Local-fallback file or empty — nothing to sign; hand back what we have.
+    if (!stored || stored.startsWith("/uploads/")) {
+      return res.json({ url: stored || "" });
+    }
+
+    const objectPath = storagePathFromUrl(stored);
+    if (!objectPath) {
+      // Unrecognized (e.g. an external URL we didn't store) — return as-is
+      // rather than 500, so an odd legacy row still renders.
+      return res.json({ url: stored });
+    }
+
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(config.storageBucket)
+      .createSignedUrl(objectPath, SIGNED_URL_TTL_SECONDS);
+
+    if (signErr || !signed?.signedUrl) {
+      console.error("❌ createSignedUrl failed in getDeckSignedUrl:", signErr);
+      return res.status(500).json({ error: "Failed to sign deck URL" });
+    }
+
+    res.json({ url: signed.signedUrl });
+  } catch (err) {
+    console.error("❌ getDeckSignedUrl exception:", err);
+    res.status(500).json({ error: "Failed to sign deck URL" });
   }
 };
 

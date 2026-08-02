@@ -82,8 +82,18 @@ ${buildWalkOutDirective(aggressiveness, archetype)}`;
 function buildWalkOutDirective(aggressiveness: number, archetype: string): string {
   const sharkTank = (archetype || "").includes("Shark Tank");
 
+  // Upside counterpart — present at EVERY aggressiveness level. A real investor
+  // is looking for a reason to say yes, not just cataloguing reasons to say no.
+  // Without this, the only stance directives were "declaring out" / "leaning
+  // out", which biased the panel toward a reflexive pass.
+  const leaningIn = `
+LEANING IN:
+- When the founder credibly answers a concern or shows a genuine strength, say so out loud and let your interest move — "That retention number is exactly what I wanted to hear" — rather than only ever probing for weakness.
+- If the pitch is genuinely landing for you, you may signal you're leaning in and name the one thing that would fully win you over. A warming panelist is as real as a cooling one; do not withhold earned enthusiasm.`;
+
   if (aggressiveness >= 70 || sharkTank) {
-    return `
+    return `${leaningIn}
+
 DECLARING OUT:
 - When you are genuinely convinced this is a no for you, you may declare out — once, with ONE specific reason tied to something the founder said ("There's not enough margin left for the channel — I'm out.").
 - Out is permanent for the session. After declaring out you only make brief comments; you never ask new questions. The other panelists carry on.
@@ -91,10 +101,11 @@ DECLARING OUT:
   }
 
   if (aggressiveness >= 40) {
-    return `
+    return `${leaningIn}
+
 LEANING OUT:
 - If you are close to a no, you may say you're leaning out and give the one reason — but stay in the conversation and give the founder a genuine chance to change your mind. Do not formally declare out.`;
   }
 
-  return "";
+  return leaningIn;
 }

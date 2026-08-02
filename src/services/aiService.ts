@@ -507,6 +507,39 @@ function buildToneDirective(aggressiveness: number, riskAppetite: number): strin
 }
 
 /**
+ * Traction calibration by the founder's stated funding stage. Every stage
+ * bracket gets its own expected bar so a pre-revenue idea founder is never
+ * judged against a revenue-stage yardstick (and a selling company is never
+ * let off the hook for missing numbers). Injected into both panel and coach
+ * prompts via buildTractionDirective().
+ */
+function buildTractionDirective(fundingStage: string): string {
+  const stage = (fundingStage || "").trim().toLowerCase();
+  let expectations: string;
+  if (/series [abc]|growth|scale|seed\s*\+?$/i.test(fundingStage)) {
+    // "Series A+" / "Growth Stage - Venture Capital" (PrePitchSetup passes the
+    // archetype string here for growth): a company that is actually selling.
+    expectations =
+      "The founder is (or claims to be) an operating company with customers. Traction IS expected: real revenue, real usage, or real pipeline — probe for concrete numbers, and do not let narrative stand in for them.";
+  } else if (stage === "seed" || /seed/.test(stage)) {
+    expectations =
+      "Seed-stage. Traction should be early signals — pilots, letters of intent, first paying customers, waitlists with real names — not scaled revenue. Reward a credible early signal; do not demand Series A numbers.";
+  } else if (stage === "pre-seed" || /pre[- ]?seed/.test(stage)) {
+    expectations =
+      "Pre-seed. Traction is NOT expected: no revenue, users, or pilots is completely normal. Judge the problem, the founder, and the plan. Do not lower the score for an honest 'no traction yet' — probe whether the plan and approach could plausibly get there.";
+  } else {
+    // "Idea / Bootstrap" and any unknown/empty value — the most permissive bar.
+    expectations =
+      "Idea-stage / pre-launch. No traction is expected at all: no users, no revenue, no validation. The bar is whether the problem is real, the founder is credible, and the plan is sound. Never penalize the absence of traction at this stage.";
+  }
+
+  return `TRACTION BY FUNDING STAGE:
+- The founder stated their funding stage as "${fundingStage}". Calibrate EVERY traction question and judgment to that stage — never apply a generic higher bar.
+- ${expectations}
+- Never compare an idea-stage founder to a revenue-stage yardstick, and never let a growth-stage founder hand you narrative in place of numbers.`;
+}
+
+/**
  * Prompt block injected when the founder is re-pitching a startup they already
  * pitched here before ("Pitch Again"). Gives the panel/coach compact memory of
  * the previous attempt so they can welcome the founder back and probe whether
@@ -717,6 +750,7 @@ STARTUP CONTEXT:
 ${deckContext}
 
 ${toneBlock}
+${buildTractionDirective(fundingStage)}
 ${returningBlock}` + `
 SESSION FLOW:
 1. OPENING (your first turn only): Welcome the founder warmly. Mention one specific detail from their deck or concept. Invite them to deliver their opening pitch.
@@ -744,6 +778,7 @@ ${deckContext}
 
 ${buildArchetypeDirective(archetype)}
 ${toneBlock}
+${buildTractionDirective(fundingStage)}
 ${returningBlock}
 SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
@@ -753,6 +788,7 @@ SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - MACHINE TAG (the single exception to spoken-words-only; it is stripped before speech): end EVERY response with a final line of exactly this form: @@INTEREST <SpeakerName>=<warming|neutral|cooling|out>
   It reports the SPEAKING panelist's honest current interest in this deal. Optionally append ONE short unresolved concern as a phrase with no periods: @@INTEREST Sarah=cooling | concern: gross margin still unclear
   Keep "concern:" only while that panelist's raised concern remains unanswered; drop it once the founder addresses it. Once a panelist is out they stay out for the whole session. Everything BEFORE this line must still be only spoken words.
+  The ONLY other tag is the two-step-interruption signal: when you interrupt an unfinished founder thought, your intent-only STEP 1 turn ends with a separate final line "@@FLOOR hold" (after the @@INTEREST line). It is stripped before speech and holds the floor until the founder hands it back — you then ask your held question when the system prompts you to.
 - Turns may begin with [PANEL STATE: ...] metadata — each panelist's current stance from earlier turns. Stay consistent with it: a panelist marked out stays out, makes at most brief comments, and asks no new questions.
 
 PANEL CONVERSATION STYLE
@@ -767,7 +803,7 @@ Personalities (keep them distinct in voice and focus — this is what makes THIS
 How the conversation flows:
 - After the founder gives their opening (problem + solution), engage as a genuine discussion, not a fixed Q&A list.
 - All three of you participate across the session. Do NOT let one panelist carry it while the other two stay silent. Whoever's domain the founder just touched is the natural person to speak next.
-- React to each other and to the founder: "Building on Sarah's point about churn..." or "I'd push back on what Marcus said...".
+- React to each other and to the founder ONLY when it is genuinely relevant — when you actually build on or disagree with a specific point just made ("Building on Sarah's point about churn..." or "I'd push back on what Marcus said..."). This is not a regular cadence or an opener to reach for every turn; most turns should go straight to your own question. An empty "building on that" with nothing real behind it is worse than not referencing at all.
 
 Turn discipline (strict):
 - ONE panelist speaks per turn, asking ONE thing.
@@ -788,10 +824,13 @@ No scripts, no repetition:
 - Do NOT recite stock questions. The investor concerns above are what you CARE about, not what you say — every question must still come from what the founder ACTUALLY just said: challenge their specific claim, number, assumption, or the gap they left.
 - Vary phrasing, depth, and angle. Pursue what is genuinely interesting or weak in THIS specific pitch.
 
-Interrupting (use sparingly):
-- Default to letting the founder finish their thought.
-- Only interject if the founder has spoken 30+ seconds without answering the question on the table, or states something clearly false or internally inconsistent. In that case the relevant panelist may briefly cut in ("Sorry, let me jump in —") and ask the pointed question.
-- Never interrupt a founder who is mid-answer and on track.
+Interrupting (use sparingly — TWO STEPS, never one):
+- Default to letting the founder finish their thought. Never interrupt a founder who is mid-answer and on track.
+- Only interject if the founder has spoken 30+ seconds without answering the question on the table, or states something clearly false or internally inconsistent.
+- When you DO interject, you do it in TWO separate turns — never both at once:
+  - STEP 1 — signal intent ONLY. Say a short, polite "hold on, I have a question" line and NOTHING else: no question yet, no topic, do NOT ask anything. End that turn with the machine tag "@@FLOOR hold" on its own final line (see MACHINE TAG rules) so the floor is held for you. Example spoken line: "Sarah: Sorry — can I jump in for a second?" then a new line: "@@FLOOR hold". Because this turn asks nothing, it contains NO question mark.
+  - STEP 2 — after the founder hands the floor back to you (the system will prompt you when they say "go ahead"/"ask away"), THEN ask your one pointed question, grounded in what they were saying. Do NOT ask before they hand it back.
+- If you are just asking a normal follow-up (not cutting the founder off mid-thought), ask it directly as usual — the two-step is ONLY for interrupting an unfinished thought.
 
 Grounding:
 - Challenge the logic and internal consistency of their claims (does CAC reconcile with LTV, is the TAM actually derived, does the timeline hold) rather than asserting external facts you cannot verify.
@@ -848,6 +887,10 @@ export async function evaluatePitch(
   // Market snapshot from the session's background web research (or null).
   // Grounds the competitive-intel section in real, dated web results.
   researchContext?: { text: string; retrievedAt: string } | null,
+  // Founder's stated funding stage (e.g. "Pre-Seed", "Series A+"). Carried into
+  // the scoring context so traction expectations are calibrated to the stage
+  // instead of a generic revenue-stage bar. Empty string = not specified.
+  fundingStage: string = "",
 ): Promise<EvaluationReport> {
   if (!hasSubstantivePitch(transcript)) {
     console.log("ℹ️ Skipping evaluation LLM calls: transcript has no substantive pitch content.");
@@ -928,6 +971,7 @@ RE-PITCH RULE: In the summary and category_matrix, explicitly note where this at
   const coachPrompt = `${coachIntro}
 
 BUSINESS: ${businessName}
+FUNDING STAGE: ${fundingStage || "Not specified"}
 ${deckSection}${previousSection}
 SESSION TRANSCRIPT:
 ${transcriptText}
@@ -941,6 +985,7 @@ COACHING EVALUATION RULES:
 - clarity = how clearly they explain the problem, solution, and value proposition.
 - scalability = how well they understand market size, growth potential, and business model.
 - readiness = how prepared they are to face a real investor panel based on this session.
+- TRACTION BY STAGE: Calibrate to the FUNDING STAGE above. Idea/Bootstrap or Pre-Seed → no revenue/users/pilots expected; never lower scores for lacking traction at this stage. Seed → early signals (pilots, LOIs, first customers) suffice. Series A+ / Growth → real traction is expected. Coach toward the RIGHT next milestone for their stage, not a generic "get revenue".
 - TECHNICAL-DEPTH FAIRNESS: Not every founder is an engineer. Judge "how the product works" at a FUNCTIONAL level — a clear explanation of what it does and the key technical concepts a smart non-expert would expect, NOT engineering-level implementation depth (architecture, algorithms, infra). Reward a clear functional explanation fully; only expect deeper technical detail if the startup's core claim is itself a deep-tech breakthrough. Keep market, traction, and business-model expectations as rigorous as ever.
 - strengths: Specific things the founder did well — cite real moments from the transcript.
 - risks: Gaps, weak answers, or areas that need work before facing investors — be specific and constructive.
@@ -969,7 +1014,13 @@ Return this exact JSON structure:
   // ── Panel evaluation: split into 3 concurrent calls ──────────────────────
   // Faster than one 4096-token monolith (the calls run in parallel), and a parse
   // failure in one section no longer forces the entire report to regenerate.
+  // Shared context for the three report sections (core, market intel, action
+  // plan). Funding stage is carried here so every section — especially the
+  // scorer judging "readiness for the stated funding stage" — knows the stage
+  // and applies the right traction bar. Stage-blind scoring is what used to
+  // mark early-stage founders down for missing revenue.
   const panelCtx = `BUSINESS: ${businessName}
+FUNDING STAGE: ${fundingStage || "Not specified"}
 ${deckSection}${previousSection}
 TRANSCRIPT:
 ${transcriptText}`;
@@ -989,6 +1040,7 @@ RULES:
 - clarity = problem/solution narrative, structure, jargon control.
 - scalability = market size, growth model, unit economics, GTM scalability.
 - readiness = overall investability for the stated funding stage.
+- TRACTION BY STAGE: Calibrate traction expectations to the FUNDING STAGE above. Idea/Bootstrap or Pre-Seed → no revenue/users/pilots expected; do NOT lower scalability or readiness for the absence of traction — judge the problem, plan, and market instead. Seed → early signals (pilots, LOIs, first customers) are enough. Series A+ / Growth → real traction numbers ARE expected; do not accept narrative in place of them. Never judge an early-stage founder against a revenue-stage bar.
 - TECHNICAL-DEPTH FAIRNESS: Not every founder is an engineer. The bar for "how the product works" is FUNCTIONAL, not engineering-level: the founder should clearly explain what the product does, how it delivers value, and speak sensibly to the key technical concepts a smart non-expert would expect. Reward that clear functional explanation fully. Do NOT lower delivery, clarity, or readiness merely because they lack implementation-level depth (architecture, algorithms, code, infra) UNLESS the pitch's own core claim is a deep-tech breakthrough that depends on it. Judge market, traction, business model, and financials with full rigor — this fairness note applies ONLY to technical/engineering depth.
 - ACCENT FAIRNESS: Focus on the substance and clarity of the pitch content. Do not penalize pronunciation, grammatical variations, or speech patterns due to non-native accents or regional English variants (e.g. Nigerian English, Indian English).
 - Keep summary to 2-3 sentences. Include one sentiment quote each for Marcus, Sarah, and Chen.
@@ -997,7 +1049,7 @@ RULES:
 - founder_market_fit: 0-100 — how convincingly THIS founder showed they are the right person for THIS problem (relevant background, earned insight, origin story). Judge only what surfaced in this session; if it never came up, score it low and say so in founder_market_fit_note. Reported separately — it does NOT affect the four scores above.
 - transcript_summary: 3-5 sentence summary of what was discussed and what was missed.
 - question_difficulty: integer counts {easy, medium, hard} of the panel's questions.
-- vc_investment_probability: 0-100 chance this pitch earns a VC follow-up meeting.
+- vc_investment_probability: 0-100 chance this pitch earns a VC follow-up meeting. This is NOT a default-low field: judge it honestly from THIS session — a strong, well-supported pitch at the right stage should score well above 50; reserve low values for pitches with real, specific gaps. Do not anchor to the example number below.
 - category_matrix: for Delivery, Clarity, Scalability, Readiness — went_well + needs_improvement (specific) + impact ("High"/"Moderate"/"Low").
 - confidence_timeline: 5 points fluctuating realistically (start, after first hard question, weakest moment, recovery, close).
 ${sharedRules}
@@ -1024,7 +1076,7 @@ Return this exact JSON structure:
   "founder_market_fit_note": "One sentence on why this founder is (or is not yet) the right person for this problem.",
   "transcript_summary": "3-5 sentence summary of the session",
   "question_difficulty": { "easy": 2, "medium": 3, "hard": 3 },
-  "vc_investment_probability": 25,
+  "vc_investment_probability": 50,
   "category_matrix": [ { "category": "Delivery", "went_well": "Specific sentence", "needs_improvement": "Specific sentence", "impact": "Moderate" } ],
   "confidence_timeline": [ { "time": "0:00", "value": 80 }, { "time": "1:30", "value": 68 }, { "time": "3:00", "value": 55 }, { "time": "4:30", "value": 45 }, { "time": "6:00", "value": 60 } ]
 }`;
