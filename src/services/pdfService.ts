@@ -738,31 +738,19 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         : "AI VC Panel";
       const strengths: string[] = Array.isArray(report.strengths) && report.strengths.length > 0
         ? report.strengths
-        : [
-            "Innovative application of AI to help founders practice, get feedback, and improve pitching.",
-            "Solo and panel modes provide realistic practice and simulate real investor interactions.",
-            "Targeting founders in Africa addresses a large, underserved, and high-potential community."
-          ];
+        : ["Not assessed in this session — deliver a fuller pitch to surface your key strengths."];
       const risks: string[] = Array.isArray(report.risks) && report.risks.length > 0
         ? report.risks
-        : [
-            "Projected 5M founders in Africa lacks clear methodology and detailed breakdown.",
-            "No clarity on CAC, pricing, revenue model, or go-to-market plan.",
-            "No information on AI architecture, data strategy, or scalability approach."
-          ];
+        : ["Not assessed in this session."];
       const nextSteps: any[] = Array.isArray(report.next_steps) && report.next_steps.length > 0
         ? report.next_steps
         : [
-            { title: "Develop Detailed Market Analysis", priority: "High Priority", desc: "Provide a clear breakdown of the total addressable market and realistic capture projections." },
-            { title: "Clarify Unit Economics & GTM Strategy", priority: "High Priority", desc: "Outline customer acquisition costs, pricing model, and revenue projections." },
-            { title: "Present Technical Infrastructure Plan", priority: "High Priority", desc: "Detail the AI system architecture, data pipeline, and scalability approach." }
+            { title: "Not assessed in this session", priority: "", desc: "Complete a fuller pitch to receive tailored next steps." },
           ];
       const sentiments: any[] = Array.isArray(report.sentiments) && report.sentiments.length > 0
         ? report.sentiments
         : [
-            { persona: "Marcus (Lead Investor)", quote: "The market sizing feels overly optimistic without clear evidence of demand or competitive differentiation." },
-            { persona: "Sarah (Partner)", quote: "The unit economics and customer acquisition strategy were not addressed, making it hard to gauge financial viability." },
-            { persona: "Chen (Tech Investor)", quote: "The technical details and infrastructure plans were missing, so I'm unsure about feasibility." }
+            { persona: "Panel", quote: "Investor sentiment was not captured for this session." },
           ];
 
       // Dynamic data from AI evaluation (with hardcoded fallbacks)
@@ -788,79 +776,56 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
             color: topicColors[t.topic] || COLORS.primary,
           }));
         }
-        return [
-          { topic: "Problem Definition", percentage: 100, color: COLORS.emerald },
-          { topic: "Solution Overview", percentage: 90, color: COLORS.primary },
-          { topic: "Market Size", percentage: 35, color: COLORS.amber },
-          { topic: "Business Model", percentage: 20, color: COLORS.violet },
-          { topic: "Go-to-Market", percentage: 10, color: COLORS.secondary },
-        ];
+        // No fabricated coverage — an empty set renders an empty donut/legend
+        // (the chart helpers tolerate zero segments) rather than inventing scores.
+        return [];
       })();
 
       const transcriptSummary: string = report.transcript_summary ||
-        "The founder effectively introduced the concept and core features. However, the market size claim lacked justification and detail. Key areas such as unit economics, go-to-market strategy, traction, team, and technical infrastructure were not addressed, leading to a unanimous PASS verdict from the investor panel.";
+        "Not assessed in this session.";
 
       const questionsToPrepare: string[] = Array.isArray(report.questions_to_prepare) && report.questions_to_prepare.length > 0
         ? report.questions_to_prepare
-        : [
-            "How did you calculate your total addressable market?",
-            "What is your pricing model and unit economics?",
-            "How will you acquire your first 1,000 paying customers?",
-            "What makes your product defensible against competitors?",
-            "What is your technology roadmap for the next 12 months?",
-            "Who is on your team and why are you the right team to win?"
-          ];
+        : ["Not assessed in this session."];
 
       const swotData = report.competitive_landscape?.swot || {
-        strengths: ["AI-powered investor & YC panel simulation", "Built specifically for African founders and investors", "Affordable and accessible pricing model", "Addresses a large and underserved market"],
-        weaknesses: ["Limited brand awareness and early traction", "No clear unit economics yet", "Small team and limited resources", "Lack of enterprise integrations"],
-        opportunities: ["Growing startup ecosystem in Africa", "Partnerships with accelerators and VCs", "Expansion into global emerging markets", "Add advanced analytics & fundraising insights"],
-        threats: ["Large global players may enter the space", "Feature replication is easy", "Economic downturn may reduce startup funding", "User acquisition cost may rise over time"],
+        strengths: ["Not assessed in this session."],
+        weaknesses: ["Not assessed in this session."],
+        opportunities: ["Not assessed in this session."],
+        threats: ["Not assessed in this session."],
       };
 
       const strategicRecommendation: string = report.competitive_landscape?.strategic_recommendation ||
-        "PitchNest is addressing a real and underserved need with a strong value proposition. The Africa-first focus and AI-driven panel simulation are strong differentiators. However, to compete with well-funded global players, show clear traction, refine unit economics, and build strong partnerships with local accelerators and VCs.";
+        "Not assessed in this session.";
 
       const keyFocusAreas: string[] = report.competitive_landscape?.key_focus_areas || [
-        "Validate market demand with real users",
-        "Prove unit economics and sustainability",
-        "Build strategic partnerships",
-        "Strengthen technical roadmap"
+        "Not assessed in this session.",
       ];
 
       const practiceDrills: any[] = Array.isArray(report.practice_drills) && report.practice_drills.length > 0
         ? report.practice_drills
         : [
-            { title: "Elevator Pitch (60 sec)", desc: "Practice a clear, concise pitch that covers problem, solution, and value.", reps: "3 Reps", time: "5 min" },
-            { title: "Market Size Breakdown", desc: "Present your TAM, SAM, SOM with clear numbers and sources.", reps: "2 Reps", time: "7 min" },
-            { title: "Unit Economics Pitch", desc: "Explain pricing, CAC, LTV, and why the model is sustainable.", reps: "2 Reps", time: "6 min" },
-            { title: "Investor Q&A Simulation", desc: "Answer tough investor questions with clarity and confidence.", reps: "5 Qs", time: "10 min" }
+            { title: "Not assessed in this session", desc: "Complete a fuller pitch to receive tailored practice drills.", reps: "", time: "" },
           ];
 
-      const durationStr = report.duration ? `${Math.floor(report.duration / 60)}:${String(report.duration % 60).padStart(2, "0")}` : "06:12";
+      const durationStr = report.duration ? `${Math.floor(report.duration / 60)}:${String(report.duration % 60).padStart(2, "0")}` : "—";
 
-      // ── Dynamic data from new AI fields (with hardcoded fallbacks) ───────────
+      // ── Dynamic data from new AI fields (with honest placeholders) ───────────
       const marketGaps: { title: string; desc: string }[] =
         Array.isArray(report.market_gaps) && report.market_gaps.length > 0
           ? report.market_gaps.slice(0, 4)
           : [
-              { title: "Geographic Focus", desc: "Most tools focus on US/Europe — PitchNest is Africa-first." },
-              { title: "Investor Simulation", desc: "Few platforms simulate local African investor dynamics." },
-              { title: "Localized Insights", desc: "No localized templates or guidance for African founders." },
-              { title: "Affordability", desc: "Competitors are too expensive for early-stage founders." },
+              { title: "Not assessed", desc: "Market gap analysis was not generated for this session." },
             ];
 
       const collaborationOpportunities: string[] =
         Array.isArray(report.collaboration_opportunities) && report.collaboration_opportunities.length > 0
           ? report.collaboration_opportunities.slice(0, 4)
           : [
-              "Partner with African accelerators and incubators for distribution",
-              "Collaborate with VC firms to provide portfolio company training",
-              "Build integrations with pitch deck tools (Tome, Beautiful.ai)",
-              "Establish university partnerships for entrepreneurship programs",
+              "Not assessed in this session.",
             ];
 
-      const questionDifficulty = report.question_difficulty || { easy: 2, medium: 3, hard: 3 };
+      const questionDifficulty = report.question_difficulty || { easy: 0, medium: 0, hard: 0 };
 
       const vcInvestmentProbability =
         typeof report.vc_investment_probability === "number"
@@ -871,60 +836,37 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const competitorList = Array.isArray(report.competitors) && report.competitors.length > 0
         ? report.competitors.slice(0, 4)
         : [
-            { name: "Competitor A", similarity: 80, strength: "Strong brand presence", weakness: "Limited geographic focus", size: "Est. ~$15M" },
-            { name: "Competitor B", similarity: 72, strength: "Great UX and onboarding", weakness: "Higher price point", size: "Est. ~$10M" },
-            { name: "Competitor C", similarity: 65, strength: "Large user base", weakness: "No AI features", size: "Est. ~$25M" },
-            { name: "Competitor D", similarity: 55, strength: "Backed by top VCs", weakness: "Poor customer support", size: "N/A" },
+            { name: "Not assessed", similarity: 0, strength: "Competitor analysis was not generated for this session.", weakness: "—", size: "—" },
           ];
 
       const studiesToShow = Array.isArray(report.companies_to_study) && report.companies_to_study.length > 0
         ? report.companies_to_study.slice(0, 4)
         : [
-            { name: "Y Combinator", why: "Best-in-class founder education and network." },
-            { name: "Stripe", why: "Exceptional developer experience and product-led growth." },
-            { name: "Canva", why: "Mastered freemium conversion at global scale." },
-            { name: "Notion", why: "Viral growth through templates and community sharing." },
+            { name: "Not assessed", why: "Companies to study were not generated for this session." },
           ];
 
       const priorityImprovements = Array.isArray(report.top_priorities) && report.top_priorities.length > 0
         ? report.top_priorities.slice(0, 5)
         : [
-            { title: "Strengthen Market Size", desc: "Provide a detailed breakdown of your market with realistic capture projections.", priority: "High Priority", impact: "Very High" },
-            { title: "Clarify Unit Economics", desc: "Define pricing model, CAC, LTV, and gross margin to show financial viability.", priority: "High Priority", impact: "Very High" },
-            { title: "Present Technical Scale", desc: "Explain your architecture, data pipeline, and scalability strategy clearly.", priority: "High Priority", impact: "High" },
-            { title: "Build Traction & Proof", desc: "Show early user adoption, testimonials, and partnership evidence.", priority: "Medium Priority", impact: "High" },
-            { title: "Refine Go-to-Market", desc: "Outline customer acquisition channels, partnerships, and growth plan.", priority: "Medium Priority", impact: "Medium" },
+            { title: "Not assessed", desc: "Complete a fuller pitch to receive tailored priority improvements.", priority: "", impact: "" },
           ];
 
       const frameworkData = report.answer_framework || {
-        question: "How did you calculate your total addressable market?",
+        question: "Not assessed in this session.",
         steps: [
-          { label: "Start with the Big Picture", text: "Reference total industry size using credible third-party sources." },
-          { label: "Show Your Calculation", text: "Break down TAM into SAM and SOM with clear logical steps." },
-          { label: "Market Capture Plan", text: "State your realistic capture percentage and the timeline to get there." },
-          { label: "Back It Up with Data", text: "Cite sources like Statista, World Bank, or industry reports." },
-          { label: "Close with Confidence", text: "Restate your conservative estimate and the levers available to expand it." },
+          { label: "Not assessed", text: "A suggested answer framework was not generated for this session." },
         ],
       };
 
       const categoryMatrixRows = Array.isArray(report.category_matrix) && report.category_matrix.length > 0
         ? report.category_matrix.slice(0, 4)
         : [
-            { category: "Delivery", went_well: "Strong opening tone and conviction.", needs_improvement: "Pace was inconsistent under pressure.", impact: "Moderate" },
-            { category: "Clarity", went_well: "Problem statement was clearly framed.", needs_improvement: "Market sizing was not clearly explained.", impact: "Moderate" },
-            { category: "Scalability", went_well: "Large market segment identified.", needs_improvement: "No clear scaling plan was articulated.", impact: "High" },
-            { category: "Readiness", went_well: "Passionate about the vision.", needs_improvement: "Unit economics were not defined.", impact: "High" },
+            { category: "Not assessed", went_well: "—", needs_improvement: "A detailed category matrix was not generated for this session.", impact: "—" },
           ];
 
       const timelinePoints = Array.isArray(report.confidence_timeline) && report.confidence_timeline.length > 0
         ? report.confidence_timeline.map((p: any) => ({ xVal: p.time, yVal: p.value }))
-        : [
-            { xVal: "0:00", yVal: 85 },
-            { xVal: "1:30", yVal: 70 },
-            { xVal: "3:00", yVal: 65 },
-            { xVal: "4:30", yVal: 48 },
-            { xVal: "6:00", yVal: 55 },
-          ];
+        : [];
 
       // Derived from the SAME overall score shown on the page, so the percentile
       // is identical on p1 and p3 and can never read above-average for a
@@ -993,6 +935,45 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         const deltaColor = delta >= 0 ? COLORS.emerald : COLORS.rose;
         doc.font("Inter-Bold").fontSize(9).fillColor(deltaColor)
           .text(`vs previous attempt: ${prevOverall} → ${overallScore} (${delta >= 0 ? "+" : ""}${delta})`, 350, 310);
+      }
+
+      // ── Insufficient session: SHORT-FORM report ────────────────────────────
+      // A too-short/empty pitch has no real scores, sentiment, or analytics — so
+      // we stop after the executive summary rather than render pages of fabricated
+      // placeholder content (the old behavior). One honest, friendly callout tells
+      // the founder exactly what to do, then the document ends. This is the single
+      // most important guard against the "6 fabricated pages under an Incomplete
+      // header" bug: pages 2-7 (and the zeroed category/radar/sentiment blocks
+      // below) are never emitted for an insufficient session.
+      if (isInsufficient) {
+        const boxY = 380;
+        doc.roundedRect(50, boxY, 495, 150, 8).lineWidth(1).fillAndStroke(COLORS.indigoBg, "#c7d2fe");
+        drawIcon(doc, "target", 70, boxY + 24, 20, COLORS.primary);
+        doc.font("Inter-Bold").fontSize(13).fillColor(COLORS.primaryDark).text(
+          "This pitch was too short to score",
+          100, boxY + 24, { width: 420 },
+        );
+        doc.font("Inter").fontSize(9.5).fillColor(COLORS.dark).text(
+          "We only generate scores, investor sentiment, and the full analytics report once " +
+            "you've delivered a real pitch — at minimum your problem and solution, spoken for " +
+            "at least a minute. There wasn't enough here to evaluate fairly, so we've left the " +
+            "scoring out rather than guess.",
+          70, boxY + 54, { width: 455, lineGap: 3 },
+        );
+        doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.primary).text(
+          "Re-pitch to get your full report — you've got this.",
+          70, boxY + 120, { width: 455 },
+        );
+
+        // Footer on this single page, then finish. (bufferPages is on, so the
+        // footer loop still runs over the one buffered page.)
+        const range = doc.bufferedPageRange();
+        for (let i = 0; i < range.count; i++) {
+          doc.switchToPage(i);
+          drawFooter(doc, i + 1, range.count);
+        }
+        doc.end();
+        return;
       }
 
       // Category Scores

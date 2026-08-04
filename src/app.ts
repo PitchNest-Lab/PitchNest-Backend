@@ -10,6 +10,7 @@ import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
+import adminRoutes from "./routes/adminRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 
 const app = express();
@@ -73,6 +74,8 @@ app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
 app.use("/api/profile", profileRoutes);
+// Internal admin surface (Item C) — gated by ADMIN_API_KEY, 404 when unset.
+app.use("/api/admin", adminRoutes);
 app.post("/api/waitlist", handleWaitlist);
 app.post("/api/survey", handleSurvey);
 

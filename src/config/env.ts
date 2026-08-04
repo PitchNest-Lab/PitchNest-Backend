@@ -26,6 +26,10 @@ export const config = {
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
   avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || "pitchnest-avatars",
+  // Internal-only admin key for the transcript-review endpoint (Item C). Not a
+  // user role — a single shared secret sent as the x-admin-key header. Empty
+  // disables the admin routes entirely (they 404).
+  adminApiKey: process.env.ADMIN_API_KEY || "",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
     .split(",")
     .map((o) => o.trim())

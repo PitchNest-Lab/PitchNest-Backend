@@ -872,6 +872,22 @@ export function hasSubstantivePitch(transcript: any[]): boolean {
   return totalUserText.length >= 80 || words.length >= 15;
 }
 
+// A session is "insufficient" when the founder delivered no real pitch — either
+// they said essentially nothing (falling the word/char threshold below) OR the
+// whole session lasted under ~1 minute of elapsed pitch time. Duration is OR'd,
+// not AND'd, so a founder who spoke for 40 seconds and then went silent still
+// gets an honest "too short to score" report instead of a fabricated one.
+// Negative/undefined durations (e.g. a session that never really started) also
+// count as insufficient — a full report must never be produced from nothing.
+export function isInsufficientPitch(
+  transcript: any[],
+  durationSec: number | null | undefined,
+): boolean {
+  if (!hasSubstantivePitch(transcript)) return true;
+  const d = Number(durationSec);
+  return !Number.isFinite(d) || d < 60;
+}
+
 export async function evaluatePitch(
   transcript: any[],
   businessName: string,
@@ -891,8 +907,13 @@ export async function evaluatePitch(
   // the scoring context so traction expectations are calibrated to the stage
   // instead of a generic revenue-stage bar. Empty string = not specified.
   fundingStage: string = "",
+  // Elapsed pitch time in seconds (the client's wall-clock duration). Makes the
+  // insufficiency gate duration-aware: a founder who spoke briefly then went
+  // silent still gets an honest "too short to score" report instead of a
+  // fabricated one. Omit/undefined when no duration is known.
+  durationSec?: number | null,
 ): Promise<EvaluationReport> {
-  if (!hasSubstantivePitch(transcript)) {
+  if (isInsufficientPitch(transcript, durationSec)) {
     console.log("ℹ️ Skipping evaluation LLM calls: transcript has no substantive pitch content.");
     return {
       summary:

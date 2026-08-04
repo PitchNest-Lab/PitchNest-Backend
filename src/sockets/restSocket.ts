@@ -6,6 +6,7 @@ import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import {
   evaluatePitch,
   hasSubstantivePitch,
+  isInsufficientPitch,
   getMasterPrompt,
   generatePanelResponse,
   streamPanelResponse,
@@ -35,11 +36,17 @@ import {
 } from "../services/researchService.ts";
 import crypto from "crypto";
 
-const MIN_EVAL_USER_CHARS = 150;
-const MIN_EVAL_DURATION_SEC = 60;
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
 // garbled and ask the founder to repeat instead of answering it.
 const LOW_STT_CONFIDENCE = 0.2;
+
+// Hard wrap-up window: in the final seconds of a session the panel must not
+// launch a NEW spoken turn in response to the founder — no new questions right
+// before the buzzer (the 2-minute wrap-up cue has already told them to land the
+// plane). The founder's words are still recorded to the transcript; only the AI
+// turn is suppressed, so time-up transitions cleanly into verdicts instead of a
+// fresh panelist turn overlapping the closing.
+const WRAP_UP_HARD_SEC = 20;
 // Only the most recent messages are sent to the live model each turn — the
 // system prompt already carries the deck + setup, and an unbounded history
 // makes responses progressively slower as the session runs. The full history
@@ -379,18 +386,6 @@ function sendJson(ws: WebSocket, payload: Record<string, unknown>) {
   if (ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify(payload));
   }
-}
-
-function shouldRunEvaluation(
-  userTurns: any[],
-  totalUserTextLength: number,
-  durationSec: number,
-): boolean {
-  if (userTurns.length < 1) return false;
-  return (
-    totalUserTextLength >= MIN_EVAL_USER_CHARS ||
-    durationSec >= MIN_EVAL_DURATION_SEC
-  );
 }
 
 type QueuedTurn = {
@@ -1523,7 +1518,12 @@ export function initRestSocket(wss: WebSocketServer) {
                 // below so they see what they said.
                 const consumedByEndFlow =
                   !consumedByFloor && handleEndSessionVoiceFlow(text);
-                if (!consumedByFloor && !consumedByEndFlow) {
+                // Hard wrap-up: in the last WRAP_UP_HARD_SEC seconds, don't start
+                // a new panel turn — the founder's words are still recorded below,
+                // but the panel won't fire a fresh question the buzzer would cut off.
+                const inHardWrapUp =
+                  !isSoloMode && getTimeLeftSeconds() <= WRAP_UP_HARD_SEC;
+                if (!consumedByFloor && !consumedByEndFlow && !inHardWrapUp) {
                   noteFounderTurnForRoomRead();
                   enqueueTurn({
                     text,
@@ -1746,13 +1746,20 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           if (!consumedByFloor && !consumedByEndFlow) {
-            noteFounderTurnForRoomRead();
-            enqueueTurn({
-              text: data.text,
-              timeLeft:
-                typeof data.timeLeft === "number" ? data.timeLeft : undefined,
-              inputMethod,
-            });
+            // Hard wrap-up: in the last WRAP_UP_HARD_SEC seconds, suppress the new
+            // panel turn (no new questions before the buzzer). The founder's words
+            // are still echoed to the transcript below.
+            const inHardWrapUp =
+              !isSoloMode && getTimeLeftSeconds() <= WRAP_UP_HARD_SEC;
+            if (!inHardWrapUp) {
+              noteFounderTurnForRoomRead();
+              enqueueTurn({
+                text: data.text,
+                timeLeft:
+                  typeof data.timeLeft === "number" ? data.timeLeft : undefined,
+                inputMethod,
+              });
+            }
           }
 
           if (inputMethod === "voice") {
@@ -1870,7 +1877,14 @@ export function initRestSocket(wss: WebSocketServer) {
             const t = Array.isArray(data.transcript)
               ? data.transcript
               : fullTranscript;
-            if (hasSubstantivePitch(t)) {
+            // Duration-aware gate: skip the LLM pre-start when the session was
+            // too short to score, so we don't spend tokens (or fabricate a
+            // report) for an insufficient pitch. Uses the server's own elapsed
+            // clock since the client's `duration` arrives later with end_session.
+            const elapsedSec = Math.floor(
+              (Date.now() - sessionStartTimestamp) / 1000,
+            );
+            if (!isInsufficientPitch(t, elapsedSec)) {
               console.log(
                 "🧠 Pre-starting evaluation in background (parallel with verdicts)...",
               );
@@ -1882,6 +1896,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 previousSessionCtx,
                 marketSnapshot,
                 pitchConfigSnapshot?.fundingStage || "",
+                elapsedSec,
               ).catch((err) => {
                 console.error("❌ Background evaluation failed:", err);
                 return null;
@@ -1906,7 +1921,13 @@ export function initRestSocket(wss: WebSocketServer) {
           const frontendTranscript = Array.isArray(data.transcript)
             ? data.transcript
             : fullTranscript;
-          const durationSec = Number(data.duration) || 0;
+          // Elapsed pitch time drives the insufficiency gate. Prefer the client's
+          // measured duration; fall back to the server's own clock so a missing
+          // client value can never misclassify a real, long pitch as too short.
+          const serverElapsedSec = Math.floor(
+            (Date.now() - sessionStartTimestamp) / 1000,
+          );
+          const durationSec = Number(data.duration) || serverElapsedSec;
 
           let reportData: any = {
             summary:
@@ -1921,14 +1942,6 @@ export function initRestSocket(wss: WebSocketServer) {
             evaluationStatus: "insufficient_data",
           };
 
-          const userTurns = frontendTranscript.filter(
-            (m: any) => m.type === "user",
-          );
-          const totalUserTextLength = userTurns.reduce(
-            (sum: number, m: any) => sum + (m.text || "").length,
-            0,
-          );
-
           try {
             // Reuse the evaluation that was pre-started during the verdict
             // phase if available; otherwise run it now.
@@ -1942,12 +1955,17 @@ export function initRestSocket(wss: WebSocketServer) {
                 previousSessionCtx,
                 marketSnapshot,
                 pitchConfigSnapshot?.fundingStage || "",
+                durationSec,
               );
             }
+            // Respect the status evaluatePitch reports. It returns
+            // "insufficient_data" for a too-short/empty pitch (duration-aware);
+            // only a real evaluation carries "complete". Never force "complete"
+            // over the top, or a short session would render a fabricated report.
             reportData = {
               ...reportData,
               ...evaluated,
-              evaluationStatus: "complete",
+              evaluationStatus: evaluated?.evaluationStatus || "complete",
             };
 
             // Room-read feedback is derived server-side from the interest
@@ -2020,37 +2038,52 @@ export function initRestSocket(wss: WebSocketServer) {
               sessionId = dbData.id;
               if (dbData.share_id) shareId = dbData.share_id;
 
-              // Generate PDF in the background and cache in db
-              const formattedSession = {
-                ...dbData,
-                created_at: dbData.created_at || dbData.timestamp,
-                evaluation_report: reportData,
-              };
-              generatePitchReportPDF(formattedSession)
-                .then((buf) => {
-                  const base64Pdf = buf.toString("base64");
-                  return supabase
-                    .from("session_pdfs")
-                    .insert([{ session_id: dbData.id, pdf_base64: base64Pdf }]);
-                })
-                .then(({ error: cacheErr }) => {
-                  if (cacheErr) {
-                    console.warn(
-                      `⚠️ Failed to cache background PDF for session ${dbData.id}:`,
-                      cacheErr.message,
+              // Generate PDF in the background and cache in db — but only for a
+              // substantive session. An insufficient session's report is short-form
+              // (page 1 only) and the on-demand route generates it deterministically
+              // on download, so caching one adds nothing and would persist a stale
+              // copy if the short-form logic ever changes.
+              const evalStatus = reportData.evaluationStatus;
+              const insufficient =
+                evalStatus === "insufficient_data" ||
+                evalStatus === "failed" ||
+                (reportData.scores &&
+                  reportData.scores.delivery === 0 &&
+                  reportData.scores.clarity === 0 &&
+                  reportData.scores.scalability === 0 &&
+                  reportData.scores.readiness === 0);
+              if (!insufficient) {
+                const formattedSession = {
+                  ...dbData,
+                  created_at: dbData.created_at || dbData.timestamp,
+                  evaluation_report: reportData,
+                };
+                generatePitchReportPDF(formattedSession)
+                  .then((buf) => {
+                    const base64Pdf = buf.toString("base64");
+                    return supabase
+                      .from("session_pdfs")
+                      .insert([{ session_id: dbData.id, pdf_base64: base64Pdf }]);
+                  })
+                  .then(({ error: cacheErr }) => {
+                    if (cacheErr) {
+                      console.warn(
+                        `⚠️ Failed to cache background PDF for session ${dbData.id}:`,
+                        cacheErr.message,
+                      );
+                    } else {
+                      console.log(
+                        `✅ Background PDF cached successfully for session ${dbData.id}`,
+                      );
+                    }
+                  })
+                  .catch((err) => {
+                    console.error(
+                      `❌ Background PDF generation failed for session ${dbData.id}:`,
+                      err,
                     );
-                  } else {
-                    console.log(
-                      `✅ Background PDF cached successfully for session ${dbData.id}`,
-                    );
-                  }
-                })
-                .catch((err) => {
-                  console.error(
-                    `❌ Background PDF generation failed for session ${dbData.id}:`,
-                    err,
-                  );
-                });
+                  });
+              }
             }
           } catch (dbErr) {
             console.error("❌ Failed to save session to Supabase:", dbErr);
