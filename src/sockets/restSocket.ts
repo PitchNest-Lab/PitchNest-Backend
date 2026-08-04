@@ -1557,9 +1557,15 @@ export function initRestSocket(wss: WebSocketServer) {
                 // stop_audio — that would make the client drop the NEXT turn's
                 // audio, which is exactly the "panel text shows but no voice
                 // plays" bug.
+                // ALSO: brief partials (1-2 words) are often spurious noise,
+                // breathing, or mic artifacts — especially on mobile with AGC.
+                // Require ≥3 words before aborting, so real sustained speech
+                // triggers barge-in but brief noise doesn't cut the panel off.
                 const hadActiveTurn =
                   !!currentTurnAbort && !currentTurnAbort.signal.aborted;
                 if (!hadActiveTurn) return;
+                const wordCount = _partialText.trim().split(/\s+/).length;
+                if (wordCount < 3) return; // ignore brief noise
                 currentTurnAbort!.abort();
                 const now = Date.now();
                 // Avoid spamming stop_audio too fast
