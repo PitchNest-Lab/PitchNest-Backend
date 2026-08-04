@@ -29,6 +29,7 @@ import {
   classifyConfirmationReply,
 } from "../utils/endSessionIntent.ts";
 import { detectFloorHandback } from "../utils/floorControl.ts";
+import { applyConversationWindow } from "../utils/conversationWindow.ts";
 import {
   researchStartup,
   buildMarketSnapshotBlock,
@@ -47,11 +48,13 @@ const LOW_STT_CONFIDENCE = 0.2;
 // turn is suppressed, so time-up transitions cleanly into verdicts instead of a
 // fresh panelist turn overlapping the closing.
 const WRAP_UP_HARD_SEC = 20;
-// Only the most recent messages are sent to the live model each turn — the
-// system prompt already carries the deck + setup, and an unbounded history
-// makes responses progressively slower as the session runs. The full history
-// stays in memory; the evaluation still sees the entire transcript.
-const MAX_LLM_HISTORY = 20;
+// The live model's per-turn context is bounded by applyConversationWindow()
+// (see utils/conversationWindow.ts): founder utterances are pinned (their words
+// are the factual record — pricing, CAC, dates), the panel's own turns are
+// trimmed oldest-first to a token budget, and a compaction guard folds the
+// oldest founder turns into a verbatim-figures digest only at pathological
+// length. The full history stays in memory; the evaluation still sees the
+// entire transcript.
 
 // ── Varied opening greetings ─────────────────────────────────────────────────
 // "Welcome to the Nest" (play on PitchNest). A fresh one is picked at random each
@@ -693,7 +696,7 @@ export function initRestSocket(wss: WebSocketServer) {
           const aiResponse = (
             await generatePanelResponse(
               userInput,
-              conversationHistory.slice(-MAX_LLM_HISTORY),
+              applyConversationWindow(conversationHistory),
               masterPrompt,
             )
           )
@@ -814,7 +817,7 @@ export function initRestSocket(wss: WebSocketServer) {
               ? singleChunkStream(turn.text)
               : streamPanelResponse(
                   userInputToUse,
-                  conversationHistory.slice(-MAX_LLM_HISTORY),
+                  applyConversationWindow(conversationHistory),
                   promptToUse,
                   turnAbort.signal,
                 );
