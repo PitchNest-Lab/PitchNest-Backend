@@ -146,8 +146,7 @@ RULES:
           content: `BUSINESS: ${businessName}\nWHAT IT DOES: ${description || "(not stated)"}\nINDUSTRY: ${industry || "(not stated)"}\n\nSEARCH RESULTS:\n${sourceMaterial}`,
         },
       ],
-      temperature: 0.2,
-      max_tokens: 300,
+      max_completion_tokens: 300,
     });
 
     const text = (completion.choices?.[0]?.message?.content || "").trim();

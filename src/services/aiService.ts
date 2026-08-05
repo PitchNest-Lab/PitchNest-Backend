@@ -846,9 +846,28 @@ import { OpenAI, AzureOpenAI } from "openai";
 
 export function getOpenAIClient() {
   if (config.azureOpenAiEndpoint && config.azureOpenAiApiKey) {
-    // Use AzureOpenAI client which handles the correct headers and paths automatically
+    const rawEndpoint = config.azureOpenAiEndpoint.trim();
+
+    // Check if using Azure AI Foundry / Azure OpenAI v1 endpoint format
+    if (rawEndpoint.includes("/openai/v1")) {
+      const baseURL = rawEndpoint.replace(/\/responses$/, "").replace(/\/+$/, "");
+      return new OpenAI({
+        baseURL,
+        apiKey: config.azureOpenAiApiKey,
+        defaultHeaders: { "api-key": config.azureOpenAiApiKey },
+      });
+    }
+
+    // Classic Azure OpenAI client
+    let cleanedEndpoint = rawEndpoint;
+    try {
+      cleanedEndpoint = new URL(rawEndpoint).origin;
+    } catch {
+      cleanedEndpoint = rawEndpoint.replace(/\/+$/, "");
+    }
+
     return new AzureOpenAI({
-      endpoint: config.azureOpenAiEndpoint.replace("/openai/v1", ""), // Strip openai/v1 if present to let SDK handle it
+      endpoint: cleanedEndpoint,
       apiKey: config.azureOpenAiApiKey,
       apiVersion: config.azureOpenAiApiVersion,
       deployment: config.azureOpenAiDeployment,
@@ -1210,8 +1229,7 @@ async function callJsonModel(prompt: string, maxTokens: number, label: string): 
       const response = await openai.chat.completions.create({
         model: config.azureOpenAiDeployment || "gpt-4o",
         messages: [{ role: "user", content: prompt }],
-        temperature: 0.15,
-        max_tokens: maxTokens,
+        max_completion_tokens: maxTokens,
         response_format: { type: "json_object" },
       });
       const rawText = response.choices[0]?.message?.content?.trim() || "";
@@ -1272,8 +1290,7 @@ export async function generatePanelResponse(
     const response = await openai.chat.completions.create({
       model: config.azureOpenAiDeployment || "gpt-4o",
       messages: messages,
-      temperature: 0.7,
-      max_tokens: 320,
+      max_completion_tokens: 1000,
     });
 
     return response.choices[0]?.message?.content || "";
@@ -1322,8 +1339,7 @@ RULES:
     const response = await openai.chat.completions.create({
       model: config.azureOpenAiDeployment || "gpt-4o",
       messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      max_tokens: 160,
+      max_completion_tokens: 800,
       response_format: { type: "json_object" },
     });
     const raw = response.choices[0]?.message?.content?.trim() || "";
@@ -1370,10 +1386,7 @@ export async function* streamPanelResponse(
       {
         model: config.azureOpenAiDeployment || "gpt-4o",
         messages: messages,
-        // Higher temperature than scoring/eval calls: the live panel should vary
-        // its questions between sessions instead of sounding scripted.
-        temperature: 0.9,
-        max_tokens: 320,
+        max_completion_tokens: 1000,
         stream: true,
       },
       { signal }
@@ -1414,7 +1427,7 @@ export async function checkApiKeyStatus(): Promise<void> {
     await openai.chat.completions.create({
       model: config.azureOpenAiDeployment || "gpt-4o",
       messages: [{ role: "user", content: "ping" }],
-      max_tokens: 5
+      max_completion_tokens: 5
     });
     console.log(`\n🟢 OpenAI API Status Check: Connection successful (${isAzure ? 'Azure' : 'Standard'} OpenAI)!\n`);
   } catch (err: any) {
