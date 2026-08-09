@@ -194,7 +194,29 @@ export const generateSessionPDF = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    // 1. Try to fetch cached PDF from session_pdfs table
+    // 1. Authorize FIRST, before touching the PDF cache.
+    //
+    // The session_pdfs cache is keyed on session_id alone, so reading it before
+    // establishing ownership would serve any user's report to any caller. The
+    // ownership check has to gate the response, not just the filename.
+    //
+    // 404 rather than 403 on a permission failure: a 403 confirms the id exists
+    // and turns this endpoint into an id-enumeration oracle.
+    const { data: session, error: sessionError } = await supabase
+      .from("sessions")
+      .select("*")
+      .eq("id", req.params.id)
+      .maybeSingle();
+
+    if (sessionError) {
+      console.error("❌ Supabase query error in generateSessionPDF:", sessionError);
+      return res.status(500).json({ error: "Failed to query session" });
+    }
+    if (!session || session.user_id !== userId) {
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    // 2. Try the cached PDF now that the caller is known to own the session.
     const { data: cached, error: cacheError } = await supabase
       .from("session_pdfs")
       .select("pdf_base64")
@@ -207,34 +229,12 @@ export const generateSessionPDF = async (req: Request, res: Response) => {
     if (!cacheError && cached?.pdf_base64) {
       console.log(`📦 Serving cached PDF for session ID ${req.params.id}`);
       pdfBuffer = Buffer.from(cached.pdf_base64, "base64");
-      
-      // Fetch minimal session details to get the correct filename
-      const { data: session } = await supabase
-        .from("sessions")
-        .select("business_name")
-        .eq("id", req.params.id)
-        .eq("user_id", userId)
-        .maybeSingle();
-      if (session?.business_name) {
+      // The session row is already loaded above — no second query needed.
+      if (session.business_name) {
         businessName = session.business_name;
       }
     } else {
       console.log(`🔨 PDF cache miss. Generating PDF on-demand for session ID ${req.params.id}`);
-      // 2. Fetch session if not cached
-      const { data: session, error } = await supabase
-        .from("sessions")
-        .select("*")
-        .eq("id", req.params.id)
-        .eq("user_id", userId)
-        .maybeSingle();
-
-      if (error) {
-        console.error("❌ Supabase query error in generateSessionPDF:", error);
-        return res.status(500).json({ error: "Failed to query session" });
-      }
-      if (!session) {
-        return res.status(404).json({ error: "Session not found" });
-      }
 
       const formatted = {
         ...session,
