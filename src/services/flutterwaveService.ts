@@ -22,6 +22,29 @@ export interface CheckoutSession {
   paymentLink: string;
 }
 
+/**
+ * A checkout failure with a machine-readable `code` and an operator-facing
+ * `detail`. The controller maps `code` to an HTTP status and a safe client
+ * `reason`; `detail` is logged server-side ONLY — it can carry a raw provider
+ * message or DB error, neither of which should ever reach the browser.
+ *
+ * Distinguishing these is the whole point: a 502 previously collapsed "the
+ * payments table isn't there" and "Flutterwave rejected our key" into one
+ * opaque message, so neither could be fixed without shell access to prod.
+ */
+export class CheckoutError extends Error {
+  constructor(
+    public code:
+      | "BILLING_NOT_CONFIGURED"
+      | "PAYMENT_RECORD_FAILED"
+      | "CHECKOUT_INIT_FAILED",
+    public detail?: string,
+  ) {
+    super(code);
+    this.name = "CheckoutError";
+  }
+}
+
 /** Our own reference. Unique per attempt, and unguessable so it cannot be forged. */
 function mintTxRef(userId: number): string {
   return `pn-${userId}-${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
@@ -40,7 +63,7 @@ export async function createCheckout(user: {
   name?: string | null;
 }): Promise<CheckoutSession> {
   if (!config.flutterwaveSecretKey) {
-    throw new Error("BILLING_NOT_CONFIGURED");
+    throw new CheckoutError("BILLING_NOT_CONFIGURED");
   }
 
   const txRef = mintTxRef(user.id);
@@ -58,40 +81,56 @@ export async function createCheckout(user: {
     },
   ]);
   if (insertErr) {
+    // Surface the DB reason (e.g. `relation "payments" does not exist` when the
+    // migration was never applied) so the log names the fix instead of just
+    // "checkout failed". Kept server-side only — never returned to the client.
     console.error("❌ createCheckout: failed to record pending payment:", insertErr.message);
-    throw new Error("PAYMENT_RECORD_FAILED");
+    throw new CheckoutError("PAYMENT_RECORD_FAILED", insertErr.message);
   }
 
-  const res = await fetch(`${FLW_API}/payments`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.flutterwaveSecretKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      tx_ref: txRef,
-      amount,
-      currency,
-      redirect_url: `${config.appBaseUrl}/billing/return`,
-      customer: {
-        email: user.email,
-        name: user.name || undefined,
+  let res: Response;
+  try {
+    res = await fetch(`${FLW_API}/payments`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.flutterwaveSecretKey}`,
+        "Content-Type": "application/json",
       },
-      customizations: {
-        title: "PitchNest Pro",
-        description: `${config.proPlanDays} days of unlimited pitch sessions`,
-      },
-      // Echoed back on the webhook. Never TRUSTED for identity — the user is
-      // resolved from our own payments row via tx_ref — but useful in logs.
-      meta: { user_id: user.id },
-    }),
-  });
+      body: JSON.stringify({
+        tx_ref: txRef,
+        amount,
+        currency,
+        redirect_url: `${config.appBaseUrl}/billing/return`,
+        customer: {
+          email: user.email,
+          name: user.name || undefined,
+        },
+        customizations: {
+          title: "PitchNest Pro",
+          description: `${config.proPlanDays} days of unlimited pitch sessions`,
+        },
+        // Echoed back on the webhook. Never TRUSTED for identity — the user is
+        // resolved from our own payments row via tx_ref — but useful in logs.
+        meta: { user_id: user.id },
+      }),
+    });
+  } catch (err: any) {
+    // A thrown fetch is a transport failure (DNS, TLS, blocked egress), NOT a
+    // provider rejection — distinct from the !res.ok branch below, which means
+    // Flutterwave answered but refused. The pending row is left as-is: harmless,
+    // and the webhook can still resolve it if the user somehow paid.
+    console.error("❌ Flutterwave payment init unreachable:", err?.message || err);
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", `unreachable: ${err?.message || err}`);
+  }
 
   const body: any = await res.json().catch(() => null);
 
   if (!res.ok || body?.status !== "success" || !body?.data?.link) {
+    // Flutterwave answered but refused — the message names why (invalid key,
+    // currency not enabled on the account, live/test mismatch, ...).
+    const providerMsg = body?.message || `HTTP ${res.status}`;
     console.error("❌ Flutterwave payment init failed:", res.status, body);
-    throw new Error("CHECKOUT_INIT_FAILED");
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", providerMsg);
   }
 
   return { txRef, paymentLink: body.data.link };

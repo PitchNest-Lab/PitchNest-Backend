@@ -114,10 +114,30 @@ export const startCheckout = async (req: Request, res: Response) => {
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
   } catch (err: any) {
-    const code = err?.message === "BILLING_NOT_CONFIGURED" ? 503 : 502;
-    console.error("❌ startCheckout:", err?.message || err);
-    res.status(code).json({
+    // createCheckout throws a CheckoutError carrying a machine `code` and a
+    // log-only `detail`. Map the code to a status and a client-safe `reason` so
+    // the operator can tell WHICH failure this is from logs alone, without ever
+    // leaking a raw provider/DB message to the browser.
+    const code: string = err?.code ?? "UNKNOWN";
+    const status =
+      code === "BILLING_NOT_CONFIGURED" ? 503 :
+      code === "PAYMENT_RECORD_FAILED" ? 500 :
+      502; // CHECKOUT_INIT_FAILED and anything unexpected: upstream/transient.
+
+    // `reason` is a stable machine tag the client MAY branch on; `message` stays
+    // the same friendly text. Neither carries `err.detail`, which is log-only.
+    const reason =
+      code === "BILLING_NOT_CONFIGURED" ? "billing_unavailable" :
+      code === "PAYMENT_RECORD_FAILED" ? "record_failed" :
+      code === "CHECKOUT_INIT_FAILED" ? "provider_rejected" :
+      "unknown";
+
+    console.error(
+      `❌ startCheckout: ${code}${err?.detail ? ` — ${err.detail}` : ""}`,
+    );
+    res.status(status).json({
       error: "checkout_failed",
+      reason,
       message: "Couldn't start checkout. Please try again.",
     });
   }
