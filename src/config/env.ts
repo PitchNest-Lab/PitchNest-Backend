@@ -10,8 +10,6 @@ export const config = {
   isGoogleCloud: !!process.env.K_SERVICE,
   jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
   allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
-  // NOTE: defaults to "production" so a misconfigured deploy doesn't open dev
-  // code paths (wipe endpoint, permissive CORS, etc.).
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
   openAiApiKey: process.env.OPENAI_API_KEY || "",
@@ -20,7 +18,12 @@ export const config = {
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
-  nodeEnv: process.env.NODE_ENV || "development",
+  // Defaults to "production" so a deploy that FORGETS to set NODE_ENV fails
+  // CLOSED. Getting this backwards is silent and severe: `isProduction` gates
+  // the CORS allow-list in app.ts, so a "development" default would reflect
+  // ANY origin with credentials:true on the live site. Local dev sets
+  // NODE_ENV=development explicitly in .env / npm scripts.
+  nodeEnv: process.env.NODE_ENV || "production",
   emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
@@ -39,19 +42,61 @@ export const config = {
   researchEnabled: process.env.RESEARCH_ENABLED === "true",
   tavilyApiKey: process.env.TAVILY_API_KEY || "",
   serperApiKey: process.env.SERPER_API_KEY || "",
+  // ── Billing: Flutterwave v3 Standard (hosted checkout) ──────────────────
+  // Empty secret key disables billing entirely: the checkout route 404s and the
+  // paywall still works, users just cannot self-upgrade. Fail closed, never
+  // fail open into a free-money path.
+  //
+  // We accept BOTH naming conventions for the keys. The v3 Standard secret key
+  // is `FLWSECK-...` and the public key is `FLWPUBK-...`; some dashboards/docs
+  // surface the same two values under the v4-style names CLIENT_SECRET /
+  // CLIENT_ID. The VALUE is what matters (a `FLWSECK-` bearer key is what the v3
+  // API expects), so read either name rather than forcing the operator to
+  // rename their env.
+  flutterwaveSecretKey:
+    process.env.FLW_SECRET_KEY || process.env.FLW_CLIENT_SECRET || "",
+  flutterwavePublicKey:
+    process.env.FLW_PUBLIC_KEY || process.env.FLW_CLIENT_ID || "",
+  // The dashboard-set secret hash Flutterwave echoes in the `verif-hash`
+  // webhook header. Without it we cannot tell a real webhook from a forged one,
+  // so billing is treated as NOT configured until it is set (see
+  // hasBillingConfig) — the webhook also independently refuses every request.
+  flutterwaveWebhookHash: process.env.FLW_WEBHOOK_HASH || "",
+  // Price is config, not code, so a currency or amount change is a deploy env
+  // change. Amount is MAJOR units (10 = $10.00).
+  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 10,
+  proPlanCurrency: process.env.PRO_PLAN_CURRENCY || "USD",
+  /** Days of Pro granted per successful payment. */
+  proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
+  /** Where Flutterwave returns the user after checkout. */
+  appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
 };
 
-// In production, a missing JWT_SECRET means every JWT is signed with the
-// publicly-known fallback string below — i.e. anyone can forge a token for any
-// user (and the WebSocket auth relies entirely on this secret). Refuse to boot
-// rather than run with a forgeable secret. Dev keeps the fallback for frictionless
-// local setup.
+// A missing JWT_SECRET means every JWT is signed with the publicly-known
+// fallback string below — i.e. anyone can forge a token for any user (and the
+// WebSocket auth relies entirely on this secret). Refuse to boot rather than run
+// with a forgeable secret.
+//
+// Deliberately NOT gated on nodeEnv. A guard that only fires "in production"
+// is disarmed by the very same misconfiguration it exists to catch: forget
+// NODE_ENV and you get both the dev CORS policy AND a forgeable secret. The
+// secret being the public fallback is itself the danger, whatever the
+// environment claims to be. Local dev opts in via .env instead.
 const FALLBACK_JWT_SECRET = "pitchnest-dev-secret-change-in-production";
-if (config.nodeEnv === "production" && config.jwtSecret === FALLBACK_JWT_SECRET) {
-  throw new Error(
-    "FATAL: JWT_SECRET is not set in production. Refusing to start with the " +
-      "public fallback secret (all tokens would be forgeable). Set JWT_SECRET " +
-      "in your server environment variables.",
+if (config.jwtSecret === FALLBACK_JWT_SECRET) {
+  const allowInsecure = process.env.ALLOW_INSECURE_JWT_SECRET === "true";
+  if (!allowInsecure) {
+    throw new Error(
+      "FATAL: JWT_SECRET is not set. Refusing to start with the public " +
+        "fallback secret (all tokens would be forgeable, over HTTP and the " +
+        "WebSocket). Set JWT_SECRET in your environment. For local dev only, " +
+        "set ALLOW_INSECURE_JWT_SECRET=true to bypass this.",
+    );
+  }
+  console.warn(
+    "⚠️ SECURITY: running with the PUBLIC fallback JWT secret because " +
+      "ALLOW_INSECURE_JWT_SECRET=true. Every token is forgeable. Never do this " +
+      "on a deployed environment.",
   );
 }
 
@@ -78,6 +123,32 @@ export function hasAzureTtsConfig(): boolean {
 export function hasResearchConfig(): boolean {
   return (
     config.researchEnabled && !!(config.tavilyApiKey || config.serperApiKey)
+  );
+}
+
+/**
+ * Checkout can only be offered when we can BOTH call Flutterwave (secret key)
+ * AND verify its webhooks (secret hash).
+ *
+ * Requiring the hash here is what makes the failure mode safe: with no hash the
+ * webhook cannot prove a payment is real, so rather than run a half-open state
+ * (checkout works, grants can't be verified) we treat billing as fully off.
+ * Checkout returns 503, the paywall still holds, and there is no unverifiable
+ * grant path. This is a service-level "off", NOT a server-killing throw — a
+ * missing hash must never take down auth, pitching, and everything else.
+ */
+export function hasBillingConfig(): boolean {
+  return !!(config.flutterwaveSecretKey && config.flutterwaveWebhookHash);
+}
+
+// Loud, non-fatal warning when the secret is present but the hash is not: this
+// is almost always a deploy that half-configured billing, and the operator
+// needs to see WHY checkout is 503-ing without having to read the source.
+if (config.flutterwaveSecretKey && !config.flutterwaveWebhookHash) {
+  console.warn(
+    "⚠️ Billing DISABLED: FLW secret key is set but FLW_WEBHOOK_HASH is missing. " +
+      "Checkout will return 503 until the webhook hash (from your Flutterwave " +
+      "dashboard → Settings → Webhooks) is set, because grants could not be verified.",
   );
 }
 

@@ -50,6 +50,12 @@ function lockAuthProvider(userId: number, provider: "form" | "google") {
 }
 
 export function toPublicUser(u: any) {
+  // An expired paid period reads as free to the client, exactly as it does to
+  // every server-side gate — otherwise the UI would keep offering Pro controls
+  // after the period lapsed and every action would fail.
+  const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
+  const active = u?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+
   return {
     id: u?.id,
     name: u?.name,
@@ -58,6 +64,11 @@ export function toPublicUser(u: any) {
     bio: u?.bio,
     avatarUrl: u?.avatar_url ?? null,
     settings: u?.settings ?? {},
+    // Drives paywall UI only. The server never trusts the client's copy of
+    // this — every gate re-resolves the plan from the database.
+    plan: active ? "pro" : "free",
+    // Null when the plan never expires (grandfathered or comped).
+    planExpiresAt: active && expiry ? expiry.toISOString() : null,
   };
 }
 
@@ -178,7 +189,7 @@ export const signup = async (req: Request, res: Response) => {
       return res
         .status(200)
         .json({
-          user: { id: existingUser.id, name: existingUser.name, email: existingUser.email },
+          user: toPublicUser(existingUser),
           token,
           message: "Verification email resent",
         });
@@ -215,7 +226,10 @@ export const signup = async (req: Request, res: Response) => {
     });
 
     res.status(201).json({
-      user: { id: newUser.id, name: newUser.name, email: newUser.email },
+      // toPublicUser rather than a hand-built object so the new account's plan
+      // is present immediately — otherwise the client shows no plan until the
+      // first /me refetch and could offer paid options to a free user.
+      user: toPublicUser(newUser),
       token,
     });
   } catch (error) {
@@ -815,11 +829,70 @@ async function purgeUserAccount(userId: number): Promise<void> {
     }
   }
 
-  await supabase.from("password_resets").delete().eq("user_id", userId);
-  await supabase.from("sessions").delete().eq("user_id", userId);
-  await supabase.from("decks").delete().eq("user_id", userId);
-  await supabase.from("profiles").delete().eq("user_id", userId);
-  await supabase.from("users").delete().eq("id", userId);
+  // Deck audits hang off decks but carry their OWN user_id and the full AI
+  // report, so deleting decks alone can strand them. Collect the ids first —
+  // after the decks row is gone there is no way to find them by deck_id.
+  const { data: deckRows } = await supabase
+    .from("decks")
+    .select("id")
+    .eq("user_id", userId);
+  const deckIds = (deckRows || []).map((d: any) => d.id).filter(Boolean);
+
+  // session_pdfs is keyed on session_id only — no user_id column — so it is
+  // unreachable once the sessions rows are deleted. Same ordering problem.
+  const { data: sessionRows } = await supabase
+    .from("sessions")
+    .select("id")
+    .eq("user_id", userId);
+  const sessionIds = (sessionRows || []).map((s: any) => s.id).filter(Boolean);
+
+  /**
+   * Every delete, in dependency order. Children first so a mid-sequence failure
+   * can never orphan a row whose only route back to the user has already gone.
+   *
+   * Failures are COLLECTED, not swallowed. The previous version ignored every
+   * error and still returned 200, so a user could be told their data was erased
+   * while it was all still there — the worst possible outcome for a GDPR
+   * erasure request.
+   */
+  const failures: string[] = [];
+  const purge = async (
+    table: string,
+    apply: (q: any) => any,
+  ): Promise<void> => {
+    const { error } = await apply(supabase.from(table).delete());
+    if (error) {
+      console.error(`❌ Account deletion: failed to purge ${table} for user ${userId}:`, error.message);
+      failures.push(table);
+    }
+  };
+
+  if (deckIds.length) {
+    await purge("deck_audits", (q: any) => q.in("deck_id", deckIds));
+  }
+  // Belt and braces: audits recorded against the user but not against a deck we
+  // still know about (e.g. a deck row deleted earlier by hand).
+  await purge("deck_audits", (q: any) => q.eq("user_id", userId));
+
+  if (sessionIds.length) {
+    await purge("session_pdfs", (q: any) => q.in("session_id", sessionIds));
+  }
+
+  await purge("email_verification_tokens", (q: any) => q.eq("user_id", userId));
+  await purge("password_resets", (q: any) => q.eq("user_id", userId));
+  await purge("sessions", (q: any) => q.eq("user_id", userId));
+  await purge("decks", (q: any) => q.eq("user_id", userId));
+  await purge("profiles", (q: any) => q.eq("user_id", userId));
+
+  // session_starts and payments carry ON DELETE CASCADE (migrations 0008/0009),
+  // so they go with the users row. Everything above does not.
+  await purge("users", (q: any) => q.eq("id", userId));
+
+  if (failures.length) {
+    // Surfaced to the caller so the UI cannot claim a clean deletion. The user
+    // row may still exist, which means they can retry.
+    throw new Error(`ACCOUNT_DELETE_PARTIAL:${failures.join(",")}`);
+  }
 }
 
 async function verifyUserPassword(

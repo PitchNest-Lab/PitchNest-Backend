@@ -45,8 +45,16 @@ function clamp(v: unknown): number {
   return Number.isFinite(n) ? Math.min(100, Math.max(0, n)) : 0;
 }
 
-function getVerdict(score: number, isInsufficient: boolean): string {
+function getVerdict(score: number, isInsufficient: boolean, mode: string = "panel"): string {
   if (isInsufficient) return "Incomplete";
+  // Only the investor Panel uses invest/pass language. Coach and Solo are
+  // practice, so their verdict is a readiness read — matching the backend
+  // evaluation prompt, which forbids invest/pass/fund wording for those modes.
+  if (mode === "coach" || mode === "solo") {
+    if (score >= 80) return "Pitch-Ready";
+    if (score >= 60) return "Nearly There";
+    return "Keep Practicing";
+  }
   if (score >= 80) return "Strong Buy (Invest)";
   if (score >= 60) return "Consideration (Follow Up)";
   return "Decline to Invest";
@@ -892,7 +900,7 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       doc.font("Inter").fontSize(9).fillColor("#94a3b8").text(`Pitch Date: ${formattedDate}   |   Session Type: ${sessionTypeLabel}`, 50, 82);
 
       // Verdict Box
-      const verdict = getVerdict(overallScore, isInsufficient);
+      const verdict = getVerdict(overallScore, isInsufficient, sessionMode);
       const verdictColor = getVerdictColor(overallScore, isInsufficient);
       doc.rect(50, 140, 260, 60).lineWidth(1.5).fillAndStroke("#FFF8F8", verdictColor);
       doc.font("Inter-Bold").fontSize(8).fillColor(COLORS.textLight).text("VERDICT", 65, 150);
@@ -1001,11 +1009,15 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       // Radar Chart
       drawRadarChart(doc, 435, 455, 60, scores);
 
-      // Investor Sentiment
+      // Sentiment / coaching read — heading depends on the session type.
       doc.y = 570;
       doc.moveTo(50, doc.y).lineTo(doc.page.width - 50, doc.y).strokeColor(COLORS.border).lineWidth(1).stroke();
       doc.y = 585;
-      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text("INVESTOR SENTIMENT");
+      const sentimentHeading =
+        sessionMode === "coach" ? "COACH'S READ"
+        : sessionMode === "solo" ? "PRACTICE READ"
+        : "INVESTOR SENTIMENT";
+      doc.font("Inter-Bold").fontSize(10).fillColor(COLORS.dark).text(sentimentHeading);
 
       let sentX = 50;
       sentiments.slice(0, 3).forEach((s) => {

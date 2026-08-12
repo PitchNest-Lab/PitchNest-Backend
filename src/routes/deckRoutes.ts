@@ -25,7 +25,12 @@ const auditLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-router.post("/upload-deck", authMiddleware, upload.single("deck"), uploadDeck);
+/**
+ * The canonical deck upload lives at POST /api/upload-deck (uploadRoutes.ts),
+ * where it is rate-limited to 20/hr. This route previously registered the SAME
+ * handler with NO limiter, so anyone could bypass that cap simply by using the
+ * other path. Removed rather than duplicated — one upload endpoint, one limit.
+ */
 router.get("/", authMiddleware, listDecks);
 
 // Deck Check — static registered before "/:id"-shaped routes for clarity.

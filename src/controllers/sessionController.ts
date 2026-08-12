@@ -1,7 +1,7 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
-import crypto from "crypto";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
+import { getEntitlements } from "../services/entitlementService.ts";
 
 /**
  * Safely parses stringified JSON structures, falling back to a structured object
@@ -134,58 +134,11 @@ export const deleteSession = async (req: Request, res: Response) => {
   }
 };
 
-export const createSession = async (req: Request, res: Response) => {
-  try {
-    const userId = req.user?.id;
-    if (!userId) {
-      return res.status(401).json({ error: "Authentication required" });
-    }
-
-    const { business_name, evaluation_report, video_url = "" } = req.body;
-
-    // Server-side validation
-    if (!business_name || typeof business_name !== "string" || business_name.trim().length === 0) {
-      return res.status(400).json({ error: "Business name is required." });
-    }
-    if (business_name.length > 200) {
-      return res.status(400).json({ error: "Business name is too long (max 200 characters)." });
-    }
-    if (evaluation_report && typeof evaluation_report !== "object") {
-      return res.status(400).json({ error: "Invalid evaluation report format." });
-    }
-    if (typeof video_url !== "string" || video_url.length > 2000) {
-      return res.status(400).json({ error: "Invalid video URL." });
-    }
-
-    const share_id = crypto.randomUUID();
-
-    const { data, error } = await supabase
-      .from("sessions")
-      .insert({
-        business_name,
-        evaluation_report,
-        video_url,
-        user_id: userId,
-        share_id: share_id
-      })
-      .select()
-      .single();
-
-    if (error) {
-      console.error("❌ Supabase createSession error:", error);
-      return res.status(500).json({
-        error: "Failed to create session",
-      });
-    }
-
-    res.status(201).json(data);
-  } catch (error: any) {
-    console.error("❌ createSession exception:", error);
-    res.status(500).json({
-      error: "Failed to create session",
-    });
-  }
-};
+// NOTE: createSession was removed alongside its POST /api/sessions/create
+// route. It accepted a client-supplied evaluation_report and inserted a session
+// row directly, bypassing both the WebSocket pitch flow (which is where
+// sessions are actually created, at end_session) and the plan quota. It had no
+// callers in the web app, the mobile app, or the backend.
 
 export const generateSessionPDF = async (req: Request, res: Response) => {
   try {
@@ -216,7 +169,22 @@ export const generateSessionPDF = async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Session not found" });
     }
 
-    // 2. Try the cached PDF now that the caller is known to own the session.
+    // 2. Entitlement. Checked after ownership (so a stranger still gets 404,
+    //    not a 402 that would confirm the session exists) and before the cache
+    //    read, so a free user can never be served a cached full report.
+    //
+    //    402 and NOT 401: the frontend's authFetch treats 401 as a dead token
+    //    and logs the user out, so denying with 401 would destroy the session
+    //    of the very user we are trying to sell to.
+    const entitlement = await getEntitlements(userId);
+    if (!entitlement.pdfDownload) {
+      return res.status(402).json({
+        error: "upgrade_required",
+        message: "Downloading the full PDF report is a Pro feature.",
+      });
+    }
+
+    // 3. Try the cached PDF now that the caller is known to own the session.
     const { data: cached, error: cacheError } = await supabase
       .from("session_pdfs")
       .select("pdf_base64")
@@ -248,7 +216,7 @@ export const generateSessionPDF = async (req: Request, res: Response) => {
       pdfBuffer = await generatePitchReportPDF(formatted);
       businessName = formatted.business_name || "Pitch_Report";
 
-      // 3. Cache generated PDF in database asynchronously
+      // 4. Cache generated PDF in database asynchronously
       const base64Pdf = pdfBuffer.toString("base64");
       supabase
         .from("session_pdfs")

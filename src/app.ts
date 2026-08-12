@@ -11,6 +11,7 @@ import uploadRoutes from "./routes/uploadRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
+import billingRoutes from "./routes/billingRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 
 const app = express();
@@ -62,6 +63,19 @@ app.use(
   }),
 );
 
+/**
+ * ⚠️ MUST STAY ABOVE express.json — the payment webhook needs the raw bytes.
+ *
+ * express.json consumes the request stream and leaves only a parsed object.
+ * Re-serialising that object does not reproduce the original body (key order and
+ * whitespace differ), so any body-based signature check would break. Flutterwave
+ * v3 happens to authenticate with a header rather than a body HMAC, so this is
+ * currently belt-and-braces — but it is what makes the route correct if we ever
+ * switch providers or Flutterwave moves to a body signature, and getting it
+ * wrong fails silently until real money is involved.
+ */
+app.use("/api/billing/webhook", express.raw({ type: "application/json", limit: "1mb" }));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
@@ -76,6 +90,8 @@ app.use("/api/sessions", sessionRoutes);
 app.use("/api/profile", profileRoutes);
 // Internal admin surface (Item C) — gated by ADMIN_API_KEY, 404 when unset.
 app.use("/api/admin", adminRoutes);
+// Billing: checkout + the webhook that grants paid access.
+app.use("/api/billing", billingRoutes);
 app.post("/api/waitlist", handleWaitlist);
 app.post("/api/survey", handleSurvey);
 

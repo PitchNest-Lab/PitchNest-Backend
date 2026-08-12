@@ -35,6 +35,13 @@ import {
   buildMarketSnapshotBlock,
   type MarketSnapshot,
 } from "../services/researchService.ts";
+import {
+  entitlementsForPlan,
+  hasCapacity,
+  recordSessionStart,
+  resolveDuration,
+  type Entitlement,
+} from "../services/entitlementService.ts";
 import crypto from "crypto";
 
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
@@ -476,6 +483,10 @@ export function initRestSocket(wss: WebSocketServer) {
     let parentSessionId: number | null = null;
     let previousSessionCtx: ReturnType<typeof clampPreviousSession> = null;
     let sttRecognizer: StreamingRecognizer | null = null;
+    // Plan capability for this connection, resolved once from the database at
+    // client_ready and held for the connection's life. Defaults to the free
+    // tier so any path that fails to resolve it cannot grant paid capability.
+    let entitlement: Entitlement = entitlementsForPlan(null);
 
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
@@ -1324,10 +1335,13 @@ export function initRestSocket(wss: WebSocketServer) {
 
           // Verify that the user still exists in the database (prevents deleted users
           // from pitching via WebSocket since WS bypasses Express auth middleware).
+          // Also pulls `plan` in the SAME query so the paywall costs no extra
+          // round trip. A missing user is a hard reject; a missing/unknown plan
+          // silently degrades to free, which is the safe direction.
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
-              .select("id")
+              .select("id, plan, plan_expires_at")
               .eq("id", currentUserId)
               .maybeSingle();
 
@@ -1341,6 +1355,57 @@ export function initRestSocket(wss: WebSocketServer) {
               ws.close();
               return;
             }
+
+            entitlement = entitlementsForPlan(
+              (dbUser as any).plan,
+              (dbUser as any).plan_expires_at,
+            );
+          }
+
+          // ── Paywall: quota ────────────────────────────────────────────────
+          // Checked BEFORE any Azure STT/LLM/TTS work so a refused session costs
+          // nothing. A resume continues an already-metered session, so it never
+          // re-checks and never re-meters.
+          if (currentUserId && !isResume) {
+            const capacity = await hasCapacity(currentUserId, entitlement);
+            if (!capacity.ok) {
+              console.warn(
+                `🚫 Quota exceeded for user ${currentUserId} (${capacity.used}/${entitlement.maxWeeklySessions} in the last 7 days)`,
+              );
+              sendJson(ws, {
+                type: "error",
+                code: "PLAN_QUOTA_EXCEEDED",
+                message: `You've used all ${entitlement.maxWeeklySessions} of your free sessions for this week. Upgrade to Pro for unlimited pitches.`,
+                used: capacity.used,
+                limit: entitlement.maxWeeklySessions,
+                resetsAt: capacity.resetsAt?.toISOString() ?? null,
+              });
+              ws.close(4005, "Quota exceeded");
+              return;
+            }
+
+            // Record the start now — the cost is committed from here on, and
+            // metering any later would let an abandoned pitch run free.
+            await recordSessionStart(currentUserId);
+          }
+
+          // PAYWALL — AUTHORITATIVE DURATION CLAMP.
+          //
+          // The client's `duration` is a REQUEST, not a grant. This handler
+          // accepts whatever the browser sends, so without this clamp a crafted
+          // client_ready with `duration: 999` buys a 999-minute session and the
+          // paid tier is decorative. The frontend's zod .max(60) is UI only.
+          //
+          // Free is pinned to 10 minutes; pro is snapped to the nearest allowed
+          // value at or below the request (so a legacy 15 becomes 10 rather than
+          // erroring). Resolved here, ahead of the setup snapshot, so a future
+          // "Pitch Again" prefills what the user may actually run.
+          const requestedDuration = clientConfig.duration;
+          const grantedMinutes = resolveDuration(requestedDuration, entitlement);
+          if (Number(requestedDuration) !== grantedMinutes) {
+            console.log(
+              `⏱️ Duration clamped for user ${currentUserId} (${entitlement.plan}): requested ${requestedDuration} → granted ${grantedMinutes} min`,
+            );
           }
 
           // Compact setup snapshot stored with the session row so a future
@@ -1355,7 +1420,9 @@ export function initRestSocket(wss: WebSocketServer) {
             fundingStage: clientConfig.fundingStage || "",
             aggressiveness: clientConfig.aggressiveness ?? null,
             riskAppetite: clientConfig.riskAppetite ?? null,
-            duration: clientConfig.duration ?? null,
+            // The GRANTED duration, not the requested one — otherwise a free
+            // user's "Pitch Again" would prefill a locked value.
+            duration: grantedMinutes,
             deckId: clientConfig.selectedDeck?.id ?? null,
             deckName: clientConfig.selectedDeck?.name ?? null,
           };
@@ -1464,7 +1531,12 @@ export function initRestSocket(wss: WebSocketServer) {
           // Fire-and-forget web research (panel + coach; solo has no live
           // turns and its coach-style report has no competitor section).
           // researchStartup never throws and resolves null when disabled.
-          if (!isSoloMode) {
+          //
+          // PAYWALL: live market research is a Pro capability. It costs a real
+          // third-party search call per session and is the substantive part of
+          // "advanced AI" — the panel grounds its market and competitor talk in
+          // dated web results instead of model priors.
+          if (!isSoloMode && entitlement.liveResearch) {
             researchStartup({
               businessName: currentBusinessName,
               description: clientConfig.description || "",
@@ -1587,10 +1659,13 @@ export function initRestSocket(wss: WebSocketServer) {
             );
           }
 
-          // Start idle detection — check every 5s, nudge at 35s, auto-end at 3min
+          // Start idle detection — check every 5s, nudge at 60s, auto-end at 5min
           lastUserActivityTime = Date.now();
           sessionStartTimestamp = Date.now();
-          initialDurationSeconds = Number(clientConfig.duration || 15) * 60;
+          // Server clock uses the CLAMPED duration resolved above. The client
+          // adopts it via time_sync whenever drift exceeds 3s, so a tampered
+          // client-side timer is corrected within one tick.
+          initialDurationSeconds = grantedMinutes * 60;
           // On resume (reconnect after refresh) the client reports how much
           // time was actually left — otherwise the server clock would restart
           // at the full duration and time_sync would extend the session.
@@ -2061,7 +2136,11 @@ export function initRestSocket(wss: WebSocketServer) {
                   reportData.scores.clarity === 0 &&
                   reportData.scores.scalability === 0 &&
                   reportData.scores.readiness === 0);
-              if (!insufficient) {
+              // PAYWALL: free users cannot download the PDF, so rendering six
+              // pages of PDFKit and storing them base64 in Postgres for every
+              // free session is pure waste. If they later upgrade, the
+              // on-demand route regenerates on cache miss — same output.
+              if (!insufficient && entitlement.pdfDownload) {
                 const formattedSession = {
                   ...dbData,
                   created_at: dbData.created_at || dbData.timestamp,
