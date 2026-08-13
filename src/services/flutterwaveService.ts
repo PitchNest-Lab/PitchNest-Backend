@@ -127,29 +127,15 @@ export interface RegionPricing {
  * Amount is ALWAYS computed server-side to prevent client-side price tampering.
  */
 export async function getRegionPricing(
-  countryCode?: string,
-  requestedCurrency?: string,
+  _countryCode?: string,
+  _requestedCurrency?: string,
 ): Promise<RegionPricing> {
-  const country = (countryCode || "").trim().toUpperCase();
-  const reqCurr = (requestedCurrency || "").trim().toUpperCase();
-
-  const isNigeria = country === "NG" || reqCurr === "NGN";
-
-  if (isNigeria) {
-    return {
-      currency: "NGN",
-      amount: 9999,
-      paymentOptions: "card,ussd,banktransfer,account,nqr,opay",
-      baseAmountUsd: 14.99,
-      exchangeRate: 1,
-    };
-  }
-
+  const amount = config.proPlanAmount || 9.99;
   return {
-    currency: "USD",
-    amount: 14.99,
+    currency: config.proPlanCurrency || "USD",
+    amount,
     paymentOptions: "card,account",
-    baseAmountUsd: 14.99,
+    baseAmountUsd: amount,
     exchangeRate: 1,
   };
 }

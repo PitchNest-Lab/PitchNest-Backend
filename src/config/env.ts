@@ -58,8 +58,8 @@ export const config = {
   // hasBillingConfig) — the webhook also independently refuses every request.
   flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
   // Price is config, not code, so a currency or amount change is a deploy env
-  // change. Amount is MAJOR units (10 = $10.00).
-  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 10,
+  // change. Amount is MAJOR units (9.99 = $9.99 USD).
+  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 9.99,
   proPlanCurrency: process.env.PRO_PLAN_CURRENCY || "USD",
   /** Days of Pro granted per successful payment. */
   proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
