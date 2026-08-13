@@ -130,51 +130,27 @@ export async function getRegionPricing(
   countryCode?: string,
   requestedCurrency?: string,
 ): Promise<RegionPricing> {
-  const baseUsd = config.proPlanAmount; // Default $10 USD
   const country = (countryCode || "").trim().toUpperCase();
-  let currency = (requestedCurrency || "").trim().toUpperCase();
+  const reqCurr = (requestedCurrency || "").trim().toUpperCase();
 
-  if (!currency) {
-    switch (country) {
-      case "NG":
-        currency = "NGN";
-        break;
-      case "GH":
-        currency = "GHS";
-        break;
-      case "KE":
-        currency = "KES";
-        break;
-      case "UG":
-        currency = "UGX";
-        break;
-      case "ZA":
-        currency = "ZAR";
-        break;
-      default:
-        currency = config.proPlanCurrency || "USD";
-        break;
-    }
+  const isNigeria = country === "NG" || reqCurr === "NGN";
+
+  if (isNigeria) {
+    return {
+      currency: "NGN",
+      amount: 9999,
+      paymentOptions: "card,ussd,banktransfer,account,nqr,opay",
+      baseAmountUsd: 14.99,
+      exchangeRate: 1,
+    };
   }
-
-  const rate = await getFxRate("USD", currency, baseUsd);
-  let amount = baseUsd * rate;
-
-  // Rounding rules: NGN, KES, UGX rounded to neat integer; GHS, USD, EUR, ZAR to 2 decimal places.
-  if (["NGN", "KES", "UGX"].includes(currency)) {
-    amount = Math.round(amount);
-  } else {
-    amount = Math.round(amount * 100) / 100;
-  }
-
-  const paymentOptions = getPaymentOptionsForCurrency(currency);
 
   return {
-    currency,
-    amount,
-    paymentOptions,
-    baseAmountUsd: baseUsd,
-    exchangeRate: rate,
+    currency: "USD",
+    amount: 14.99,
+    paymentOptions: "card,account",
+    baseAmountUsd: 14.99,
+    exchangeRate: 1,
   };
 }
 
