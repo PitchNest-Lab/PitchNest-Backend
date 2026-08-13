@@ -47,21 +47,16 @@ export const config = {
   // paywall still works, users just cannot self-upgrade. Fail closed, never
   // fail open into a free-money path.
   //
-  // We accept BOTH naming conventions for the keys. The v3 Standard secret key
-  // is `FLWSECK-...` and the public key is `FLWPUBK-...`; some dashboards/docs
-  // surface the same two values under the v4-style names CLIENT_SECRET /
-  // CLIENT_ID. The VALUE is what matters (a `FLWSECK-` bearer key is what the v3
-  // API expects), so read either name rather than forcing the operator to
-  // rename their env.
-  flutterwaveSecretKey:
-    process.env.FLW_SECRET_KEY || process.env.FLW_CLIENT_SECRET || "",
-  flutterwavePublicKey:
-    process.env.FLW_PUBLIC_KEY || process.env.FLW_CLIENT_ID || "",
+  // The v3 Standard secret key is `FLWSECK-...` (live) or `FLWSECK_TEST-...`
+  // (test). Environment values are trimmed to prevent stray spaces/newlines
+  // from causing phantom 401s.
+  flutterwaveSecretKey: (process.env.FLW_SECRET_KEY || "").trim(),
+  flutterwavePublicKey: (process.env.FLW_PUBLIC_KEY || "").trim(),
   // The dashboard-set secret hash Flutterwave echoes in the `verif-hash`
   // webhook header. Without it we cannot tell a real webhook from a forged one,
   // so billing is treated as NOT configured until it is set (see
   // hasBillingConfig) — the webhook also independently refuses every request.
-  flutterwaveWebhookHash: process.env.FLW_WEBHOOK_HASH || "",
+  flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
   // Price is config, not code, so a currency or amount change is a deploy env
   // change. Amount is MAJOR units (10 = $10.00).
   proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 10,
@@ -146,7 +141,7 @@ export function hasBillingConfig(): boolean {
 // needs to see WHY checkout is 503-ing without having to read the source.
 if (config.flutterwaveSecretKey && !config.flutterwaveWebhookHash) {
   console.warn(
-    "⚠️ Billing DISABLED: FLW secret key is set but FLW_WEBHOOK_HASH is missing. " +
+    "⚠️ Billing DISABLED: FLW_SECRET_KEY is set but FLW_WEBHOOK_HASH is missing. " +
       "Checkout will return 503 until the webhook hash (from your Flutterwave " +
       "dashboard → Settings → Webhooks) is set, because grants could not be verified.",
   );

@@ -50,25 +50,183 @@ function mintTxRef(userId: number): string {
   return `pn-${userId}-${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
 }
 
+interface FxCacheItem {
+  rate: number;
+  expiresAt: number;
+}
+const fxRateCache: Record<string, FxCacheItem> = {};
+
+/**
+ * Fetches live FX exchange rate from Flutterwave or returns a fallback rate.
+ * Caches exchange rates in memory for 15 minutes.
+ */
+export async function getFxRate(
+  sourceCurrency: string,
+  destinationCurrency: string,
+  baseAmount: number = 1,
+): Promise<number> {
+  const source = sourceCurrency.trim().toUpperCase();
+  const dest = destinationCurrency.trim().toUpperCase();
+
+  if (source === dest) return 1;
+
+  const cacheKey = `${source}_${dest}`;
+  const now = Date.now();
+  if (fxRateCache[cacheKey] && fxRateCache[cacheKey].expiresAt > now) {
+    return fxRateCache[cacheKey].rate;
+  }
+
+  if (config.flutterwaveSecretKey) {
+    try {
+      const url = `${FLW_API}/transfers/rates?amount=${baseAmount}&source_currency=${source}&destination_currency=${dest}`;
+      const res = await fetch(url, {
+        headers: { Authorization: `Bearer ${config.flutterwaveSecretKey}` },
+      });
+      const body: any = await res.json().catch(() => null);
+      if (res.ok && body?.status === "success" && body?.data?.rate) {
+        const rate = Number(body.data.rate);
+        if (rate > 0) {
+          fxRateCache[cacheKey] = {
+            rate,
+            expiresAt: now + 15 * 60 * 1000, // 15 min cache
+          };
+          return rate;
+        }
+      }
+    } catch (err: any) {
+      console.warn("⚠️ Live FX rate fetch failed, falling back to default:", err?.message || err);
+    }
+  }
+
+  // Fallback static conversion rates if FX endpoint is unreachable or in dev without key
+  const fallbackRates: Record<string, number> = {
+    USD_NGN: 1500,
+    USD_GHS: 15.5,
+    USD_KES: 130,
+    USD_UGX: 3700,
+    USD_ZAR: 18.5,
+    USD_EUR: 0.92,
+    USD_GBP: 0.79,
+  };
+
+  const fallback = fallbackRates[cacheKey] || 1;
+  fxRateCache[cacheKey] = { rate: fallback, expiresAt: now + 5 * 60 * 1000 };
+  return fallback;
+}
+
+export interface RegionPricing {
+  currency: string;
+  amount: number;
+  paymentOptions: string;
+  baseAmountUsd: number;
+  exchangeRate: number;
+}
+
+/**
+ * Server-side region pricing resolution based on user location or currency preference.
+ * Amount is ALWAYS computed server-side to prevent client-side price tampering.
+ */
+export async function getRegionPricing(
+  countryCode?: string,
+  requestedCurrency?: string,
+): Promise<RegionPricing> {
+  const baseUsd = config.proPlanAmount; // Default $10 USD
+  const country = (countryCode || "").trim().toUpperCase();
+  let currency = (requestedCurrency || "").trim().toUpperCase();
+
+  if (!currency) {
+    switch (country) {
+      case "NG":
+        currency = "NGN";
+        break;
+      case "GH":
+        currency = "GHS";
+        break;
+      case "KE":
+        currency = "KES";
+        break;
+      case "UG":
+        currency = "UGX";
+        break;
+      case "ZA":
+        currency = "ZAR";
+        break;
+      default:
+        currency = config.proPlanCurrency || "USD";
+        break;
+    }
+  }
+
+  const rate = await getFxRate("USD", currency, baseUsd);
+  let amount = baseUsd * rate;
+
+  // Rounding rules: NGN, KES, UGX rounded to neat integer; GHS, USD, EUR, ZAR to 2 decimal places.
+  if (["NGN", "KES", "UGX"].includes(currency)) {
+    amount = Math.round(amount);
+  } else {
+    amount = Math.round(amount * 100) / 100;
+  }
+
+  const paymentOptions = getPaymentOptionsForCurrency(currency);
+
+  return {
+    currency,
+    amount,
+    paymentOptions,
+    baseAmountUsd: baseUsd,
+    exchangeRate: rate,
+  };
+}
+
+/**
+ * Maps a currency code to its supported Flutterwave payment options string.
+ */
+function getPaymentOptionsForCurrency(currency: string): string {
+  const curr = (currency || "").trim().toUpperCase();
+  switch (curr) {
+    case "NGN":
+      return "card,ussd,banktransfer,account,nqr,opay";
+    case "GHS":
+      return "card,ghanamobilemoney";
+    case "KES":
+      return "card,mpesa";
+    case "UGX":
+      return "card,mobilemoneyuganda";
+    case "ZAR":
+      return "card,eft";
+    case "USD":
+    case "EUR":
+    case "GBP":
+    default:
+      return "card,account";
+  }
+}
+
 /**
  * Creates a pending payment row and returns the hosted checkout link.
  *
  * The row is written BEFORE calling Flutterwave so the webhook always has a
- * reference to resolve, even if the user pays on a device that never returns to
- * our site. `pending` rows for abandoned checkouts are expected and harmless.
+ * reference to resolve. Amount and currency are computed SERVER-SIDE to prevent
+ * client-side price tampering.
  */
-export async function createCheckout(user: {
-  id: number;
-  email: string;
-  name?: string | null;
-}): Promise<CheckoutSession> {
+export async function createCheckout(
+  user: {
+    id: number;
+    email: string;
+    name?: string | null;
+  },
+  preferences?: {
+    countryCode?: string;
+    currency?: string;
+  },
+): Promise<CheckoutSession> {
   if (!config.flutterwaveSecretKey) {
     throw new CheckoutError("BILLING_NOT_CONFIGURED");
   }
 
   const txRef = mintTxRef(user.id);
-  const amount = config.proPlanAmount;
-  const currency = config.proPlanCurrency;
+  const pricing = await getRegionPricing(preferences?.countryCode, preferences?.currency);
+  const { amount, currency, paymentOptions } = pricing;
 
   const { error: insertErr } = await supabase.from("payments").insert([
     {
@@ -81,9 +239,6 @@ export async function createCheckout(user: {
     },
   ]);
   if (insertErr) {
-    // Surface the DB reason (e.g. `relation "payments" does not exist` when the
-    // migration was never applied) so the log names the fix instead of just
-    // "checkout failed". Kept server-side only — never returned to the client.
     console.error("❌ createCheckout: failed to record pending payment:", insertErr.message);
     throw new CheckoutError("PAYMENT_RECORD_FAILED", insertErr.message);
   }
@@ -105,12 +260,11 @@ export async function createCheckout(user: {
           email: user.email,
           name: user.name || undefined,
         },
+        payment_options: paymentOptions,
         customizations: {
           title: "PitchNest Pro",
           description: `${config.proPlanDays} days of unlimited pitch sessions`,
         },
-        // Echoed back on the webhook. Never TRUSTED for identity — the user is
-        // resolved from our own payments row via tx_ref — but useful in logs.
         meta: { user_id: user.id },
       }),
     });
@@ -151,28 +305,42 @@ export interface VerifiedTransaction {
  * own guidance is to never grant value on the payload alone, because the endpoint
  * is public and a forged body with a stolen-looking reference is trivial to send.
  */
+/**
+ * Re-queries Flutterwave for the truth about a transaction.
+ * Supports verification by numeric transaction ID OR by string tx_ref.
+ */
 export async function verifyTransaction(
-  transactionId: string | number,
+  transactionIdOrRef: string | number,
 ): Promise<VerifiedTransaction | null> {
   if (!config.flutterwaveSecretKey) return null;
 
   try {
-    const res = await fetch(`${FLW_API}/transactions/${transactionId}/verify`, {
+    const isNumericId =
+      typeof transactionIdOrRef === "number" ||
+      (/^\d+$/.test(String(transactionIdOrRef)) && Number(transactionIdOrRef) < 2000000000);
+
+    const url = isNumericId
+      ? `${FLW_API}/transactions/${transactionIdOrRef}/verify`
+      : `${FLW_API}/transactions/verify_by_reference?tx_ref=${encodeURIComponent(String(transactionIdOrRef))}`;
+
+    const res = await fetch(url, {
       headers: { Authorization: `Bearer ${config.flutterwaveSecretKey}` },
     });
     const body: any = await res.json().catch(() => null);
 
     if (!res.ok || body?.status !== "success" || !body?.data) {
-      console.warn("⚠️ Flutterwave verify returned no usable data:", res.status, body?.message);
       return null;
     }
 
+    const data = Array.isArray(body.data) ? body.data[0] : body.data;
+    if (!data) return null;
+
     return {
-      status: String(body.data.status || "").toLowerCase(),
-      txRef: body.data.tx_ref,
-      amount: Number(body.data.amount),
-      currency: String(body.data.currency || ""),
-      providerRef: String(body.data.id),
+      status: String(data.status || "").toLowerCase(),
+      txRef: data.tx_ref,
+      amount: Number(data.amount),
+      currency: String(data.currency || ""),
+      providerRef: String(data.id),
     };
   } catch (err: any) {
     console.error("❌ verifyTransaction threw:", err?.message || err);

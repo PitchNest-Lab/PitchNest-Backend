@@ -3,27 +3,47 @@ import { config, hasBillingConfig } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 import {
   createCheckout,
+  getRegionPricing,
   verifyTransaction,
   verifyWebhookSignature,
   grantAccess,
   markPaymentFailed,
 } from "../services/flutterwaveService.ts";
 
+/** Helper to extract client country code & currency preference from HTTP headers or request */
+function extractClientLocation(req: Request) {
+  const countryCode =
+    (req.headers["cf-ipcountry"] as string) ||
+    (req.headers["x-country"] as string) ||
+    (req.query.countryCode as string) ||
+    (req.body?.countryCode as string) ||
+    process.env.DEFAULT_TEST_COUNTRY ||
+    "";
+  const currency =
+    (req.query.currency as string) ||
+    (req.body?.currency as string) ||
+    process.env.DEFAULT_TEST_CURRENCY ||
+    "";
+  return { countryCode: countryCode.trim(), currency: currency.trim() };
+}
+
 /**
- * GET /api/billing/price — public Pro price.
- *
- * The landing page and /pricing are public, so the price cannot live behind
- * authMiddleware. This endpoint returns the config price and nothing else —
- * no plan, no user data.
+ * GET /api/billing/price — public Pro price with location-aware currency & rates.
  */
-export const getPrice = async (_req: Request, res: Response) => {
+export const getPrice = async (req: Request, res: Response) => {
   try {
+    const { countryCode, currency } = extractClientLocation(req);
+    const pricing = await getRegionPricing(countryCode, currency);
+
     res.json({
       billingEnabled: hasBillingConfig(),
       price: {
-        amount: config.proPlanAmount,
-        currency: config.proPlanCurrency,
+        amount: pricing.amount,
+        currency: pricing.currency,
         days: config.proPlanDays,
+        baseAmountUsd: pricing.baseAmountUsd,
+        exchangeRate: pricing.exchangeRate,
+        paymentOptions: pricing.paymentOptions,
       },
     });
   } catch (err: any) {
@@ -33,36 +53,79 @@ export const getPrice = async (_req: Request, res: Response) => {
 };
 
 /**
- * GET /api/billing/plan — what this user is on, and what Pro costs.
- *
- * The price lives in config, so the pricing UI never hardcodes an amount that
- * could drift from what the checkout actually charges.
+ * GET /api/billing/plan — user plan status and location-aware pricing.
  */
 export const getPlan = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: "Authentication required" });
 
-    const { data: user } = await supabase
+    let { data: user } = await supabase
       .from("users")
       .select("plan, plan_expires_at")
       .eq("id", userId)
       .maybeSingle();
 
-    const expiry = (user as any)?.plan_expires_at
+    let expiry = (user as any)?.plan_expires_at
       ? new Date((user as any).plan_expires_at)
       : null;
-    const active =
+    let active =
       (user as any)?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+
+    // In local development, webhooks from the internet cannot reach localhost.
+    // Auto-verify recent pending transactions against Flutterwave so local test checkouts turn Pro instantly.
+    if (!active && config.nodeEnv === "development") {
+      try {
+        const { data: pendingPayments } = await supabase
+          .from("payments")
+          .select("tx_ref")
+          .eq("user_id", userId)
+          .eq("status", "pending")
+          .order("created_at", { ascending: false })
+          .limit(3);
+
+        if (pendingPayments && pendingPayments.length > 0) {
+          for (const pay of pendingPayments) {
+            const verified = await verifyTransaction(pay.tx_ref);
+            if (verified && (verified.status === "successful" || verified.status === "succeeded")) {
+              await grantAccess(verified);
+              console.log(`✅ [Dev Auto-Sync] Verified local test transaction ${pay.tx_ref} — granted Pro access!`);
+
+              // Refresh user status
+              const { data: updatedUser } = await supabase
+                .from("users")
+                .select("plan, plan_expires_at")
+                .eq("id", userId)
+                .maybeSingle();
+
+              if (updatedUser) {
+                user = updatedUser;
+                expiry = (user as any)?.plan_expires_at ? new Date((user as any).plan_expires_at) : null;
+                active = (user as any)?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+              }
+              break;
+            }
+          }
+        }
+      } catch (devErr: any) {
+        console.warn("⚠️ Dev auto-sync check:", devErr?.message || devErr);
+      }
+    }
+
+    const { countryCode, currency } = extractClientLocation(req);
+    const pricing = await getRegionPricing(countryCode, currency);
 
     res.json({
       plan: active ? "pro" : "free",
       expiresAt: active && expiry ? expiry.toISOString() : null,
       billingEnabled: hasBillingConfig(),
       price: {
-        amount: config.proPlanAmount,
-        currency: config.proPlanCurrency,
+        amount: pricing.amount,
+        currency: pricing.currency,
         days: config.proPlanDays,
+        baseAmountUsd: pricing.baseAmountUsd,
+        exchangeRate: pricing.exchangeRate,
+        paymentOptions: pricing.paymentOptions,
       },
     });
   } catch (err: any) {
@@ -72,10 +135,7 @@ export const getPlan = async (req: Request, res: Response) => {
 };
 
 /**
- * POST /api/billing/checkout — start a Pro purchase.
- *
- * Returns a hosted Flutterwave link for the client to redirect to. Grants
- * nothing: entitlement comes only from the webhook.
+ * POST /api/billing/checkout — start a location-aware Pro purchase.
  */
 export const startCheckout = async (req: Request, res: Response) => {
   try {
@@ -97,8 +157,6 @@ export const startCheckout = async (req: Request, res: Response) => {
 
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    // Someone on unlimited comped access has nothing to buy, and charging them
-    // would replace that with a 30-day window (see grant_pro_access).
     if ((user as any).plan === "pro" && !(user as any).plan_expires_at) {
       return res.status(409).json({
         error: "already_pro",
@@ -106,11 +164,16 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
-    const session = await createCheckout({
-      id: (user as any).id,
-      email: (user as any).email,
-      name: (user as any).name,
-    });
+    const { countryCode, currency } = extractClientLocation(req);
+
+    const session = await createCheckout(
+      {
+        id: (user as any).id,
+        email: (user as any).email,
+        name: (user as any).name,
+      },
+      { countryCode, currency },
+    );
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
   } catch (err: any) {
