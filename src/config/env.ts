@@ -58,14 +58,86 @@ export const config = {
   // hasBillingConfig) — the webhook also independently refuses every request.
   flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
   // Price is config, not code, so a currency or amount change is a deploy env
-  // change. Amount is MAJOR units (9.99 = $9.99 USD).
-  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 9.99,
+  // change. Amount is MAJOR units (15 = $15.00 USD).
+  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 15.00,
   proPlanCurrency: process.env.PRO_PLAN_CURRENCY || "USD",
   /** Days of Pro granted per successful payment. */
   proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
   /** Where Flutterwave returns the user after checkout. */
   appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
 };
+
+// ── Billing catalog: purchasable SKUs (level × term) ─────────────────────────
+// Two paid levels, each on two terms. Price and day-count are SERVER-SIDE and
+// authoritative: both the display (/price, /plan) and the charge (createCheckout)
+// read the SAME resolver, so what a founder is shown can never drift from what
+// the checkout records and the webhook grants.
+export type PaidPlan = "prep" | "pro";
+export type BillingTerm = "monthly" | "annual";
+
+export interface ResolvedPrice {
+  plan: PaidPlan;
+  term: BillingTerm;
+  /** Major units (15 = $15.00). */
+  amount: number;
+  currency: string;
+  /** Days of access this SKU grants. */
+  days: number;
+}
+
+function envAmount(name: string, fallback: number): number {
+  const raw = process.env[name];
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const ANNUAL_DAYS = process.env.PRO_ANNUAL_DAYS
+  ? Number(process.env.PRO_ANNUAL_DAYS)
+  : 365;
+
+// Amounts per (plan, term). Founder (Prep) = $8.00/mo, Pro Founder = $15.00/mo.
+const PLAN_AMOUNTS: Record<PaidPlan, Record<BillingTerm, number>> = {
+  prep: {
+    monthly: envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 8.00)),
+    annual: envAmount("FOUNDER_ANNUAL_AMOUNT", Math.round(envAmount("FOUNDER_PLAN_AMOUNT", 8.00) * 10)),
+  },
+  pro: {
+    monthly: config.proPlanAmount,
+    annual: envAmount("PRO_ANNUAL_AMOUNT", Math.round(config.proPlanAmount * 10)),
+  },
+};
+
+const TERM_DAYS: Record<BillingTerm, number> = {
+  monthly: config.proPlanDays,
+  annual: ANNUAL_DAYS,
+};
+
+export function isPaidPlan(v: unknown): v is PaidPlan {
+  return v === "prep" || v === "pro";
+}
+
+export function isBillingTerm(v: unknown): v is BillingTerm {
+  return v === "monthly" || v === "annual";
+}
+
+/** The authoritative price for one SKU. Never takes client input. */
+export function resolvePlanPrice(plan: PaidPlan, term: BillingTerm): ResolvedPrice {
+  return {
+    plan,
+    term,
+    amount: PLAN_AMOUNTS[plan][term],
+    currency: config.proPlanCurrency,
+    days: TERM_DAYS[term],
+  };
+}
+
+/** Every purchasable SKU, for the pricing UI. */
+export function listBillingCatalog(): ResolvedPrice[] {
+  const plans: PaidPlan[] = ["prep", "pro"];
+  const terms: BillingTerm[] = ["monthly", "annual"];
+  return plans.flatMap((p) => terms.map((t) => resolvePlanPrice(p, t)));
+}
+
 
 // A missing JWT_SECRET means every JWT is signed with the publicly-known
 // fallback string below — i.e. anyone can forge a token for any user (and the

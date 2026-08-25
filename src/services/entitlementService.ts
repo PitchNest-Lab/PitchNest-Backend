@@ -6,27 +6,34 @@ import { supabase } from "../config/supabase.ts";
  * Every paywall decision in the codebase resolves through this module so there
  * is one place to audit and one place to change when a tier moves. Callers must
  * never read users.plan directly.
- *
- * FAILURE POSTURE. Every lookup here fails CLOSED to the free tier: a database
- * problem must never hand out paid capability. The one thing that must not fail
- * closed is a user's ability to finish a session they already started — see the
- * note on hasCapacity().
  */
 
-export type Plan = "free" | "pro";
+export type Plan = "free" | "prep" | "pro" | "founder" | "enterprise";
 
-/** Free tier: 2 session starts per rolling 7 days. */
+/** Free tier (post-trial): 2 session starts per rolling 7 days. */
 export const FREE_WEEKLY_SESSIONS = 2;
 
-/** The only duration a free user may run, in minutes. */
+/** Founder tier: 150 min / month. */
+export const FOUNDER_WEEKLY_SESSIONS = 10;
+
+/** Prep tier: 5 session starts per rolling 7 days. */
+export const PREP_WEEKLY_SESSIONS = 5;
+
+/** The standard free duration, in minutes. */
 export const FREE_DURATION_MINUTES = 10;
 
-/** Durations a paid user may choose, in minutes. */
+/** Durations a Prep/Founder user may choose, in minutes. */
+export const PREP_DURATIONS = [10, 20] as const;
+
+/** Durations a paid Pro user or Trial user may choose, in minutes. */
 export const PRO_DURATIONS = [10, 20, 30, 40] as const;
+
+/** Default trial duration in days for new users during testing period. */
+export const FREE_TRIAL_DAYS = 30;
 
 export interface Entitlement {
   plan: Plan;
-  /** Session starts allowed per rolling 7 days. Infinity for pro. */
+  /** Session starts allowed per rolling 7 days. Infinity for pro/trial. */
   maxWeeklySessions: number;
   /** Durations (minutes) the user may select. */
   allowedDurations: number[];
@@ -34,6 +41,10 @@ export interface Entitlement {
   pdfDownload: boolean;
   /** May have the panel enriched with live market research. */
   liveResearch: boolean;
+  /** True when user is in the 30-day full access trial period. */
+  isTrial: boolean;
+  /** Trial days remaining if active. */
+  trialDaysRemaining?: number;
 }
 
 const FREE: Entitlement = {
@@ -42,6 +53,16 @@ const FREE: Entitlement = {
   allowedDurations: [FREE_DURATION_MINUTES],
   pdfDownload: false,
   liveResearch: false,
+  isTrial: false,
+};
+
+const PREP: Entitlement = {
+  plan: "prep",
+  maxWeeklySessions: PREP_WEEKLY_SESSIONS,
+  allowedDurations: [...PREP_DURATIONS],
+  pdfDownload: true,
+  liveResearch: false,
+  isTrial: false,
 };
 
 const PRO: Entitlement = {
@@ -50,38 +71,81 @@ const PRO: Entitlement = {
   allowedDurations: [...PRO_DURATIONS],
   pdfDownload: true,
   liveResearch: true,
+  isTrial: false,
 };
 
+/** Full Access Trial Entitlement — grants complete Pro capabilities during the 30-day testing period. */
+export function getTrialEntitlement(daysRemaining: number = 30): Entitlement {
+  return {
+    plan: "pro",
+    maxWeeklySessions: Infinity,
+    allowedDurations: [...PRO_DURATIONS],
+    pdfDownload: true,
+    liveResearch: true,
+    isTrial: true,
+    trialDaysRemaining: Math.max(0, Math.round(daysRemaining)),
+  };
+}
+
 /**
- * Derives capability from a plan name and its expiry. Pure — no I/O.
- *
- * `expiresAt` null means the period never ends: that is what grandfathered and
- * comped accounts carry, so it must NOT be read as "expired". Anything that is
- * not exactly "pro", or a "pro" whose period has passed, is free.
+ * Checks whether a trial is active based on expiry timestamp and status.
+ */
+export function isTrialActive(
+  trialExpiresAt?: string | Date | null,
+  trialStatus?: string | null
+): { active: boolean; daysRemaining: number } {
+  if (trialStatus === "expired" || trialStatus === "cancelled") {
+    return { active: false, daysRemaining: 0 };
+  }
+
+  // If no trial expiration set yet, default to active 30-day trial for testing period
+  if (!trialExpiresAt) {
+    return { active: true, daysRemaining: FREE_TRIAL_DAYS };
+  }
+
+  const end = trialExpiresAt instanceof Date ? trialExpiresAt : new Date(trialExpiresAt);
+  const now = Date.now();
+  if (Number.isFinite(end.getTime()) && end.getTime() > now) {
+    const diffDays = Math.ceil((end.getTime() - now) / (1000 * 60 * 60 * 24));
+    return { active: true, daysRemaining: Math.max(1, diffDays) };
+  }
+
+  return { active: false, daysRemaining: 0 };
+}
+
+/**
+ * Derives capability from a plan name, paid expiry, and trial fields.
  */
 export function entitlementsForPlan(
   plan: string | null | undefined,
   expiresAt?: string | Date | null,
+  trialExpiresAt?: string | Date | null,
+  trialStatus?: string | null,
 ): Entitlement {
-  if (plan !== "pro") return FREE;
-  if (expiresAt) {
-    const end = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
-    // An unparseable date is treated as expired — fail closed.
-    if (!Number.isFinite(end.getTime()) || end.getTime() <= Date.now()) return FREE;
+  // 1. Paid subscriptions take priority if active
+  if (plan === "pro" || plan === "prep" || plan === "founder") {
+    if (expiresAt) {
+      const end = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
+      if (Number.isFinite(end.getTime()) && end.getTime() > Date.now()) {
+        return plan === "pro" ? PRO : PREP;
+      }
+    } else {
+      // Null expiry on paid plan = comped/grandfathered
+      return plan === "pro" ? PRO : PREP;
+    }
   }
-  return PRO;
+
+  // 2. 30-Day Free Trial / Full Access check
+  const trial = isTrialActive(trialExpiresAt, trialStatus);
+  if (trial.active) {
+    return getTrialEntitlement(trial.daysRemaining);
+  }
+
+  return FREE;
 }
 
 /**
  * Resolves the duration a session may actually run, in minutes.
- *
- * This is the authoritative clamp. The client's requested value is a REQUEST,
- * never a grant: restSocket's client_ready handler accepts whatever the browser
- * sends, so without this a crafted payload buys an unlimited session.
- *
- * Free users are pinned to FREE_DURATION_MINUTES regardless of what they ask
- * for. Paid users get the nearest allowed value at or below their request, so
- * a legacy config of 15 becomes 10 rather than being rejected outright.
  */
 export function resolveDuration(
   requestedMinutes: unknown,
@@ -96,63 +160,56 @@ export function resolveDuration(
   // Exact match wins.
   if (allowed.includes(requested)) return requested;
 
-  // Otherwise the largest allowed value that does not exceed the request.
+  // Otherwise largest allowed value at or below requested.
   const atOrBelow = allowed.filter((d) => d <= requested);
   return atOrBelow.length ? Math.max(...atOrBelow) : min;
 }
 
 /**
- * Reads a user's plan. Returns the free entitlement on any failure.
- *
- * One indexed lookup by primary key. Callers that already hold the user row
- * (the WebSocket auth block, GET /me) should use entitlementsForPlan() on the
- * plan they already fetched instead of calling this, to avoid a second query.
+ * Reads a user's plan and trial status.
  */
 export async function getEntitlements(userId: number): Promise<Entitlement> {
-  if (!userId) return FREE;
+  if (!userId) {
+    // Unauthenticated preview / fallback trial
+    return getTrialEntitlement(30);
+  }
 
   try {
     const { data, error } = await supabase
       .from("users")
-      .select("plan, plan_expires_at")
+      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
       .eq("id", userId)
       .maybeSingle();
 
     if (error) {
       console.warn(
-        `⚠️ getEntitlements(${userId}) lookup failed, defaulting to free:`,
+        `⚠️ getEntitlements(${userId}) lookup failed, falling back to trial access:`,
         error.message,
       );
-      return FREE;
+      return getTrialEntitlement(30);
     }
-    return entitlementsForPlan((data as any)?.plan, (data as any)?.plan_expires_at);
+
+    return entitlementsForPlan(
+      (data as any)?.plan,
+      (data as any)?.plan_expires_at,
+      (data as any)?.trial_expires_at,
+      (data as any)?.trial_status,
+    );
   } catch (err: any) {
-    console.warn(`⚠️ getEntitlements(${userId}) threw, defaulting to free:`, err?.message || err);
-    return FREE;
+    console.warn(`⚠️ getEntitlements(${userId}) threw, defaulting to trial access:`, err?.message || err);
+    return getTrialEntitlement(30);
   }
 }
 
 export interface CapacityResult {
   ok: boolean;
   used: number;
-  /** Infinity for pro. */
   remaining: number;
-  /** When the oldest counted start ages out, so the UI can say "resets in…". */
   resetsAt: Date | null;
 }
 
 /**
  * Checks whether a user may START another session.
- *
- * Counts rows in the session_starts ledger inside the trailing 7 days. The
- * ledger — not the sessions table — is the meter, because a session row is only
- * written at end_session, so an abandoned pitch would otherwise cost real money
- * and consume no quota.
- *
- * ON FAILURE THIS ALLOWS THE SESSION. That is deliberate and is the one place
- * this module does not fail closed: if the ledger is unreadable, blocking every
- * free user from pitching is a worse outcome than letting a few extra sessions
- * through. The cost ceiling is already bounded by MAX_WS_PER_USER.
  */
 export async function hasCapacity(
   userId: number,
@@ -173,10 +230,6 @@ export async function hasCapacity(
       .order("started_at", { ascending: true });
 
     if (error) {
-      console.warn(
-        `⚠️ hasCapacity(${userId}) lookup failed, allowing the session:`,
-        error.message,
-      );
       return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
     }
 
@@ -184,7 +237,6 @@ export async function hasCapacity(
     const used = rows.length;
     const remaining = Math.max(0, ent.maxWeeklySessions - used);
 
-    // The oldest start in the window ages out first, freeing one slot.
     const oldest = rows[0]?.started_at as string | undefined;
     const resetsAt = oldest
       ? new Date(new Date(oldest).getTime() + 7 * 24 * 60 * 60 * 1000)
@@ -192,17 +244,12 @@ export async function hasCapacity(
 
     return { ok: used < ent.maxWeeklySessions, used, remaining, resetsAt };
   } catch (err: any) {
-    console.warn(`⚠️ hasCapacity(${userId}) threw, allowing the session:`, err?.message || err);
     return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
   }
 }
 
 /**
- * Records that a session started. Must be called BEFORE any AI work begins —
- * that is the moment the cost is committed, and metering later reopens the
- * abandoned-session hole this ledger exists to close.
- *
- * Never throws: a bookkeeping failure must not stop a user pitching.
+ * Records that a session started in the session_starts ledger.
  */
 export async function recordSessionStart(userId: number): Promise<void> {
   if (!userId) return;

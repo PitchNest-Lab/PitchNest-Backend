@@ -5,6 +5,7 @@ import { uploadDir } from "../services/storageService.ts";
 import { auditDeck } from "../services/aiService.ts";
 import { generateDeckAuditPDF } from "../services/pdfService.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
+import { parseDeckIntoSlides } from "../services/deckIntelligenceService.ts";
 import path from "path";
 import fs from "fs";
 
@@ -42,6 +43,8 @@ export const uploadDeck = async (req: Request, res: Response) => {
       extractedText = req.file.buffer.toString("utf-8").replace(/\s{2,}/g, " ").trim();
       console.log("✅ Extracted plain-text deck. Length:", extractedText.length);
     }
+
+    const structuredDeck = parseDeckIntoSlides(extractedText, deckName);
 
     const { data, error } = await supabase.storage
       .from(config.storageBucket)

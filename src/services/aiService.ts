@@ -454,22 +454,41 @@ function validateEvaluationReport(raw: any): EvaluationReport {
   };
 }
 
+import { PitchSessionState, buildPitchMemoryPromptBlock } from "./pitchMemoryService.ts";
+import { DeckIntelligence, buildStructuredDeckContextBlock, parseDeckIntoSlides } from "./deckIntelligenceService.ts";
+
 const DECK_TEXT_LIMIT = 8000;
 
 const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
 - CRITICAL: Keep each turn short and conversational — one or two spoken sentences. Ask AT MOST ONE question per turn; NEVER stack or chain a second question onto the same turn — hold it for a later turn. A statement plus one question is fine, and a brief reaction with no question at all is also fine.
+- QUESTION SELECTION PRIORITY:
+  1. Contradictions or mathematical discrepancies in what the founder stated (probe immediately).
+  2. Important unsupported claims or unrealistic unit economics.
+  3. Core investor risk factors for their specific stage.
+  4. High-priority unanswered questions from earlier.
+  5. Persona-specific thesis priorities.
+- NEVER repeat a question that has already been answered. If an answer was vague or contradicted earlier numbers, explicitly cite the discrepancy before asking for clarification.
+- RESPECT TEMPORAL REASONING: Do not ask for premature metrics (e.g. if first customer was 2 weeks ago on a monthly plan, renewal is not yet due; if launched last week, do not ask for 6-month retention cohorts).
 - The founder's words arrive via automatic speech recognition and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context instead of taking a garbled phrase literally; if a critical detail is truly unclear, ask a brief clarifying question rather than assuming.
 - CRITICAL FORMATTING: You MUST speak as EXACTLY ONE person per turn. DO NOT include multiple people talking in the same response. STOP GENERATING after your chosen panelist has spoken.
 - Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly.
 - Be aware of the remaining pitch time metadata (e.g., \`[PITCH TIME REMAINING: ...]\`). Do not start complex new topics when less than 2 minutes remain; instead, guide the founder to summarize, handle final remarks, or conclude.`;
 
-function buildDeckContext(deckName: string, extractedDeckText: string): string {
+function buildDeckContext(deckName: string, extractedDeckText: string, structuredDeck?: DeckIntelligence): string {
+  if (structuredDeck && structuredDeck.slides.length > 0) {
+    return buildStructuredDeckContextBlock(structuredDeck);
+  }
   if (!extractedDeckText?.trim()) {
     return deckName && deckName !== "None Loaded"
       ? `PITCH DECK: "${deckName}" is attached but text could not be extracted. Ask the founder to walk through key slides.`
       : "PITCH DECK: None provided. Base questions on what the founder says live.";
+  }
+
+  const parsed = parseDeckIntoSlides(extractedDeckText, deckName);
+  if (parsed.slides.length > 0) {
+    return buildStructuredDeckContextBlock(parsed);
   }
 
   const trimmed = extractedDeckText.trim().slice(0, DECK_TEXT_LIMIT);
@@ -720,7 +739,13 @@ function buildArchetypeDirective(archetype: string): string {
 /**
  * Returns the formatted Master Prompt system instructions.
  */
-export function getMasterPrompt(isCoach: boolean, businessName: string, configData: any): string {
+export function getMasterPrompt(
+  isCoach: boolean,
+  businessName: string,
+  configData: any,
+  pitchState?: PitchSessionState,
+  structuredDeck?: DeckIntelligence
+): string {
   const currentBusinessName = businessName || "Unknown Pitch";
   const desc = configData.description || "Startup Pitch";
   const industry = configData.industry || "General";
@@ -730,10 +755,11 @@ export function getMasterPrompt(isCoach: boolean, businessName: string, configDa
   const riskAppetite = Number(configData.riskAppetite ?? 75);
   const deckName = configData.selectedDeck?.name || "None Loaded";
   const extractedDeckText = configData.selectedDeck?.extracted_text || configData.resolvedDeckText || "";
-  const deckContext = buildDeckContext(deckName, extractedDeckText);
+  const deckContext = buildDeckContext(deckName, extractedDeckText, structuredDeck || configData.structuredDeck);
   const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
   const persona = getPersonaProfile(archetype);
   const returningBlock = buildReturningFounderBlock(configData.previousSession, currentBusinessName);
+  const memoryBlock = pitchState ? `\n\n${buildPitchMemoryPromptBlock(pitchState)}\n` : "";
 
   if (isCoach) {
     return `${OUTPUT_RULES}
@@ -748,7 +774,7 @@ STARTUP CONTEXT:
 - Funding Stage: ${fundingStage}
 
 ${deckContext}
-
+${memoryBlock}
 ${toneBlock}
 ${buildTractionDirective(fundingStage)}
 ${returningBlock}` + `
@@ -777,7 +803,7 @@ STARTUP CONTEXT:
 - Funding Stage: ${fundingStage}
 
 ${deckContext}
-
+${memoryBlock}
 ${buildArchetypeDirective(archetype)}
 ${toneBlock}
 ${buildTractionDirective(fundingStage)}

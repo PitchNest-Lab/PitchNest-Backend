@@ -42,6 +42,18 @@ import {
   resolveDuration,
   type Entitlement,
 } from "../services/entitlementService.ts";
+import {
+  PitchSessionState,
+  createPitchSessionState,
+  updatePitchMemory,
+  recordAskedQuestion,
+  recordQuestionAnswered,
+} from "../services/pitchMemoryService.ts";
+import {
+  DeckIntelligence,
+  parseDeckIntoSlides,
+  inferActiveSlide,
+} from "../services/deckIntelligenceService.ts";
 import crypto from "crypto";
 
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
@@ -483,6 +495,10 @@ export function initRestSocket(wss: WebSocketServer) {
     let parentSessionId: number | null = null;
     let previousSessionCtx: ReturnType<typeof clampPreviousSession> = null;
     let sttRecognizer: StreamingRecognizer | null = null;
+    // Structured Pitch Memory State & Deck Intelligence
+    let pitchSessionState: PitchSessionState = createPitchSessionState();
+    let structuredDeck: DeckIntelligence | null = null;
+
     // Plan capability for this connection, resolved once from the database at
     // client_ready and held for the connection's life. Defaults to the free
     // tier so any path that fails to resolve it cannot grant paid capability.
@@ -806,6 +822,30 @@ export function initRestSocket(wss: WebSocketServer) {
         let promptToUse = masterPrompt;
         let userInputToUse = userInput;
 
+        // Structured Pitch Memory Update: update state with the founder's latest utterance
+        if (!turn.isGreeting && !turn.isCanned && !turn.isVerdict && turn.text) {
+          pitchSessionState = updatePitchMemory(
+            pitchSessionState,
+            turn.text,
+            conversationHistory.length,
+            structuredDeck?.summary,
+          );
+          recordQuestionAnswered(pitchSessionState, turn.text);
+
+          if (liveConfig) {
+            promptToUse = getMasterPrompt(
+              isCoachMode,
+              currentBusinessName,
+              liveConfig,
+              pitchSessionState,
+              structuredDeck || undefined,
+            );
+            if (marketSnapshot) {
+              promptToUse = `${promptToUse}\n\n${buildMarketSnapshotBlock(marketSnapshot)}`;
+            }
+          }
+        }
+
         // Panel-state metadata: grounded memory of who is warming/cooling/out
         // and which concerns are still open. Panel turns only.
         if (!isCoachMode && !turn.isGreeting) {
@@ -1076,6 +1116,14 @@ export function initRestSocket(wss: WebSocketServer) {
         }
         if (!turn.isCanned) {
           conversationHistory.push({ role: "assistant", text: fullSpokenText });
+          if (!turn.isGreeting && fullSpokenText.trim()) {
+            recordAskedQuestion(
+              pitchSessionState,
+              activeSpeaker,
+              fullSpokenText,
+              conversationHistory.length,
+            );
+          }
         }
         if (fullSpokenText.trim()) {
           fullTranscript.push({
@@ -1335,13 +1383,12 @@ export function initRestSocket(wss: WebSocketServer) {
 
           // Verify that the user still exists in the database (prevents deleted users
           // from pitching via WebSocket since WS bypasses Express auth middleware).
-          // Also pulls `plan` in the SAME query so the paywall costs no extra
-          // round trip. A missing user is a hard reject; a missing/unknown plan
-          // silently degrades to free, which is the safe direction.
+          // Also pulls `plan` and trial fields in the SAME query so the paywall costs no extra
+          // round trip.
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
-              .select("id, plan, plan_expires_at")
+              .select("id, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
               .eq("id", currentUserId)
               .maybeSingle();
 
@@ -1359,7 +1406,19 @@ export function initRestSocket(wss: WebSocketServer) {
             entitlement = entitlementsForPlan(
               (dbUser as any).plan,
               (dbUser as any).plan_expires_at,
+              (dbUser as any).trial_expires_at,
+              (dbUser as any).trial_status,
             );
+          }
+
+          // Initialize Structured Pitch Session State
+          pitchSessionState = createPitchSessionState(
+            currentBusinessName,
+            clientConfig.industry || "General",
+            clientConfig.fundingStage || "Pre-Seed",
+          );
+          if (clientConfig.description) {
+            pitchSessionState.solution = clientConfig.description;
           }
 
           // ── Paywall: quota ────────────────────────────────────────────────
@@ -1509,6 +1568,8 @@ export function initRestSocket(wss: WebSocketServer) {
               isCoachMode,
               currentBusinessName,
               liveConfig,
+              pitchSessionState,
+              structuredDeck || undefined,
             );
             if (marketSnapshot) {
               masterPrompt += "\n" + buildMarketSnapshotBlock(marketSnapshot);
@@ -1518,10 +1579,17 @@ export function initRestSocket(wss: WebSocketServer) {
           resolveDeckText(clientConfig)
             .then((text) => {
               resolvedDeckText = text;
+              if (resolvedDeckText) {
+                structuredDeck = parseDeckIntoSlides(
+                  resolvedDeckText,
+                  clientConfig.selectedDeck?.name || "Pitch Deck",
+                );
+              }
               if (isSoloMode) return;
               liveConfig = {
                 ...clientConfig,
                 resolvedDeckText,
+                structuredDeck,
                 previousSession: previousSessionCtx,
               };
               rebuildMasterPrompt();

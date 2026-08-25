@@ -49,12 +49,15 @@ function lockAuthProvider(userId: number, provider: "form" | "google") {
     });
 }
 
+import { isTrialActive, FREE_TRIAL_DAYS } from "../services/entitlementService.ts";
+
 export function toPublicUser(u: any) {
-  // An expired paid period reads as free to the client, exactly as it does to
-  // every server-side gate — otherwise the UI would keep offering Pro controls
-  // after the period lapsed and every action would fail.
   const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
-  const active = u?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+  const isPaidActive = (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") && (!expiry || expiry.getTime() > Date.now());
+  const trial = isTrialActive(u?.trial_expires_at, u?.trial_status);
+
+  // During trial or paid plan, the user has full access
+  const effectivePlan = isPaidActive ? (u.plan as string) : (trial.active ? "pro" : "free");
 
   return {
     id: u?.id,
@@ -64,11 +67,11 @@ export function toPublicUser(u: any) {
     bio: u?.bio,
     avatarUrl: u?.avatar_url ?? null,
     settings: u?.settings ?? {},
-    // Drives paywall UI only. The server never trusts the client's copy of
-    // this — every gate re-resolves the plan from the database.
-    plan: active ? "pro" : "free",
-    // Null when the plan never expires (grandfathered or comped).
-    planExpiresAt: active && expiry ? expiry.toISOString() : null,
+    plan: effectivePlan,
+    planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
+    isTrial: trial.active,
+    trialDaysRemaining: trial.daysRemaining,
+    trialExpiresAt: u?.trial_expires_at ? new Date(u.trial_expires_at).toISOString() : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
   };
 }
 
@@ -196,17 +199,26 @@ export const signup = async (req: Request, res: Response) => {
     }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const now = new Date();
+    const trialEnd = new Date(now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
 
     let { data: newUser, error } = await supabase
       .from("users")
       .insert([
-        { name, email: cleanEmail, password: hashedPassword, auth_provider: "form" },
+        {
+          name,
+          email: cleanEmail,
+          password: hashedPassword,
+          auth_provider: "form",
+          trial_started_at: now.toISOString(),
+          trial_expires_at: trialEnd.toISOString(),
+          trial_status: "active",
+        },
       ])
       .select()
       .single();
 
-    // Rollout safety: if the auth_provider column hasn't been added in
-    // Supabase yet, retry without it so signup never breaks.
+    // Rollout safety: if new columns haven't been added in Supabase yet, retry without them
     if (error && /column|schema/i.test(error.message || "")) {
       ({ data: newUser, error } = await supabase
         .from("users")
@@ -513,6 +525,9 @@ export const googleAuth = async (req: Request, res: Response) => {
         crypto.randomBytes(32).toString("hex"),
         4,
       );
+      const now = new Date();
+      const trialEnd = new Date(now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+
       let { data: created, error } = await supabase
         .from("users")
         .insert([
@@ -523,6 +538,9 @@ export const googleAuth = async (req: Request, res: Response) => {
             isEmailVerified: true,
             role: "Founder",
             auth_provider: "google",
+            trial_started_at: now.toISOString(),
+            trial_expires_at: trialEnd.toISOString(),
+            trial_status: "active",
           },
         ])
         .select()

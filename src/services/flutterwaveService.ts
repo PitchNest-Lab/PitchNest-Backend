@@ -1,5 +1,10 @@
 import crypto from "crypto";
-import { config } from "../config/env.ts";
+import {
+  config,
+  resolvePlanPrice,
+  type PaidPlan,
+  type BillingTerm,
+} from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 
 /**
@@ -50,126 +55,14 @@ function mintTxRef(userId: number): string {
   return `pn-${userId}-${Date.now()}-${crypto.randomBytes(8).toString("hex")}`;
 }
 
-interface FxCacheItem {
-  rate: number;
-  expiresAt: number;
-}
-const fxRateCache: Record<string, FxCacheItem> = {};
-
-/**
- * Fetches live FX exchange rate from Flutterwave or returns a fallback rate.
- * Caches exchange rates in memory for 15 minutes.
- */
-export async function getFxRate(
-  sourceCurrency: string,
-  destinationCurrency: string,
-  baseAmount: number = 1,
-): Promise<number> {
-  const source = sourceCurrency.trim().toUpperCase();
-  const dest = destinationCurrency.trim().toUpperCase();
-
-  if (source === dest) return 1;
-
-  const cacheKey = `${source}_${dest}`;
-  const now = Date.now();
-  if (fxRateCache[cacheKey] && fxRateCache[cacheKey].expiresAt > now) {
-    return fxRateCache[cacheKey].rate;
-  }
-
-  if (config.flutterwaveSecretKey) {
-    try {
-      const url = `${FLW_API}/transfers/rates?amount=${baseAmount}&source_currency=${source}&destination_currency=${dest}`;
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${config.flutterwaveSecretKey}` },
-      });
-      const body: any = await res.json().catch(() => null);
-      if (res.ok && body?.status === "success" && body?.data?.rate) {
-        const rate = Number(body.data.rate);
-        if (rate > 0) {
-          fxRateCache[cacheKey] = {
-            rate,
-            expiresAt: now + 15 * 60 * 1000, // 15 min cache
-          };
-          return rate;
-        }
-      }
-    } catch (err: any) {
-      console.warn("⚠️ Live FX rate fetch failed, falling back to default:", err?.message || err);
-    }
-  }
-
-  // Fallback static conversion rates if FX endpoint is unreachable or in dev without key
-  const fallbackRates: Record<string, number> = {
-    USD_NGN: 1500,
-    USD_GHS: 15.5,
-    USD_KES: 130,
-    USD_UGX: 3700,
-    USD_ZAR: 18.5,
-    USD_EUR: 0.92,
-    USD_GBP: 0.79,
-  };
-
-  const fallback = fallbackRates[cacheKey] || 1;
-  fxRateCache[cacheKey] = { rate: fallback, expiresAt: now + 5 * 60 * 1000 };
-  return fallback;
-}
-
-export interface RegionPricing {
-  currency: string;
-  amount: number;
-  paymentOptions: string;
-  baseAmountUsd: number;
-  exchangeRate: number;
-}
-
-/**
- * Server-side region pricing resolution based on user location or currency preference.
- * Amount is ALWAYS computed server-side to prevent client-side price tampering.
- */
-export async function getRegionPricing(
-  _countryCode?: string,
-  _requestedCurrency?: string,
-): Promise<RegionPricing> {
-  const amount = config.proPlanAmount || 9.99;
-  return {
-    currency: config.proPlanCurrency || "USD",
-    amount,
-    paymentOptions: "card,account",
-    baseAmountUsd: amount,
-    exchangeRate: 1,
-  };
-}
-
-/**
- * Maps a currency code to its supported Flutterwave payment options string.
- */
-function getPaymentOptionsForCurrency(currency: string): string {
-  const curr = (currency || "").trim().toUpperCase();
-  switch (curr) {
-    case "NGN":
-      return "card,ussd,banktransfer,account,nqr,opay";
-    case "GHS":
-      return "card,ghanamobilemoney";
-    case "KES":
-      return "card,mpesa";
-    case "UGX":
-      return "card,mobilemoneyuganda";
-    case "ZAR":
-      return "card,eft";
-    case "USD":
-    case "EUR":
-    case "GBP":
-    default:
-      return "card,account";
-  }
-}
-
 /**
  * Creates a pending payment row and returns the hosted checkout link.
  *
  * The row is written BEFORE calling Flutterwave so the webhook always has a
- * reference to resolve. Amount and currency are computed SERVER-SIDE to prevent
- * client-side price tampering.
+ * reference to resolve. Price, level and day-count are computed SERVER-SIDE from
+ * the (plan, term) catalog and recorded onto the row — the webhook grants from
+ * those recorded values, never from client input, so a founder receives exactly
+ * the SKU that was priced here.
  */
 export async function createCheckout(
   user: {
@@ -177,9 +70,9 @@ export async function createCheckout(
     email: string;
     name?: string | null;
   },
-  preferences?: {
-    countryCode?: string;
-    currency?: string;
+  selection: {
+    plan: PaidPlan;
+    term: BillingTerm;
   },
 ): Promise<CheckoutSession> {
   if (!config.flutterwaveSecretKey) {
@@ -187,8 +80,11 @@ export async function createCheckout(
   }
 
   const txRef = mintTxRef(user.id);
-  const pricing = await getRegionPricing(preferences?.countryCode, preferences?.currency);
-  const { amount, currency, paymentOptions } = pricing;
+  const price = resolvePlanPrice(selection.plan, selection.term);
+  const { amount, currency, days } = price;
+
+  const planLabel = selection.plan === "pro" ? "Pro" : "Prep";
+  const termLabel = selection.term === "annual" ? "year" : "month";
 
   const { error: insertErr } = await supabase.from("payments").insert([
     {
@@ -198,6 +94,10 @@ export async function createCheckout(
       status: "pending",
       amount,
       currency,
+      // The intended grant, read back by grant_pro_access under a row lock.
+      plan: selection.plan,
+      term: selection.term,
+      granted_days: days,
     },
   ]);
   if (insertErr) {
@@ -222,12 +122,11 @@ export async function createCheckout(
           email: user.email,
           name: user.name || undefined,
         },
-        payment_options: paymentOptions,
         customizations: {
-          title: "PitchNest Pro",
-          description: `${config.proPlanDays} days of unlimited pitch sessions`,
+          title: `PitchNest ${planLabel}`,
+          description: `${days} days of PitchNest ${planLabel} (billed per ${termLabel})`,
         },
-        meta: { user_id: user.id },
+        meta: { user_id: user.id, plan: selection.plan, term: selection.term },
       }),
     });
   } catch (err: any) {
@@ -336,8 +235,10 @@ export function verifyWebhookSignature(headerValue: unknown): boolean {
 }
 
 /**
- * Settles a verified payment: marks it successful and extends the user's Pro
- * period, atomically.
+ * Settles a verified payment: marks it successful and extends the user's paid
+ * period, atomically. The tier and day-count come from the payment row itself
+ * (recorded at checkout), so this call only needs to pass the VERIFIED amount
+ * and currency that were actually charged.
  *
  * Returns true when access was granted, false when the reference was already
  * settled (a webhook retry — Flutterwave sends up to 3, 30 minutes apart).
@@ -348,7 +249,6 @@ export async function grantAccess(tx: VerifiedTransaction): Promise<boolean> {
     p_provider_ref: tx.providerRef,
     p_amount: tx.amount,
     p_currency: tx.currency,
-    p_days: config.proPlanDays,
   });
 
   if (error) {

@@ -1,50 +1,62 @@
 import { Request, Response } from "express";
-import { config, hasBillingConfig } from "../config/env.ts";
+import {
+  config,
+  hasBillingConfig,
+  resolvePlanPrice,
+  listBillingCatalog,
+  isPaidPlan,
+  isBillingTerm,
+  type PaidPlan,
+  type BillingTerm,
+} from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 import {
   createCheckout,
-  getRegionPricing,
   verifyTransaction,
   verifyWebhookSignature,
   grantAccess,
   markPaymentFailed,
 } from "../services/flutterwaveService.ts";
 
-/** Helper to extract client country code & currency preference from HTTP headers or request */
-function extractClientLocation(req: Request) {
-  const countryCode =
-    (req.headers["cf-ipcountry"] as string) ||
-    (req.headers["x-country"] as string) ||
-    (req.query.countryCode as string) ||
-    (req.body?.countryCode as string) ||
-    process.env.DEFAULT_TEST_COUNTRY ||
-    "";
-  const currency =
-    (req.query.currency as string) ||
-    (req.body?.currency as string) ||
-    process.env.DEFAULT_TEST_CURRENCY ||
-    "";
-  return { countryCode: countryCode.trim(), currency: currency.trim() };
+/**
+ * The featured price (Pro, monthly) plus the full purchasable catalog.
+ *
+ * `price` is kept for backward-compatibility with surfaces that render a single
+ * headline number; `catalog` lists every (plan, term) SKU the checkout will
+ * honour. Both come from the same server-side resolver, so display can never
+ * drift from what is charged.
+ */
+function pricingPayload() {
+  const featured = resolvePlanPrice("pro", "monthly");
+  return {
+    price: {
+      amount: featured.amount,
+      currency: featured.currency,
+      days: featured.days,
+    },
+    catalog: listBillingCatalog(),
+  };
 }
 
 /**
- * GET /api/billing/price — public Pro price with location-aware currency & rates.
+ * Parses the requested SKU from a checkout request body, defaulting to the
+ * headline Pro monthly. Anything unrecognised falls back rather than 400-ing, so
+ * a stale client can still buy the default plan.
  */
-export const getPrice = async (req: Request, res: Response) => {
-  try {
-    const { countryCode, currency } = extractClientLocation(req);
-    const pricing = await getRegionPricing(countryCode, currency);
+function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } {
+  const plan: PaidPlan = isPaidPlan(body?.plan) ? body.plan : "pro";
+  const term: BillingTerm = isBillingTerm(body?.term) ? body.term : "monthly";
+  return { plan, term };
+}
 
+/**
+ * GET /api/billing/price — public price + purchasable catalog. No user data.
+ */
+export const getPrice = async (_req: Request, res: Response) => {
+  try {
     res.json({
       billingEnabled: hasBillingConfig(),
-      price: {
-        amount: pricing.amount,
-        currency: pricing.currency,
-        days: config.proPlanDays,
-        baseAmountUsd: pricing.baseAmountUsd,
-        exchangeRate: pricing.exchangeRate,
-        paymentOptions: pricing.paymentOptions,
-      },
+      ...pricingPayload(),
     });
   } catch (err: any) {
     console.error("❌ getPrice:", err?.message || err);
@@ -55,6 +67,8 @@ export const getPrice = async (req: Request, res: Response) => {
 /**
  * GET /api/billing/plan — user plan status and location-aware pricing.
  */
+import { isTrialActive } from "../services/entitlementService.ts";
+
 export const getPlan = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -62,15 +76,18 @@ export const getPlan = async (req: Request, res: Response) => {
 
     let { data: user } = await supabase
       .from("users")
-      .select("plan, plan_expires_at")
+      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
       .eq("id", userId)
       .maybeSingle();
 
     let expiry = (user as any)?.plan_expires_at
       ? new Date((user as any).plan_expires_at)
       : null;
-    let active =
-      (user as any)?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+    // A paid level (prep or pro) counts as active until its period passes.
+    // A null expiry means "never expires" (comped / grandfathered).
+    const isPaidActive = (plan: unknown, e: Date | null) =>
+      (plan === "prep" || plan === "pro" || plan === "founder") && (!e || e.getTime() > Date.now());
+    let active = isPaidActive((user as any)?.plan, expiry);
 
     // In local development, webhooks from the internet cannot reach localhost.
     // Auto-verify recent pending transactions against Flutterwave so local test checkouts turn Pro instantly.
@@ -94,14 +111,14 @@ export const getPlan = async (req: Request, res: Response) => {
               // Refresh user status
               const { data: updatedUser } = await supabase
                 .from("users")
-                .select("plan, plan_expires_at")
+                .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
                 .eq("id", userId)
                 .maybeSingle();
 
               if (updatedUser) {
                 user = updatedUser;
                 expiry = (user as any)?.plan_expires_at ? new Date((user as any).plan_expires_at) : null;
-                active = (user as any)?.plan === "pro" && (!expiry || expiry.getTime() > Date.now());
+                active = isPaidActive((user as any)?.plan, expiry);
               }
               break;
             }
@@ -112,21 +129,17 @@ export const getPlan = async (req: Request, res: Response) => {
       }
     }
 
-    const { countryCode, currency } = extractClientLocation(req);
-    const pricing = await getRegionPricing(countryCode, currency);
+    const trial = isTrialActive((user as any)?.trial_expires_at, (user as any)?.trial_status);
+    const effectivePlan = active ? ((user as any).plan as string) : (trial.active ? "pro" : "free");
 
     res.json({
-      plan: active ? "pro" : "free",
+      plan: effectivePlan,
       expiresAt: active && expiry ? expiry.toISOString() : null,
+      isTrial: trial.active,
+      trialDaysRemaining: trial.daysRemaining,
+      trialExpiresAt: (user as any)?.trial_expires_at ? new Date((user as any).trial_expires_at).toISOString() : null,
       billingEnabled: hasBillingConfig(),
-      price: {
-        amount: pricing.amount,
-        currency: pricing.currency,
-        days: config.proPlanDays,
-        baseAmountUsd: pricing.baseAmountUsd,
-        exchangeRate: pricing.exchangeRate,
-        paymentOptions: pricing.paymentOptions,
-      },
+      ...pricingPayload(),
     });
   } catch (err: any) {
     console.error("❌ getPlan:", err?.message || err);
@@ -135,7 +148,12 @@ export const getPlan = async (req: Request, res: Response) => {
 };
 
 /**
- * POST /api/billing/checkout — start a location-aware Pro purchase.
+ * POST /api/billing/checkout — start a purchase of a specific SKU.
+ *
+ * The body may name `plan` ("prep" | "pro") and `term` ("monthly" | "annual");
+ * both default to the headline Pro monthly and unrecognised values fall back
+ * rather than erroring, so a stale client still works. The PRICE for the SKU is
+ * resolved server-side inside createCheckout — the body never carries an amount.
  */
 export const startCheckout = async (req: Request, res: Response) => {
   try {
@@ -157,6 +175,8 @@ export const startCheckout = async (req: Request, res: Response) => {
 
     if (!user) return res.status(404).json({ error: "User not found" });
 
+    // Unlimited (comped) access has nothing to buy, and paying would replace it
+    // with a dated period (see grant_pro_access downgrade guard).
     if ((user as any).plan === "pro" && !(user as any).plan_expires_at) {
       return res.status(409).json({
         error: "already_pro",
@@ -164,7 +184,7 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
-    const { countryCode, currency } = extractClientLocation(req);
+    const selection = parseSelection(req.body);
 
     const session = await createCheckout(
       {
@@ -172,7 +192,7 @@ export const startCheckout = async (req: Request, res: Response) => {
         email: (user as any).email,
         name: (user as any).name,
       },
-      { countryCode, currency },
+      selection,
     );
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
