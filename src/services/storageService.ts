@@ -65,9 +65,24 @@ function makeUpload(allowed: readonly string[], maxBytes: number, label: string)
   });
 }
 
-/** Pitch decks: PDF and plain text. 25 MB is generous for a slide deck. */
+/**
+ * Pitch decks: PDF and plain text. 25 MB is generous for a slide deck.
+ *
+ * `application/octet-stream` (and an empty type) are also admitted AT THIS
+ * GATE ONLY, because a Windows machine with a broken file association sends a
+ * perfectly good PDF with no MIME type at all — and multer rejects before the
+ * controller ever sees the bytes. The controller then sniffs the buffer's
+ * magic bytes and returns 415 itself for anything that is not genuinely a PDF
+ * or text, so this does not widen what can be stored.
+ */
 export const deckUpload = makeUpload(
-  ["application/pdf", "text/plain", "text/markdown"],
+  [
+    "application/pdf",
+    "text/plain",
+    "text/markdown",
+    "application/octet-stream",
+    "",
+  ],
   25 * 1024 * 1024,
   "deck",
 );

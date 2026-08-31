@@ -17,10 +17,59 @@ import fs from "fs";
 // noise (image-only PDFs extract as empty/near-empty text).
 const MIN_AUDITABLE_TEXT_CHARS = 200;
 
+/**
+ * Resolves what a deck upload ACTUALLY is, from its bytes.
+ *
+ * The multipart MIME type is set by the client and can be wrong: Windows with
+ * a broken file association sends `application/octet-stream` for a real PDF,
+ * and some browsers send an empty type. Multer's allow-list now lets those two
+ * through the gate, so the truth has to be established here.
+ *
+ *   • `%PDF-` magic prefix                          → application/pdf
+ *   • decodable UTF-8 with no NUL bytes in the head → text/plain
+ *   • anything else (e.g. a renamed .pptx = `PK…`)  → null → 415
+ */
+export function resolveDeckType(buffer: Buffer, mimetype: string | undefined): string | null {
+  if (mimetype === "application/pdf" || mimetype === "text/plain" || mimetype === "text/markdown") {
+    return mimetype;
+  }
+  const head = buffer.subarray(0, Math.min(buffer.length, 1024));
+  // Known NON-deck binary containers, rejected before any text heuristic can
+  // misfire on them: PK = zip (pptx/docx/xlsx), the OLE compound header = legacy
+  // Office (.ppt/.doc), MZ = Windows executables.
+  const magic = head.subarray(0, 4).toString("latin1");
+  if (magic === "PK\x03\x04" || magic.startsWith("PK")) return null;
+  if (
+    head.length >= 8 &&
+    head.subarray(0, 8).toString("latin1") === "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"
+  ) {
+    return null;
+  }
+  if (magic === "MZ\x90\x00" || magic.startsWith("MZ")) return null;
+  if (head.length >= 5 && head.subarray(0, 5).toString("latin1") === "%PDF-") {
+    return "application/pdf";
+  }
+  if (head.length > 0 && !head.includes(0)) {
+    const decoded = head.toString("utf-8");
+    // � appears when Buffer.toString hits invalid UTF-8 — binary content.
+    if (!decoded.includes("�")) return "text/plain";
+  }
+  return null;
+}
+
 export const uploadDeck = async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No deck file provided" });
-    
+
+    // Client MIME is a hint; the bytes are the truth (see resolveDeckType).
+    const deckType = resolveDeckType(req.file.buffer, req.file.mimetype);
+    if (!deckType) {
+      return res.status(415).json({
+        error:
+          "Pitch decks must be PDF, .txt or .md files. PowerPoint files are not supported yet — export your deck as a PDF and upload that.",
+      });
+    }
+
     const userId = req.user?.id;
     const originalName = sanitizeUploadName(req.file.originalname);
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
@@ -32,7 +81,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
     // Text extraction MUST keep page boundaries (\f) — that is what makes the
     // deck one slide per page for both the viewer and the AI's slide context.
     // See deckTextService for why normalising with /\s{2,}/ destroyed them.
-    if (req.file.mimetype === "application/pdf") {
+    if (deckType === "application/pdf") {
       const extraction = await extractPdfPages(req.file.buffer);
       extractedText = extraction.text;
       pageCount = extraction.pageCount;
@@ -40,7 +89,8 @@ export const uploadDeck = async (req: Request, res: Response) => {
         `✅ Extracted PDF text. Length: ${extractedText.length}, pages: ${pageCount}`,
       );
     } else if (
-      req.file.mimetype === "text/plain" ||
+      deckType === "text/plain" ||
+      deckType === "text/markdown" ||
       originalName.endsWith(".txt") ||
       originalName.endsWith(".md")
     ) {
@@ -55,7 +105,9 @@ export const uploadDeck = async (req: Request, res: Response) => {
     const { data, error } = await supabase.storage
       .from(config.storageBucket)
       .upload(filePath, req.file.buffer, {
-        contentType: req.file.mimetype,
+        // Store with the sniffed type, not what the client claimed — a PDF
+        // that arrived as octet-stream must not be stored as one.
+        contentType: deckType,
         duplex: 'half'
       });
 
