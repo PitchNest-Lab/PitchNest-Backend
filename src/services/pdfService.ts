@@ -14,16 +14,6 @@ const LOGO_PATH = path.resolve(ASSETS_DIR, "logo.png");
 const FONT_REGULAR = path.resolve(ASSETS_DIR, "fonts", "Inter-Regular.ttf");
 const FONT_BOLD = path.resolve(ASSETS_DIR, "fonts", "Inter-Bold.ttf");
 
-// Preload fonts in memory once to accelerate PDF rendering
-let fontRegularBuffer: Buffer | null = null;
-let fontBoldBuffer: Buffer | null = null;
-try {
-  if (fs.existsSync(FONT_REGULAR)) fontRegularBuffer = fs.readFileSync(FONT_REGULAR);
-  if (fs.existsSync(FONT_BOLD)) fontBoldBuffer = fs.readFileSync(FONT_BOLD);
-} catch (e) {
-  console.warn("⚠️ Failed to preload Inter font buffers:", e);
-}
-
 // ── Color palette ────────────────────────────────────────────────────────────
 const COLORS = {
   primary: "#3b52c4",
@@ -717,15 +707,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
         },
       });
 
-      // Register Inter fonts using preloaded buffers or fallbacks
+      // Register Inter fonts
       try {
-        if (fontRegularBuffer && fontBoldBuffer) {
-          doc.registerFont("Inter", fontRegularBuffer);
-          doc.registerFont("Inter-Bold", fontBoldBuffer);
-        } else {
-          doc.registerFont("Inter", FONT_REGULAR);
-          doc.registerFont("Inter-Bold", FONT_BOLD);
-        }
+        doc.registerFont("Inter", FONT_REGULAR);
+        doc.registerFont("Inter-Bold", FONT_BOLD);
       } catch {
         // Fallback to Helvetica if Inter fonts not found
         doc.registerFont("Inter", "Helvetica");
@@ -1995,13 +1980,8 @@ export async function generateDeckAuditPDF(audit: any, deckName: string): Promis
       });
 
       try {
-        if (fontRegularBuffer && fontBoldBuffer) {
-          doc.registerFont("Inter", fontRegularBuffer);
-          doc.registerFont("Inter-Bold", fontBoldBuffer);
-        } else {
-          doc.registerFont("Inter", FONT_REGULAR);
-          doc.registerFont("Inter-Bold", FONT_BOLD);
-        }
+        doc.registerFont("Inter", FONT_REGULAR);
+        doc.registerFont("Inter-Bold", FONT_BOLD);
       } catch {
         doc.registerFont("Inter", "Helvetica");
         doc.registerFont("Inter-Bold", "Helvetica-Bold");

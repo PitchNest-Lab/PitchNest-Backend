@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "start": "tsx server.ts",
+    "start": "node --max-old-space-size=384 ./node_modules/tsx/dist/cli.mjs server.ts",
     "dev": "tsx server.ts",
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
