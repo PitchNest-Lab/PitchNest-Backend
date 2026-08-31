@@ -233,55 +233,60 @@ async function resolveDeckPageCount(
 ): Promise<number> {
   if (knownCount && knownCount > 0) return knownCount;
 
+  const fallbackCount = pageCountFromText(extractedText);
+
   const objectPath = storedPath ? storagePathFromUrl(storedPath) : null;
   const isPdf = (storedPath || "").toLowerCase().endsWith(".pdf");
 
-  // Re-parse from storage — the only way to learn the true count.
-  if (objectPath && isPdf) {
+  // Re-parse in the background to update page_count in DB without blocking the signed URL response
+  const backgroundBackfill = async () => {
     try {
-      const { data: blob, error } = await supabase.storage
-        .from(config.storageBucket)
-        .download(objectPath);
-      if (!error && blob) {
-        const buffer = Buffer.from(await blob.arrayBuffer());
-        const extraction = await extractPdfPages(buffer);
-        if (extraction.pageCount > 0) {
-          const patch: any = { page_count: extraction.pageCount };
-          // Only replace the stored text when re-extraction actually produced
-          // some — never overwrite existing text with nothing.
-          if (extraction.text) patch.extracted_text = extraction.text;
-          const { error: patchErr } = await supabase
-            .from("decks")
-            .update(patch)
-            .eq("id", deckId);
-          if (patchErr) {
-            console.warn(
-              "⚠️ Could not backfill deck page_count (non-fatal):",
-              patchErr.message,
-            );
+      if (objectPath && isPdf) {
+        const { data: blob, error } = await supabase.storage
+          .from(config.storageBucket)
+          .download(objectPath);
+        if (!error && blob) {
+          const buffer = Buffer.from(await blob.arrayBuffer());
+          const extraction = await extractPdfPages(buffer);
+          if (extraction.pageCount > 0) {
+            const patch: any = { page_count: extraction.pageCount };
+            if (extraction.text) patch.extracted_text = extraction.text;
+            await supabase.from("decks").update(patch).eq("id", deckId);
+            return extraction.pageCount;
           }
-          return extraction.pageCount;
+        }
+      } else if (storedPath?.startsWith("/uploads/") && isPdf) {
+        const localPath = path.join(uploadDir, storedPath.slice("/uploads/".length));
+        if (fs.existsSync(localPath)) {
+          const extraction = await extractPdfPages(fs.readFileSync(localPath));
+          if (extraction.pageCount > 0) {
+            await supabase.from("decks").update({ page_count: extraction.pageCount }).eq("id", deckId);
+            return extraction.pageCount;
+          }
         }
       }
     } catch (err) {
-      console.warn("⚠️ Deck page-count measurement failed (non-fatal):", err);
+      console.warn("⚠️ Background deck page-count measurement:", err);
     }
+    return 0;
+  };
+
+  if (fallbackCount > 0) {
+    // Return the text-derived count immediately and backfill in background
+    void backgroundBackfill();
+    return fallbackCount;
   }
 
-  // Local-fallback file on disk.
-  if (storedPath?.startsWith("/uploads/") && isPdf) {
-    try {
-      const localPath = path.join(uploadDir, storedPath.slice("/uploads/".length));
-      if (fs.existsSync(localPath)) {
-        const extraction = await extractPdfPages(fs.readFileSync(localPath));
-        if (extraction.pageCount > 0) return extraction.pageCount;
-      }
-    } catch {
-      /* fall through to the text-derived count */
-    }
-  }
+  // If no text fallback, do a fast attempt with a 1.5s timeout or return 1
+  try {
+    const measured = await Promise.race([
+      backgroundBackfill(),
+      new Promise<number>((resolve) => setTimeout(() => resolve(0), 1500)),
+    ]);
+    if (measured > 0) return measured;
+  } catch {}
 
-  return pageCountFromText(extractedText);
+  return fallbackCount > 0 ? fallbackCount : 1;
 }
 
 export const getDeckSignedUrl = async (req: Request, res: Response) => {
