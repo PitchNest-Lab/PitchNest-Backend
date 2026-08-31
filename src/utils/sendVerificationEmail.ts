@@ -6,8 +6,15 @@ import { config } from "../config/env.ts";
 const resend = new Resend(process.env.RESEND_API_KEY);
 
 export async function sendVerificationEmail(userId: string | number, email: string) {
-  // 1. Generate 6-digit OTP code
-  const token = Math.floor(100000 + Math.random() * 900000).toString();
+  // Two factors, both cryptographically random:
+  //  • token — a long, high-entropy value for the emailed LINK. Because it is
+  //    unguessable, the link's global lookup (verifyEmail) is safe.
+  //  • code  — a 6-digit value for MANUAL entry, only ever checked SCOPED to
+  //    this account (verifyEmailOtp) behind a per-record attempt lockout.
+  // Math.random() must NOT be used here: it is not cryptographically secure, so
+  // a predictable code would collapse the brute-force space.
+  const token = crypto.randomBytes(32).toString("hex");
+  const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
 
   // 2. Delete any old tokens for this user
@@ -17,9 +24,22 @@ export async function sendVerificationEmail(userId: string | number, email: stri
     .eq("user_id", userId);
 
   // 3. Save new token to Supabase
-  const { error } = await supabase
+  let { error } = await supabase
     .from("email_verification_tokens")
-    .insert({ user_id: userId, token, expires_at: expiresAt });
+    .insert({ user_id: userId, token, code, expires_at: expiresAt, attempts: 0 });
+
+  // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
+  // fall back to storing just the high-entropy link token so signup and the
+  // emailed LINK keep working. Manual 6-digit entry needs the migration.
+  if (error && /column|schema/i.test(error.message || "")) {
+    console.warn(
+      "⚠️ email_verification_tokens is missing the code/attempts columns — run migration 0012. " +
+        "Falling back to link-only verification until then.",
+    );
+    ({ error } = await supabase
+      .from("email_verification_tokens")
+      .insert({ user_id: userId, token, expires_at: expiresAt }));
+  }
 
   if (error) throw new Error("Failed to save token");
 
@@ -39,6 +59,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   try {
     const { data, error } = await resend.emails.send({
       from: config.emailFrom,
+      replyTo: config.emailReplyTo,
       to: email,
       subject: "Verify your PitchNest account",
       html: `
@@ -48,7 +69,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
             Enter this 6-digit verification code on the verification screen:
           </p>
           <div style="font-size:36px;font-weight:800;letter-spacing:6px;color:#0284c7;margin:24px 0;padding:16px;background:#f0f9ff;border-radius:12px;text-align:center;width:fit-content;margin-left:auto;margin-right:auto">
-            ${token}
+            ${code}
           </div>
           <p style="color:#4b5563;font-size:16px;line-height:24px;margin-bottom:24px;text-align:center">
             — OR —

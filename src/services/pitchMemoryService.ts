@@ -371,6 +371,43 @@ export function verifyMathematicalConsistency(state: PitchSessionState): {
 }
 
 /**
+ * Parses a metric string ("$1,000", "20 users", "1.5m") to a number, for
+ * detecting whether a re-stated metric materially changed.
+ */
+function parseMetricNumber(str?: string): number | null {
+  if (!str) return null;
+  const m = str.match(/(\d[\d,]*(?:\.\d+)?)\s*(k|m|b|thousand|million|billion)?/i);
+  if (!m) return null;
+  const base = parseFloat(m[1].replace(/,/g, ""));
+  if (isNaN(base)) return null;
+  const unit = (m[2] || "").toLowerCase();
+  const mult = unit.startsWith("k") || unit === "thousand" ? 1e3
+    : unit.startsWith("m") || unit === "million" ? 1e6
+    : unit.startsWith("b") || unit === "billion" ? 1e9
+    : 1;
+  return base * mult;
+}
+
+/**
+ * True when two stated values for the SAME metric are materially different
+ * (>5% for numbers; case-insensitive text compare otherwise). Formatting-only
+ * differences ("$1,000" vs "$1000") are NOT treated as a change.
+ */
+function metricValuesDiffer(a: string, b: string): boolean {
+  const na = parseMetricNumber(a);
+  const nb = parseMetricNumber(b);
+  if (na !== null && nb !== null) {
+    if (na === 0 && nb === 0) return false;
+    return Math.abs(na - nb) / Math.max(Math.abs(na), Math.abs(nb), 1) > 0.05;
+  }
+  return a.trim().toLowerCase() !== b.trim().toLowerCase();
+}
+
+function humanizeMetricKey(key: string): string {
+  return key.replace(/([A-Z])/g, " $1").toLowerCase().trim();
+}
+
+/**
  * Updates the pitch session state incrementally from a new founder utterance.
  */
 export function updatePitchMemory(
@@ -405,7 +442,22 @@ export function updatePitchMemory(
   // 2. Analyze Numerical Facts & Metrics
   const { numericalFacts, extractedMetrics } = analyzeNumericalFacts(text, turnIndex);
   state.numericalFacts.push(...numericalFacts);
-  Object.assign(state.metrics, extractedMetrics);
+
+  // Merge newly extracted metrics. CRITICAL: if a metric that was already
+  // stated changes to a MATERIALLY different value, preserve the discrepancy as
+  // a contradiction for the panel to probe — never silently overwrite an
+  // earlier figure (e.g. "100 users" must not vanish when "10 users" arrives).
+  for (const [key, val] of Object.entries(extractedMetrics)) {
+    if (!val) continue;
+    const prev = (state.metrics as any)[key] as string | undefined;
+    if (prev && prev !== val && metricValuesDiffer(prev, val)) {
+      const note = `Founder re-stated ${humanizeMetricKey(key)} as "${val}" after earlier saying "${prev}" — confirm which is current and why it changed.`;
+      if (!state.contradictionsDetected.includes(note)) {
+        state.contradictionsDetected.push(note);
+      }
+    }
+    (state.metrics as any)[key] = val;
+  }
 
   // If paying customers / MRR detected, upgrade inferred stage
   if (state.metrics.mrr || state.metrics.payingCustomers) {
@@ -575,4 +627,41 @@ export function buildPitchMemoryPromptBlock(state: PitchSessionState): string {
 
   parts.push(`=== END PITCH MEMORY ===`);
   return parts.join("\n");
+}
+
+/**
+ * Reconstructs pitch memory by replaying a transcript through the same
+ * incremental extractors used live. Used on RESUME (reconnect after a refresh):
+ * the per-connection state is otherwise lost, so without this the panel would
+ * forget every number/date/question from before the reconnect. Deterministic —
+ * no LLM call. Founder turns update the memory + mark the prior question
+ * answered; panel turns are recorded in the question ledger.
+ */
+export function rebuildPitchMemoryFromTranscript(
+  base: PitchSessionState,
+  transcript: Array<{
+    type?: string;
+    role?: string;
+    text?: string;
+    fullText?: string;
+    speaker?: string;
+  }>,
+): PitchSessionState {
+  let state = base;
+  if (!Array.isArray(transcript)) return state;
+
+  let turn = 0;
+  for (const m of transcript) {
+    turn++;
+    const isUser = m?.type === "user" || m?.role === "user";
+    const txt = String(m?.fullText || m?.text || "").trim();
+    if (!txt) continue;
+    if (isUser) {
+      state = updatePitchMemory(state, txt, turn);
+      recordQuestionAnswered(state, txt);
+    } else {
+      recordAskedQuestion(state, m?.speaker || "AI", txt, turn);
+    }
+  }
+  return state;
 }

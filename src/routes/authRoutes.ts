@@ -12,6 +12,7 @@ import {
   deleteAccount,
   deleteAccountByCredentials,
   verifyEmail,
+  verifyEmailOtp,
   resendEmailVerification,
   refreshToken,
 } from "../controllers/authController.ts";
@@ -39,6 +40,7 @@ router.post("/google", authLimiter, googleAuth);
 router.post("/forgot-password", authLimiter, forgotPassword);
 router.post("/reset-password", authLimiter, resetPassword);
 router.get("/verify-email", authLimiter, verifyEmail);
+router.post("/verify-email-otp", authLimiter, verifyEmailOtp);
 router.post("/resend-verification", authLimiter, resendEmailVerification);
 
 router.get("/me", authMiddleware, async (req, res) => {

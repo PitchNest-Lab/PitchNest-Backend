@@ -54,7 +54,7 @@ import { isTrialActive, FREE_TRIAL_DAYS } from "../services/entitlementService.t
 export function toPublicUser(u: any) {
   const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
   const isPaidActive = (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") && (!expiry || expiry.getTime() > Date.now());
-  const trial = isTrialActive(u?.trial_expires_at, u?.trial_status);
+  const trial = isTrialActive(u?.trial_expires_at, u?.trial_status, u?.trial_started_at);
 
   // During trial or paid plan, the user has full access
   const effectivePlan = isPaidActive ? (u.plan as string) : (trial.active ? "pro" : "free");
@@ -175,27 +175,25 @@ export const signup = async (req: Request, res: Response) => {
 
     const is_verified = existingUser?.isEmailVerified;
 
-    if (existingUser && is_verified) {
-      // Don't reveal whether the email exists — return the same generic
-      // response as a successful signup to prevent user enumeration.
-      return res.status(200).json({
-        message: "If this email is available, a verification link has been sent.",
-      });
-    }
-    if (existingUser && !is_verified) {
-      // Auto-resend verification email so user isn't stuck
-      sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
-        console.error("Failed to resend verification email on signup retry:", err);
-      });
-
-      const token = signToken({ id: existingUser.id, email: existingUser.email });
-      return res
-        .status(200)
-        .json({
-          user: toPublicUser(existingUser),
-          token,
-          message: "Verification email resent",
+    // Uniform, non-enumerating response for every existing-account case
+    // (already-verified OR exists-but-unverified). CRITICAL: we NEVER return a
+    // session token here. The previous code handed back a valid JWT for an
+    // existing *unverified* account without checking the password — anyone who
+    // knew a target's email could obtain a working login for that account. The
+    // response body is identical in both branches so it also does not reveal
+    // whether the email is registered/verified (user enumeration).
+    if (existingUser) {
+      if (!is_verified) {
+        // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
+        sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
+          console.error("Failed to resend verification email on signup retry:", err);
         });
+      }
+      return res.status(200).json({
+        requiresVerification: true,
+        email: cleanEmail,
+        message: "Check your email to verify your account.",
+      });
     }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -230,19 +228,22 @@ export const signup = async (req: Request, res: Response) => {
     if (error || !newUser)
       return res.status(500).json({ error: "Signup failed" });
 
-    const token = signToken({ id: newUser.id, email: newUser.email });
-
-    // Don't await — let it run in the background
-    sendVerificationEmail(newUser.id, email).catch((err) => {
+    // Send verification email; do NOT issue a session token. The account cannot
+    // be used until its email is verified (authMiddleware + the WS both enforce
+    // this), so returning a token here would be a usable session for an
+    // unverified account — the takeover vector we are closing. The client routes
+    // to the /verify screen on `requiresVerification`.
+    sendVerificationEmail(newUser.id, cleanEmail).catch((err) => {
       console.error("Failed to send verification email:", err);
     });
 
-    res.status(201).json({
-      // toPublicUser rather than a hand-built object so the new account's plan
-      // is present immediately — otherwise the client shows no plan until the
-      // first /me refetch and could offer paid options to a free user.
-      user: toPublicUser(newUser),
-      token,
+    // 200 (not 201) to match the existing-account branch above: a different
+    // status would let an attacker distinguish a new email from a registered
+    // one, defeating the identical-body anti-enumeration measure.
+    res.status(200).json({
+      requiresVerification: true,
+      email: cleanEmail,
+      message: "Check your email to verify your account.",
     });
   } catch (error) {
     console.error("Signup error:", error);
@@ -655,6 +656,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
     try {
       const { data, error } = await resend.emails.send({
         from: config.emailFrom,
+        replyTo: config.emailReplyTo,
         to: email,
         subject: "Reset your PitchNest password",
         html: `
@@ -769,14 +771,118 @@ export const verifyEmail = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * POST /api/auth/verify-email-otp — verify a manually-entered 6-digit code.
+ *
+ * Unlike the emailed LINK (verifyEmail, which carries a long high-entropy
+ * token), the 6-digit code is low entropy, so this path is hardened against
+ * brute force:
+ *   • SCOPED to one account — the code is only ever compared against the token
+ *     row for the user identified by `email` (never a global lookup), so a guess
+ *     can only ever attack that one account, not "any pending account".
+ *   • ATTEMPT-LOCKED — a per-record counter invalidates the code after 5 wrong
+ *     tries; the attacker must then trigger a resend (per-IP rate limited).
+ *   • CONSTANT-TIME compare, one-time use (deleted on success), TTL-checked.
+ * Responses are uniform ("Invalid or expired code.") so this cannot be used to
+ * enumerate which emails are registered/verified.
+ */
+const MAX_OTP_ATTEMPTS = 5;
+
+export const verifyEmailOtp = async (req: Request, res: Response) => {
+  try {
+    const { email, code } = req.body;
+    if (!email || !code) {
+      return res.status(400).json({ message: "Email and code are required." });
+    }
+    const cleanEmail = String(email).toLowerCase().trim();
+    const cleanCode = String(code).trim();
+    const GENERIC = "Invalid or expired code.";
+
+    const { data: user } = await supabase
+      .from("users")
+      .select("id, email, name, onboardingCompleted, isEmailVerified")
+      .eq("email", cleanEmail)
+      .maybeSingle();
+
+    if (!user) return res.status(400).json({ message: GENERIC });
+
+    // Already verified — there is nothing to verify, and NO valid code exists
+    // (the token row is deleted on verification). CRITICAL: do NOT mint a
+    // session token here. This endpoint trusts only the `email` in the body, so
+    // issuing a JWT without a matching code would be account takeover — any
+    // known verified email would yield a free session. Point the user at login.
+    if (user.isEmailVerified) {
+      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+      return res.status(200).json({
+        alreadyVerified: true,
+        message: "Email already verified. Please log in.",
+      });
+    }
+
+    const { data: record } = await supabase
+      .from("email_verification_tokens")
+      .select("*")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    // No row, or a legacy row with no `code` column populated (pre-migration
+    // link-only token) — cannot verify by code; the user must use the link.
+    if (!record || !record.code) return res.status(400).json({ message: GENERIC });
+
+    if (new Date(record.expires_at) < new Date()) {
+      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+      return res.status(400).json({ message: "Code expired. Please request a new one." });
+    }
+
+    if ((record.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
+      // Burn the code so a locked-out attacker cannot keep guessing this window.
+      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+      return res.status(429).json({ message: "Too many incorrect attempts. Please request a new code." });
+    }
+
+    // Constant-time compare so timing can't leak the code digit by digit.
+    const stored = Buffer.from(String(record.code));
+    const given = Buffer.from(cleanCode);
+    const match = stored.length === given.length && crypto.timingSafeEqual(stored, given);
+
+    if (!match) {
+      await supabase
+        .from("email_verification_tokens")
+        .update({ attempts: (record.attempts ?? 0) + 1 })
+        .eq("user_id", user.id);
+      return res.status(400).json({ message: GENERIC });
+    }
+
+    await supabase.from("users").update({ isEmailVerified: true }).eq("id", user.id);
+    await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+
+    const token = signToken({ id: user.id, email: user.email });
+    return res.json({
+      user: toPublicUser(user),
+      token,
+      message: "Email verified successfully",
+      redirectTo: user.onboardingCompleted ? "/dashboard" : "/onboarding",
+    });
+  } catch (error) {
+    console.error("verifyEmailOtp error:", error);
+    return res.status(500).json({ message: "Failed to verify code." });
+  }
+};
+
 export const resendEmailVerification = async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
+    // Normalize exactly as signup does (it stores email.toLowerCase().trim()).
+    // Without this the lookup misses whenever the address carries any capital
+    // letter — and the /verify screen forwards it AS TYPED — so this endpoint
+    // returned "Verification email resent" while sending nothing at all.
+    // maybeSingle() because zero rows is an expected outcome here, not an error.
+    const cleanEmail = String(email || "").toLowerCase().trim();
     const { data: user } = await supabase
       .from("users")
       .select("id, isEmailVerified")
-      .eq("email", email)
-      .single();
+      .eq("email", cleanEmail)
+      .maybeSingle();
 
     // Always return success — don't reveal whether the email exists or is
     // already verified. This prevents user enumeration via this endpoint.
@@ -785,7 +891,7 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
     }
 
     // Don't block the response on email delivery
-    sendVerificationEmail(user.id, email).catch((err) => {
+    sendVerificationEmail(user.id, cleanEmail).catch((err) => {
       console.error("Failed to resend verification email:", err);
     });
 

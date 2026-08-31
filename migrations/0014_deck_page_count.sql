@@ -1,0 +1,31 @@
+-- Migration 0014: Record the real page count of an uploaded deck.
+--
+-- Run once against Supabase (SQL editor or psql). Idempotent — safe to re-run.
+--
+-- ──────────────────────────────────────────────────────────────────────────────
+-- WHY
+-- ──────────────────────────────────────────────────────────────────────────────
+-- The deck viewer presents ONE slide at a time and labels it "Slide 2 of 10", so
+-- it needs an authoritative total. The document itself is the only honest source
+-- of that number, and only the backend ever parses the document (pdf-parse, at
+-- upload time) — the frontend receives a short-lived signed URL and renders it,
+-- it never counts pages.
+--
+-- Deriving the total from `extracted_text` instead does not work:
+--   • an image-only deck extracts to no text at all but still has pages, and
+--   • decks uploaded before the page-boundary fix (deckTextService) had their
+--     form feeds collapsed away, so their stored text reads as a single page.
+-- Both cases would show "Slide 1 of 1" over a deck the founder can see has more,
+-- which is exactly the fake-pagination failure this feature must avoid.
+--
+-- So the count is stored once, at upload, straight from the parsed document.
+--
+-- NULLABLE ON PURPOSE: every deck that already exists has NULL here. The read
+-- path (deckController.getDeckSignedUrl) treats NULL as "not measured yet" and
+-- backfills it — and re-extracts that deck's page-delimited text at the same
+-- time — the first time the deck is opened. Nothing is deleted or rewritten in
+-- bulk, and a deck whose file is gone from storage simply keeps NULL and falls
+-- back to a single-page presentation.
+
+ALTER TABLE decks
+  ADD COLUMN IF NOT EXISTS page_count integer;

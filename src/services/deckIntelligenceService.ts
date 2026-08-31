@@ -6,6 +6,8 @@
  * maps speech to the relevant slide and detects updates vs contradictions.
  */
 
+import { sanitizeDeckText } from "../utils/aiTextSanitizer.ts";
+
 export interface StructuredSlide {
   slideNumber: number;
   title: string;
@@ -41,9 +43,10 @@ const TOPIC_KEYWORDS: Record<StructuredSlide["topic"], RegExp> = {
  * Parses raw extracted deck text into structured slides.
  */
 export function parseDeckIntoSlides(rawText: string, deckName: string = "Pitch Deck"): DeckIntelligence {
+  const cleanDeckName = sanitizeDeckText(deckName) || "Pitch Deck";
   if (!rawText || !rawText.trim()) {
     return {
-      deckName,
+      deckName: cleanDeckName,
       totalSlides: 0,
       slides: [],
       summary: "No text content available.",
@@ -53,7 +56,14 @@ export function parseDeckIntoSlides(rawText: string, deckName: string = "Pitch D
   // 1. Split on page break characters (\f) or header patterns (--- / Slide X / Page X)
   let rawChunks: string[] = [];
   if (rawText.includes("\f")) {
-    rawChunks = rawText.split("\f").map(s => s.trim()).filter(Boolean);
+    // Form feeds are REAL page boundaries written by the extractor (one per PDF
+    // page), so an empty chunk means an image-only page — it must keep its
+    // position. Filtering empties here would renumber every later slide, and
+    // then "Slide 7" in the AI's context would not be the seventh page the
+    // founder is looking at in the viewer. The other two branches below are
+    // heuristic splits with no real page numbering to preserve, so they still
+    // drop empties.
+    rawChunks = rawText.split("\f").map(s => s.trim());
   } else if (/\n\s*(?:---+|===+|Slide\s+\d+|Page\s+\d+)\s*\n/i.test(rawText)) {
     rawChunks = rawText.split(/\n\s*(?:---+|===+|Slide\s+\d+|Page\s+\d+)\s*\n/i).map(s => s.trim()).filter(Boolean);
   } else {
@@ -76,46 +86,48 @@ export function parseDeckIntoSlides(rawText: string, deckName: string = "Pitch D
 
   const slides: StructuredSlide[] = rawChunks.map((chunk, idx) => {
     const slideNumber = idx + 1;
-    const lines = chunk.split("\n").map(l => l.trim()).filter(Boolean);
+    const cleanChunk = sanitizeDeckText(chunk);
+    const lines = cleanChunk.split("\n").map(l => l.trim()).filter(Boolean);
     const firstLine = lines[0] || "";
     
     // Extract title (use first line if clean, or "Slide X")
     let title = `Slide ${slideNumber}`;
     if (firstLine.length > 2 && firstLine.length < 60 && !/^[\d\s.,$₦%]+$/.test(firstLine)) {
-      title = firstLine.replace(/^[#\-*\d.]+\s*/, "");
+      title = sanitizeDeckText(firstLine.replace(/^[#\-*\d.]+\s*/, ""));
     }
 
     // Infer topic from content
     let topic: StructuredSlide["topic"] = "General";
     for (const [t, regex] of Object.entries(TOPIC_KEYWORDS) as [StructuredSlide["topic"], RegExp][]) {
-      if (t !== "General" && (regex.test(title) || regex.test(chunk))) {
+      if (t !== "General" && (regex.test(title) || regex.test(cleanChunk))) {
         topic = t;
         break;
       }
     }
 
     // Extract key numbers
-    const numberMatches = chunk.match(/(?:[₦$£€]\s?|\bngn\s?|\busd\s?)?\d[\d,]*(?:\.\d+)?\s*(?:%|k\b|m\b|bn\b|x\b|million|billion|users?|customers?|arr|mrr)?/gi) || [];
-    const keyNumbers = Array.from(new Set(numberMatches.map(n => n.trim()).filter(n => n.length > 1))).slice(0, 5);
+    const numberMatches = cleanChunk.match(/(?:[₦$£€]\s?|\bngn\s?|\busd\s?)?\d[\d,]*(?:\.\d+)?\s*(?:%|k\b|m\b|bn\b|x\b|million|billion|users?|customers?|arr|mrr)?/gi) || [];
+    const keyNumbers = Array.from(new Set(numberMatches.map(n => sanitizeDeckText(n.trim())).filter(n => n.length > 1))).slice(0, 5);
 
     // Extract key claims / bullet points
     const keyClaims = lines
       .filter(l => l.length > 15 && l !== firstLine)
-      .map(l => l.replace(/^[-*•\d.]+\s*/, "").trim())
+      .map(l => sanitizeDeckText(l.replace(/^[-*•\d.]+\s*/, "").trim()))
+      .filter(Boolean)
       .slice(0, 4);
 
     return {
       slideNumber,
       title,
       topic,
-      rawText: chunk.slice(0, 1000),
+      rawText: cleanChunk.slice(0, 1000),
       keyNumbers,
       keyClaims,
     };
   });
 
   return {
-    deckName,
+    deckName: cleanDeckName,
     totalSlides: slides.length,
     slides,
     summary: `Structured deck with ${slides.length} slides covering ${Array.from(new Set(slides.map(s => s.topic))).join(", ")}.`,
@@ -140,8 +152,19 @@ export function inferActiveSlide(
   for (const slide of deck.slides) {
     let score = 0;
     // Match topic keywords
+    // Image-only pages hold their position in the deck but have no text to match
+    // against, so they can never be inferred from speech. They are still
+    // reachable — the viewer reports the page the founder is actually on.
+    if (!slide.rawText.trim()) continue;
+
     const topicRegex = TOPIC_KEYWORDS[slide.topic];
-    if (topicRegex && topicRegex.test(speechLower)) {
+    // "General" means UNCLASSIFIED, and its pattern is /.*/ — which matches any
+    // speech at all. Granting it the topic bonus made every unclassified slide
+    // score 3 (over the >= 2 threshold) for completely unrelated speech, so the
+    // first such slide was reported as the active one no matter what the founder
+    // said. An unclassified slide must earn its score from titles, numbers and
+    // claims like any other.
+    if (topicRegex && slide.topic !== "General" && topicRegex.test(speechLower)) {
       score += 3;
     }
 
@@ -189,6 +212,16 @@ export function buildStructuredDeckContextBlock(deck: DeckIntelligence): string 
   parts.push(`TOTAL SLIDES: ${deck.totalSlides}`);
 
   for (const slide of deck.slides) {
+    // A page with no extractable text (image-only slide) still occupies its real
+    // page number. Say so plainly rather than emitting an empty line, so the
+    // model knows the slide exists and that it has nothing to read from it —
+    // instead of inferring the deck skips a number.
+    if (!slide.rawText.trim()) {
+      parts.push(
+        `- Slide ${slide.slideNumber}: (image or chart only — no readable text; ask the founder to describe it)`,
+      );
+      continue;
+    }
     const numLine = slide.keyNumbers.length > 0 ? ` [Key figures: ${slide.keyNumbers.join(", ")}]` : "";
     const claims = slide.keyClaims.length > 0 ? ` | Points: ${slide.keyClaims.join("; ")}` : "";
     parts.push(`- Slide ${slide.slideNumber} (${slide.title} — Topic: ${slide.topic}):${numLine}${claims}`);

@@ -476,25 +476,29 @@ const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Be highly conversational and human. When responding or answering a question, occasionally start with natural spoken filler words or transitions (e.g. "Hmm,", "Well,", "Actually,", "Right,", "Got it," or "Fair point,"). Use these sparingly.
 - Be aware of the remaining pitch time metadata (e.g., \`[PITCH TIME REMAINING: ...]\`). Do not start complex new topics when less than 2 minutes remain; instead, guide the founder to summarize, handle final remarks, or conclude.`;
 
+import { sanitizeDeckText } from "../utils/aiTextSanitizer.ts";
+
 function buildDeckContext(deckName: string, extractedDeckText: string, structuredDeck?: DeckIntelligence): string {
+  const cleanDeckName = sanitizeDeckText(deckName) || "Pitch Deck";
   if (structuredDeck && structuredDeck.slides.length > 0) {
     return buildStructuredDeckContextBlock(structuredDeck);
   }
   if (!extractedDeckText?.trim()) {
     return deckName && deckName !== "None Loaded"
-      ? `PITCH DECK: "${deckName}" is attached but text could not be extracted. Ask the founder to walk through key slides.`
+      ? `PITCH DECK: "${cleanDeckName}" is attached but text could not be extracted. Ask the founder to walk through key slides.`
       : "PITCH DECK: None provided. Base questions on what the founder says live.";
   }
 
-  const parsed = parseDeckIntoSlides(extractedDeckText, deckName);
+  const cleanExtracted = sanitizeDeckText(extractedDeckText);
+  const parsed = parseDeckIntoSlides(cleanExtracted, cleanDeckName);
   if (parsed.slides.length > 0) {
     return buildStructuredDeckContextBlock(parsed);
   }
 
-  const trimmed = extractedDeckText.trim().slice(0, DECK_TEXT_LIMIT);
-  const truncated = extractedDeckText.length > DECK_TEXT_LIMIT ? "\n[Deck text truncated for length]" : "";
+  const trimmed = cleanExtracted.trim().slice(0, DECK_TEXT_LIMIT);
+  const truncated = cleanExtracted.length > DECK_TEXT_LIMIT ? "\n[Deck text truncated for length]" : "";
 
-  return `PITCH DECK — "${deckName}" (read this carefully before questioning):
+  return `PITCH DECK — "${cleanDeckName}" (read this carefully before questioning):
 ${trimmed}${truncated}
 
 DECK INSTRUCTIONS:
@@ -1367,7 +1371,13 @@ RULES:
     const response = await openai.chat.completions.create({
       model: config.azureOpenAiDeployment || "gpt-4o",
       messages: [{ role: "user", content: prompt }],
-      max_completion_tokens: 800,
+      // The card is three short strings — term ≤ 24 chars, definition ≤ 90, tip
+      // ≤ 120 — so the whole JSON object fits comfortably inside ~120 tokens.
+      // The old budget of 800 let the model keep generating long after the card
+      // was complete, and the hint is non-streaming: the founder waits for the
+      // LAST token before the card appears. 220 leaves generous headroom for
+      // JSON punctuation and a verbose model while cutting the tail latency.
+      max_completion_tokens: 220,
       response_format: { type: "json_object" },
     });
     const raw = response.choices[0]?.message?.content?.trim() || "";

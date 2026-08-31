@@ -25,6 +25,12 @@ export const config = {
   // NODE_ENV=development explicitly in .env / npm scripts.
   nodeEnv: process.env.NODE_ENV || "production",
   emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
+  // Where user REPLIES go. This is deliberately a different address from
+  // emailFrom: Resend will only send from a domain we have verified by DNS, and
+  // gmail.com can never be verified (it returns 403 "domain is not verified"),
+  // so a Gmail address cannot be the sender. Reply-To is the supported way to
+  // route replies into that inbox while still sending from pitchnest.app.
+  emailReplyTo: process.env.EMAIL_REPLY_TO || "pitchnestapp@gmail.com",
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
@@ -95,15 +101,19 @@ const ANNUAL_DAYS = process.env.PRO_ANNUAL_DAYS
   ? Number(process.env.PRO_ANNUAL_DAYS)
   : 365;
 
-// Amounts per (plan, term). Founder (Prep) = $8.00/mo, Pro Founder = $15.00/mo.
+// Amounts per (plan, term). Founder (Prep) = $9.99/mo, Pro Founder = $15.00/mo
+// (matches the published pricing deck). Annual defaults to 10x the monthly
+// (≈2 months free), kept to 2 decimals so $9.99/mo → $99.90/yr not $100.
+const FOUNDER_MONTHLY = envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 9.99));
+const twoDp = (n: number) => Math.round(n * 100) / 100;
 const PLAN_AMOUNTS: Record<PaidPlan, Record<BillingTerm, number>> = {
   prep: {
-    monthly: envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 8.00)),
-    annual: envAmount("FOUNDER_ANNUAL_AMOUNT", Math.round(envAmount("FOUNDER_PLAN_AMOUNT", 8.00) * 10)),
+    monthly: FOUNDER_MONTHLY,
+    annual: envAmount("FOUNDER_ANNUAL_AMOUNT", twoDp(FOUNDER_MONTHLY * 10)),
   },
   pro: {
     monthly: config.proPlanAmount,
-    annual: envAmount("PRO_ANNUAL_AMOUNT", Math.round(config.proPlanAmount * 10)),
+    annual: envAmount("PRO_ANNUAL_AMOUNT", twoDp(config.proPlanAmount * 10)),
   },
 };
 

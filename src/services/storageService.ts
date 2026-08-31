@@ -1,6 +1,7 @@
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import jwt from "jsonwebtoken";
 import { config } from "../config/env.ts";
 
 // Set uploads directory based on environment (local vs GAE/GCF /tmp)
@@ -11,6 +12,27 @@ export const uploadDir = config.isGoogleCloud
 // Ensure directory exists
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
+}
+
+/**
+ * Make a client-supplied filename safe to embed in a storage object key OR a
+ * local filesystem path.
+ *
+ * WHY: `req.file.originalname` is fully attacker-controlled. Both upload
+ * controllers build `path.join(uploadDir, `${Date.now()}_${originalname}`)` on
+ * the Supabase-failure fallback, so a name like `../../../../etc/cron.d/x`
+ * escaped the uploads directory and wrote attacker bytes to an arbitrary path.
+ * This strips ALL directory components (basename, after normalising Windows
+ * back-slashes) and restricts to a conservative charset, so the result can
+ * never contain `/`, `\`, or `..` and cannot traverse out of its prefix.
+ */
+export function sanitizeUploadName(original: string | undefined | null): string {
+  const base = path.basename(String(original ?? "").replace(/\\/g, "/"));
+  const cleaned = base
+    .replace(/[^a-zA-Z0-9._-]/g, "_") // keep only safe path characters
+    .replace(/^\.+/, "") // no leading dots — kills ".." and hidden files
+    .slice(0, 100);
+  return cleaned || "file";
 }
 
 // Configured multer instance with 500MB size limit (perfect for long webm uploads)
@@ -58,11 +80,86 @@ export const avatarUpload = makeUpload(
 );
 
 /**
- * Session recordings. Still large by necessity, but capped well below 500 MB and
- * restricted to the container types the recorder actually produces.
+ * Session recordings — AUDIO only in practice.
+ *
+ * The recorder calls getUserMedia with video: false, so what arrives here is an
+ * audio track in a WebM/MP4 container. The video/* types stay in the allow-list
+ * because a browser may label an audio-only MediaRecorder blob "video/webm"
+ * depending on the mimeType the recorder negotiated, and rejecting that would
+ * silently lose the founder's recording (and with it, replay).
  */
 export const videoUpload = makeUpload(
-  ["video/webm", "video/mp4", "audio/webm", "audio/mpeg", "audio/mp4"],
+  ["video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4"],
   150 * 1024 * 1024,
-  "video",
+  "recording",
 );
+
+// ── Signed local-file delivery (S7) ─────────────────────────────────────────
+// Local-fallback files (written to disk when Supabase Storage errors) used to
+// be served by an UNPROTECTED `express.static('/uploads')` mount — anyone who
+// learned or guessed a filename could read a deck or video with no auth. That
+// mount is gone; local files are now delivered only through a token-gated
+// route (GET /api/files/:name?token=...) that mirrors the Supabase signed-URL
+// model: the deck's owner fetches a short-lived token (minted by the already-
+// authenticated getDeckSignedUrl), and the browser loads the file with the
+// token in the query string — iframe/`window.open` can't send Authorization
+// headers, so a capability token is the only way to render a private file.
+
+/** Tokens live 5 minutes — long enough to load a pitch, short enough to be
+ * worthless if leaked into a log or browser history. Same TTL as Supabase
+ * signed URLs (SIGNED_URL_TTL_SECONDS). */
+const LOCAL_FILE_TOKEN_TTL_SECONDS = 300;
+
+/**
+ * Mints a relative URL for a local-fallback file, signed with the app's JWT
+ * secret. Ownership is enforced by the CALLER (getDeckSignedUrl already ran
+ * authMiddleware and matched the deck row to req.user.id before calling this),
+ * then re-verified from the DB at serve time by the file route.
+ *
+ * @param name    the sanitized filename as stored under /uploads/...
+ * @param userId  the owner whose decks may fetch this file
+ * @param ttlSeconds  override the default lifetime. Audio replay needs a longer
+ *   window than a deck load: an <audio> element re-requests byte ranges while
+ *   the founder listens and seeks, so a 5-minute token would start failing
+ *   part-way through a 30-minute pitch.
+ */
+export function signLocalFileUrl(
+  name: string,
+  userId: number,
+  ttlSeconds: number = LOCAL_FILE_TOKEN_TTL_SECONDS,
+): string {
+  const token = jwt.sign(
+    { file: name, uid: userId },
+    config.jwtSecret,
+    { expiresIn: ttlSeconds },
+  );
+  return `/api/files/${encodeURIComponent(name)}?token=${token}`;
+}
+
+/**
+ * Verifies a local-file token against the requested filename. Returns the
+ * owner's uid, or null when the token is missing/expired/tampered or was
+ * minted for a different file (a token must never be reusable across files).
+ */
+export function verifyLocalFileToken(
+  token: unknown,
+  name: string,
+): number | null {
+  if (typeof token !== "string" || !token) return null;
+  try {
+    const payload = jwt.verify(token, config.jwtSecret) as {
+      file?: unknown;
+      uid?: unknown;
+    };
+    if (
+      typeof payload.file !== "string" ||
+      payload.file !== name ||
+      typeof payload.uid !== "number"
+    ) {
+      return null;
+    }
+    return payload.uid;
+  } catch {
+    return null;
+  }
+}

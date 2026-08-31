@@ -8,12 +8,12 @@ ALTER TABLE users
   ADD COLUMN IF NOT EXISTS trial_expires_at timestamptz DEFAULT (now() + interval '30 days'),
   ADD COLUMN IF NOT EXISTS trial_status text DEFAULT 'active';
 
--- 2. Grant 30-day full access to all existing accounts
+-- 2. Grant 30-day full access to all existing accounts that do not have trial timestamps set
 UPDATE users
    SET trial_started_at = COALESCE(trial_started_at, now()),
-       trial_expires_at = GREATEST(COALESCE(trial_expires_at, now()), now() + interval '30 days'),
+       trial_expires_at = COALESCE(trial_expires_at, now() + interval '30 days'),
        trial_status = 'active'
- WHERE trial_expires_at IS NULL OR trial_expires_at <= now();
+ WHERE trial_started_at IS NULL AND trial_expires_at IS NULL;
 
 -- 3. Update plan constraint if needed
 ALTER TABLE users DROP CONSTRAINT IF EXISTS users_plan_check;

@@ -4,10 +4,10 @@ import helmet from "helmet";
 import path from "path";
 import fs from "fs";
 import { config } from "./config/env.ts";
-import { uploadDir } from "./services/storageService.ts";
 import authRoutes from "./routes/authRoutes.ts";
 import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
+import fileRoutes from "./routes/fileRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
@@ -79,8 +79,10 @@ app.use("/api/billing/webhook", express.raw({ type: "application/json", limit: "
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
-// Serve local uploads statically
-app.use('/uploads', express.static(uploadDir));
+// Local-fallback files are delivered ONLY via the token-gated /api/files route
+// (S7) — the previous unauthenticated static mount let anyone who knew a
+// filename read another user's deck or video. No raw /uploads serving.
+app.use("/api/files", fileRoutes);
 
 // API Routers
 app.use("/api/auth", authRoutes);

@@ -1,15 +1,25 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
-import { uploadDir } from "../services/storageService.ts";
+import { uploadDir, sanitizeUploadName } from "../services/storageService.ts";
 import path from "path";
 import fs from "fs";
 
+/**
+ * Stores a completed session's AUDIO recording.
+ *
+ * The route is still called /api/upload-video and still answers with `videoUrl`.
+ * Both names are historical: the recorder has always captured audio only
+ * (getUserMedia is called with video: false), and the founder's camera is never
+ * recorded or uploaded. Renaming the route or the response key would break the
+ * live web client and the mobile client for no functional gain, so the contract
+ * is left exactly as it was — see sessions.video_url for the same reasoning.
+ */
 export const uploadVideo = async (req: Request, res: Response) => {
   try {
-    if (!req.file) return res.status(400).json({ error: "No video file provided" });
+    if (!req.file) return res.status(400).json({ error: "No audio file provided" });
 
-    const originalName = req.file.originalname || `pitch.webm`;
+    const originalName = sanitizeUploadName(req.file.originalname || `pitch.webm`);
     const filePath = `pitches/${Date.now()}_${originalName}`;
 
     const { data, error } = await supabase.storage
@@ -27,8 +37,8 @@ export const uploadVideo = async (req: Request, res: Response) => {
     }
 
     // Item A: the bucket is private, so return the BARE object path — never a
-    // public URL. Videos are write-only (uploaded, never replayed in the app),
-    // so a private bucket alone fully protects them; the deletion path derives
+    // public URL. Playback goes through GET /api/sessions/:id/recording, which
+    // signs this path on demand for the owner only; the deletion path derives
     // the same path to clean up on account purge.
     res.status(200).json({ videoUrl: filePath });
   } catch (error) {

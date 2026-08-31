@@ -1,11 +1,15 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
-import { uploadDir } from "../services/storageService.ts";
+import { uploadDir, sanitizeUploadName, signLocalFileUrl } from "../services/storageService.ts";
 import { auditDeck } from "../services/aiService.ts";
 import { generateDeckAuditPDF } from "../services/pdfService.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
-import { parseDeckIntoSlides } from "../services/deckIntelligenceService.ts";
+import {
+  extractPdfPages,
+  extractPlainTextDeck,
+  pageCountFromText,
+} from "../services/deckTextService.ts";
 import path from "path";
 import fs from "fs";
 
@@ -18,33 +22,35 @@ export const uploadDeck = async (req: Request, res: Response) => {
     if (!req.file) return res.status(400).json({ error: "No deck file provided" });
     
     const userId = req.user?.id;
-    const originalName = req.file.originalname.replace(/\s+/g, '_');
+    const originalName = sanitizeUploadName(req.file.originalname);
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
     const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
     const filePath = `decks/${Date.now()}_${originalName}`;
 
     let extractedText = "";
+    let pageCount = 0;
+    // Text extraction MUST keep page boundaries (\f) — that is what makes the
+    // deck one slide per page for both the viewer and the AI's slide context.
+    // See deckTextService for why normalising with /\s{2,}/ destroyed them.
     if (req.file.mimetype === "application/pdf") {
-      try {
-        const { PDFParse } = await import("pdf-parse");
-        const parser = new PDFParse({ data: req.file.buffer });
-        const result = await parser.getText();
-        extractedText = (result.text || "").replace(/\s{2,}/g, " ").trim();
-        await parser.destroy();
-        console.log("✅ Extracted PDF text. Length:", extractedText.length);
-      } catch (err) {
-        console.warn("⚠️ Failed to parse PDF text:", err);
-      }
+      const extraction = await extractPdfPages(req.file.buffer);
+      extractedText = extraction.text;
+      pageCount = extraction.pageCount;
+      console.log(
+        `✅ Extracted PDF text. Length: ${extractedText.length}, pages: ${pageCount}`,
+      );
     } else if (
       req.file.mimetype === "text/plain" ||
       originalName.endsWith(".txt") ||
       originalName.endsWith(".md")
     ) {
-      extractedText = req.file.buffer.toString("utf-8").replace(/\s{2,}/g, " ").trim();
-      console.log("✅ Extracted plain-text deck. Length:", extractedText.length);
+      const extraction = extractPlainTextDeck(req.file.buffer.toString("utf-8"));
+      extractedText = extraction.text;
+      pageCount = extraction.pageCount;
+      console.log(
+        `✅ Extracted plain-text deck. Length: ${extractedText.length}, sections: ${pageCount}`,
+      );
     }
-
-    const structuredDeck = parseDeckIntoSlides(extractedText, deckName);
 
     const { data, error } = await supabase.storage
       .from(config.storageBucket)
@@ -67,20 +73,37 @@ export const uploadDeck = async (req: Request, res: Response) => {
       publicUrl = filePath;
     }
 
-    const insertData: any = { 
-      name: deckName, 
-      file_url: publicUrl, 
-      size: sizeMB, 
-      status: 'READY', 
+    const insertData: any = {
+      name: deckName,
+      file_url: publicUrl,
+      size: sizeMB,
+      status: 'READY',
       extracted_text: extractedText,
+      page_count: pageCount || null,
       user_id: userId
     };
 
-    const { data: dbData, error: dbError } = await supabase
+    let { data: dbData, error: dbError } = await supabase
       .from("decks")
       .insert([insertData])
       .select()
       .single();
+
+    // Rollout safety: page_count arrives with migration 0014. If it isn't there
+    // yet, save the deck without it rather than failing the upload — the read
+    // path treats a missing count as "not measured yet".
+    if (dbError && /column|schema/i.test(dbError.message || "")) {
+      console.warn(
+        "⚠️ Deck insert failed (possibly missing page_count column) — retrying without it:",
+        dbError.message,
+      );
+      const { page_count, ...legacyInsert } = insertData;
+      ({ data: dbData, error: dbError } = await supabase
+        .from("decks")
+        .insert([legacyInsert])
+        .select()
+        .single());
+    }
 
     if (dbError) {
       console.error("❌ Supabase insertion failed in uploadDeck:", dbError);
@@ -93,6 +116,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
       file_url: dbData.file_url,
       size: dbData.size,
       status: dbData.status,
+      page_count: dbData.page_count ?? pageCount ?? null,
       extracted_text: extractedText
     });
   } catch (error) { 
@@ -129,9 +153,84 @@ export const listDecks = async (req: Request, res: Response) => {
 // The pitch-media bucket is private, so decks can no longer be loaded via a
 // public URL. This returns a short-lived signed URL for the OWNER's deck only.
 // Ownership is enforced by the user_id match — a signed URL is never issued for
-// a deck the caller does not own. Local-fallback decks ("/uploads/..") and any
-// non-storage value are returned as-is so dev and legacy rows still render.
+// a deck the caller does not own. Local-fallback decks ("/uploads/..") are
+// served through the token-gated /api/files route (S7) — the raw path itself is
+// no longer publicly reachable. Any other non-storage value is returned as-is
+// so dev and legacy rows still render.
 const SIGNED_URL_TTL_SECONDS = 300; // 5 min — long enough for a pitch to load it
+
+/**
+ * Measure a deck's real page count, backfilling it (and its page-delimited
+ * text) for decks stored before that was recorded.
+ *
+ * WHY HERE: the viewer needs an authoritative "of N" the moment a deck opens,
+ * and decks uploaded before deckTextService existed have neither a page_count
+ * nor form feeds in their extracted text — so they would present as one slide
+ * over a document the founder can see has more. Re-parsing the stored file once,
+ * lazily, on first open repairs both without a bulk data migration and without
+ * touching any deck whose file is no longer in storage.
+ *
+ * Never throws: a deck that cannot be measured falls back to whatever its text
+ * implies, and a count of 0 simply means the viewer presents it as a single page.
+ */
+async function resolveDeckPageCount(
+  deckId: string,
+  storedPath: string | null,
+  knownCount: number | null,
+  extractedText: string | null,
+): Promise<number> {
+  if (knownCount && knownCount > 0) return knownCount;
+
+  const objectPath = storedPath ? storagePathFromUrl(storedPath) : null;
+  const isPdf = (storedPath || "").toLowerCase().endsWith(".pdf");
+
+  // Re-parse from storage — the only way to learn the true count.
+  if (objectPath && isPdf) {
+    try {
+      const { data: blob, error } = await supabase.storage
+        .from(config.storageBucket)
+        .download(objectPath);
+      if (!error && blob) {
+        const buffer = Buffer.from(await blob.arrayBuffer());
+        const extraction = await extractPdfPages(buffer);
+        if (extraction.pageCount > 0) {
+          const patch: any = { page_count: extraction.pageCount };
+          // Only replace the stored text when re-extraction actually produced
+          // some — never overwrite existing text with nothing.
+          if (extraction.text) patch.extracted_text = extraction.text;
+          const { error: patchErr } = await supabase
+            .from("decks")
+            .update(patch)
+            .eq("id", deckId);
+          if (patchErr) {
+            console.warn(
+              "⚠️ Could not backfill deck page_count (non-fatal):",
+              patchErr.message,
+            );
+          }
+          return extraction.pageCount;
+        }
+      }
+    } catch (err) {
+      console.warn("⚠️ Deck page-count measurement failed (non-fatal):", err);
+    }
+  }
+
+  // Local-fallback file on disk.
+  if (storedPath?.startsWith("/uploads/") && isPdf) {
+    try {
+      const localPath = path.join(uploadDir, storedPath.slice("/uploads/".length));
+      if (fs.existsSync(localPath)) {
+        const extraction = await extractPdfPages(fs.readFileSync(localPath));
+        if (extraction.pageCount > 0) return extraction.pageCount;
+      }
+    } catch {
+      /* fall through to the text-derived count */
+    }
+  }
+
+  return pageCountFromText(extractedText);
+}
 
 export const getDeckSignedUrl = async (req: Request, res: Response) => {
   try {
@@ -140,12 +239,23 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { data: deck, error } = await supabase
+    // page_count arrives with migration 0014 — degrade to the legacy column set
+    // if it isn't deployed yet rather than failing the deck open.
+    let { data: deck, error } = await supabase
       .from("decks")
-      .select("file_url")
+      .select("file_url, page_count, extracted_text")
       .eq("id", req.params.id)
       .eq("user_id", userId)
       .maybeSingle();
+
+    if (error && /column|schema/i.test(error.message || "")) {
+      ({ data: deck, error } = await supabase
+        .from("decks")
+        .select("file_url, extracted_text")
+        .eq("id", req.params.id)
+        .eq("user_id", userId)
+        .maybeSingle());
+    }
 
     if (error) {
       console.error("❌ Supabase query error in getDeckSignedUrl:", error);
@@ -155,16 +265,30 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
 
     const stored = deck.file_url as string | null;
 
-    // Local-fallback file or empty — nothing to sign; hand back what we have.
-    if (!stored || stored.startsWith("/uploads/")) {
-      return res.json({ url: stored || "" });
+    if (!stored) {
+      return res.json({ url: "", pageCount: 0 });
+    }
+
+    const pageCount = await resolveDeckPageCount(
+      req.params.id,
+      stored,
+      (deck as any).page_count ?? null,
+      (deck as any).extracted_text ?? null,
+    );
+
+    // Local-fallback file — the raw /uploads path is no longer publicly served
+    // (S7). Mint a short-lived capability URL bound to this owner + filename;
+    // the /api/files route re-verifies ownership from the decks table.
+    if (stored.startsWith("/uploads/")) {
+      const name = stored.slice("/uploads/".length);
+      return res.json({ url: signLocalFileUrl(name, userId), pageCount });
     }
 
     const objectPath = storagePathFromUrl(stored);
     if (!objectPath) {
       // Unrecognized (e.g. an external URL we didn't store) — return as-is
       // rather than 500, so an odd legacy row still renders.
-      return res.json({ url: stored });
+      return res.json({ url: stored, pageCount });
     }
 
     const { data: signed, error: signErr } = await supabase.storage
@@ -176,7 +300,7 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to sign deck URL" });
     }
 
-    res.json({ url: signed.signedUrl });
+    res.json({ url: signed.signedUrl, pageCount });
   } catch (err) {
     console.error("❌ getDeckSignedUrl exception:", err);
     res.status(500).json({ error: "Failed to sign deck URL" });

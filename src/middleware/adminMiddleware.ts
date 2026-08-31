@@ -15,12 +15,11 @@ import { config } from "../config/env.ts";
  * existence is never advertised to an unauthenticated caller.
  */
 function timingSafeMatch(a: string, b: string): boolean {
-  const ab = Buffer.from(a, "utf8");
-  const bb = Buffer.from(b, "utf8");
-  // timingSafeEqual throws on length mismatch, so guard first. Comparing against
-  // a fixed-length hash keeps the mismatch branch from leaking length via timing.
-  if (ab.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ab, bb);
+  if (!a || !b) return false;
+  // Compare fixed-length SHA-256 digests so lengths never leak via early return timing
+  const hashA = crypto.createHash("sha256").update(Buffer.from(a, "utf8")).digest();
+  const hashB = crypto.createHash("sha256").update(Buffer.from(b, "utf8")).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
 }
 
 export const adminMiddleware = (

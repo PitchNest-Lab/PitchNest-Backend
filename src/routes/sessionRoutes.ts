@@ -1,7 +1,14 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { authMiddleware } from "../middleware/authMiddleware.ts";
-import { listSessions, getSession, deleteSession, generateSessionPDF } from "../controllers/sessionController.ts";
+import {
+  listSessions,
+  getSession,
+  deleteSession,
+  generateSessionPDF,
+  getSessionRecording,
+  getPitchAttempts,
+} from "../controllers/sessionController.ts";
 
 const router = Router();
 
@@ -17,6 +24,12 @@ const pdfLimiter = rateLimit({
 
 router.get("/", authMiddleware, listSessions);
 router.get("/:id/pdf", authMiddleware, pdfLimiter, generateSessionPDF);
+// Replay support: a short-lived signed URL for the session's AUDIO recording,
+// and the server-authoritative attempt state for the pitch this session belongs
+// to. Both are owner-only and must stay ABOVE the bare "/:id" route so Express
+// doesn't match them as a session id.
+router.get("/:id/recording", authMiddleware, getSessionRecording);
+router.get("/:id/attempts", authMiddleware, getPitchAttempts);
 router.get("/:id", authMiddleware, getSession);
 router.delete("/:id", authMiddleware, deleteSession);
 // NOTE: POST /create was removed. Sessions are created server-side in

@@ -13,11 +13,11 @@ export type Plan = "free" | "prep" | "pro" | "founder" | "enterprise";
 /** Free tier (post-trial): 2 session starts per rolling 7 days. */
 export const FREE_WEEKLY_SESSIONS = 2;
 
-/** Founder tier: 150 min / month. */
-export const FOUNDER_WEEKLY_SESSIONS = 10;
+/** Founder tier: unlimited sessions. */
+export const FOUNDER_WEEKLY_SESSIONS = Infinity;
 
-/** Prep tier: 5 session starts per rolling 7 days. */
-export const PREP_WEEKLY_SESSIONS = 5;
+/** Prep tier: unlimited sessions (matches advertised Founder/Prep pricing). */
+export const PREP_WEEKLY_SESSIONS = Infinity;
 
 /** The standard free duration, in minutes. */
 export const FREE_DURATION_MINUTES = 10;
@@ -47,7 +47,7 @@ export interface Entitlement {
   trialDaysRemaining?: number;
 }
 
-const FREE: Entitlement = {
+export const FREE: Entitlement = {
   plan: "free",
   maxWeeklySessions: FREE_WEEKLY_SESSIONS,
   allowedDurations: [FREE_DURATION_MINUTES],
@@ -88,24 +88,39 @@ export function getTrialEntitlement(daysRemaining: number = 30): Entitlement {
 }
 
 /**
- * Checks whether a trial is active based on expiry timestamp and status.
+ * Checks whether a trial is active based on expiry timestamp, start timestamp, and status.
  */
 export function isTrialActive(
   trialExpiresAt?: string | Date | null,
-  trialStatus?: string | null
+  trialStatus?: string | null,
+  trialStartedAt?: string | Date | null,
 ): { active: boolean; daysRemaining: number } {
   if (trialStatus === "expired" || trialStatus === "cancelled") {
     return { active: false, daysRemaining: 0 };
   }
 
-  // If no trial expiration set yet, default to active 30-day trial for testing period
-  if (!trialExpiresAt) {
-    return { active: true, daysRemaining: FREE_TRIAL_DAYS };
+  // Derive explicit end date: if trialExpiresAt is present use it;
+  // otherwise, if trialStartedAt is present, calculate trialStartedAt + 30 days.
+  // If neither timestamp is set, the trial is inactive (prevents perpetual free access).
+  let end: Date | null = null;
+  if (trialExpiresAt) {
+    const parsed = trialExpiresAt instanceof Date ? trialExpiresAt : new Date(trialExpiresAt);
+    if (Number.isFinite(parsed.getTime())) {
+      end = parsed;
+    }
+  } else if (trialStartedAt) {
+    const started = trialStartedAt instanceof Date ? trialStartedAt : new Date(trialStartedAt);
+    if (Number.isFinite(started.getTime())) {
+      end = new Date(started.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+    }
   }
 
-  const end = trialExpiresAt instanceof Date ? trialExpiresAt : new Date(trialExpiresAt);
+  if (!end) {
+    return { active: false, daysRemaining: 0 };
+  }
+
   const now = Date.now();
-  if (Number.isFinite(end.getTime()) && end.getTime() > now) {
+  if (end.getTime() > now) {
     const diffDays = Math.ceil((end.getTime() - now) / (1000 * 60 * 60 * 24));
     return { active: true, daysRemaining: Math.max(1, diffDays) };
   }
@@ -121,28 +136,34 @@ export function entitlementsForPlan(
   expiresAt?: string | Date | null,
   trialExpiresAt?: string | Date | null,
   trialStatus?: string | null,
+  trialStartedAt?: string | Date | null,
 ): Entitlement {
-  // 1. Paid subscriptions take priority if active
-  if (plan === "pro" || plan === "prep" || plan === "founder") {
+  // 1. Paid subscriptions take priority if active. Enterprise (org / cohort
+  //    seats) resolves to full PRO capability; prep/founder to PREP. Handling
+  //    every paid name here means a granted tier can never silently fall through
+  //    to FREE for lack of a mapping.
+  if (plan === "pro" || plan === "prep" || plan === "founder" || plan === "enterprise") {
+    const paid = plan === "pro" || plan === "enterprise" ? PRO : PREP;
     if (expiresAt) {
       const end = expiresAt instanceof Date ? expiresAt : new Date(expiresAt);
       if (Number.isFinite(end.getTime()) && end.getTime() > Date.now()) {
-        return plan === "pro" ? PRO : PREP;
+        return paid;
       }
     } else {
       // Null expiry on paid plan = comped/grandfathered
-      return plan === "pro" ? PRO : PREP;
+      return paid;
     }
   }
 
   // 2. 30-Day Free Trial / Full Access check
-  const trial = isTrialActive(trialExpiresAt, trialStatus);
+  const trial = isTrialActive(trialExpiresAt, trialStatus, trialStartedAt);
   if (trial.active) {
     return getTrialEntitlement(trial.daysRemaining);
   }
 
   return FREE;
 }
+
 
 /**
  * Resolves the duration a session may actually run, in minutes.
@@ -170,8 +191,9 @@ export function resolveDuration(
  */
 export async function getEntitlements(userId: number): Promise<Entitlement> {
   if (!userId) {
-    // Unauthenticated preview / fallback trial
-    return getTrialEntitlement(30);
+    // No authenticated user — fail CLOSED to the free tier. Never hand paid
+    // capability to an unidentified caller.
+    return FREE;
   }
 
   try {
@@ -183,10 +205,10 @@ export async function getEntitlements(userId: number): Promise<Entitlement> {
 
     if (error) {
       console.warn(
-        `⚠️ getEntitlements(${userId}) lookup failed, falling back to trial access:`,
+        `⚠️ getEntitlements(${userId}) lookup failed, failing CLOSED to free:`,
         error.message,
       );
-      return getTrialEntitlement(30);
+      return FREE;
     }
 
     return entitlementsForPlan(
@@ -194,10 +216,11 @@ export async function getEntitlements(userId: number): Promise<Entitlement> {
       (data as any)?.plan_expires_at,
       (data as any)?.trial_expires_at,
       (data as any)?.trial_status,
+      (data as any)?.trial_started_at,
     );
   } catch (err: any) {
-    console.warn(`⚠️ getEntitlements(${userId}) threw, defaulting to trial access:`, err?.message || err);
-    return getTrialEntitlement(30);
+    console.warn(`⚠️ getEntitlements(${userId}) threw, failing CLOSED to free:`, err?.message || err);
+    return FREE;
   }
 }
 
@@ -262,5 +285,83 @@ export async function recordSessionStart(userId: number): Promise<void> {
     }
   } catch (err: any) {
     console.error(`❌ recordSessionStart(${userId}) threw:`, err?.message || err);
+  }
+}
+
+/**
+ * Atomically claims a weekly session slot: checks the quota AND records the
+ * start in one operation, closing the check-then-act race where two concurrent
+ * `client_ready` connections could both pass a separate hasCapacity() and both
+ * record — exceeding the cap.
+ *
+ * Strategy (insert-then-rank): INSERT my start row first, then rank all of the
+ * user's rows in the 7-day window by started_at. If my row's rank exceeds the
+ * limit, I lost the race — delete my row and reject. Concurrent claimants each
+ * count including the other's just-inserted row, so at most `limit` of them can
+ * rank within bounds. Fails OPEN (allows the pitch) on a genuine DB error, so a
+ * transient outage never blocks the core action — the same posture as before.
+ */
+export async function claimSessionSlot(
+  userId: number,
+  ent: Entitlement,
+): Promise<CapacityResult> {
+  if (!userId || ent.maxWeeklySessions === Infinity) {
+    if (userId) await recordSessionStart(userId);
+    return { ok: true, used: 0, remaining: Infinity, resetsAt: null };
+  }
+
+  const windowStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+
+  try {
+    // 1. Claim a slot up-front.
+    const { data: mine, error: insErr } = await supabase
+      .from("session_starts")
+      .insert([{ user_id: userId }])
+      .select("id, started_at")
+      .single();
+
+    if (insErr || !mine) {
+      // Could not record — fail open (allow) rather than block a real pitch on a
+      // DB blip. Soft quota bypass only; no paid capability is granted.
+      console.error(`❌ claimSessionSlot(${userId}) insert failed:`, insErr?.message);
+      return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
+    }
+
+    // 2. Rank my row among the window's rows.
+    const { data: rows, error: cntErr } = await supabase
+      .from("session_starts")
+      .select("id, started_at")
+      .eq("user_id", userId)
+      .gt("started_at", windowStart.toISOString())
+      .order("started_at", { ascending: true })
+      .order("id", { ascending: true });
+
+    if (cntErr || !rows) {
+      // Count failed after a successful insert — allow (fail open); the row
+      // stays, so it is still metered.
+      return { ok: true, used: 1, remaining: ent.maxWeeklySessions - 1, resetsAt: null };
+    }
+
+    const rank = rows.findIndex((r: any) => r.id === mine.id) + 1; // 1-based
+    const used = rows.length;
+    const oldest = rows[0]?.started_at as string | undefined;
+    const resetsAt = oldest ? new Date(new Date(oldest).getTime() + WEEK_MS) : null;
+
+    if (rank > ent.maxWeeklySessions) {
+      // Lost the race / over the cap — release the slot so it isn't wasted.
+      await supabase.from("session_starts").delete().eq("id", mine.id);
+      return { ok: false, used: used - 1, remaining: 0, resetsAt };
+    }
+
+    return {
+      ok: true,
+      used,
+      remaining: Math.max(0, ent.maxWeeklySessions - used),
+      resetsAt,
+    };
+  } catch (err: any) {
+    console.error(`❌ claimSessionSlot(${userId}) threw:`, err?.message || err);
+    return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
   }
 }

@@ -129,7 +129,7 @@ export const getPlan = async (req: Request, res: Response) => {
       }
     }
 
-    const trial = isTrialActive((user as any)?.trial_expires_at, (user as any)?.trial_status);
+    const trial = isTrialActive((user as any)?.trial_expires_at, (user as any)?.trial_status, (user as any)?.trial_started_at);
     const effectivePlan = active ? ((user as any).plan as string) : (trial.active ? "pro" : "free");
 
     res.json({

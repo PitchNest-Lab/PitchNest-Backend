@@ -1,7 +1,17 @@
 import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
+import { config } from "../config/env.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { getEntitlements } from "../services/entitlementService.ts";
+import { signLocalFileUrl } from "../services/storageService.ts";
+import { storagePathFromUrl } from "../utils/storagePath.ts";
+import {
+  computeAttemptStates,
+  loadAttemptStates,
+  serializeAttemptState,
+  MAX_PITCH_ATTEMPTS,
+  PITCH_RETENTION_DAYS,
+} from "../services/pitchAttemptService.ts";
 
 /**
  * Safely parses stringified JSON structures, falling back to a structured object
@@ -36,6 +46,28 @@ const safeParseJSON = (val: any) => {
   }
 };
 
+/**
+ * Fallback attempt state for a row we could not place in a chain.
+ *
+ * Only reachable when the chain query failed. Reports the pitch as active with
+ * one attempt used so the UI degrades to "1 of 5" instead of hiding the pitch —
+ * and note that this shape is advisory display data only. Whether a new attempt
+ * may actually start is decided by pitchAttemptService at session start, never
+ * by what this response said.
+ */
+const fallbackAttemptState = () => ({
+  pitchRootId: 0,
+  attemptNumber: 1,
+  attemptsUsed: 1,
+  attemptsRemaining: MAX_PITCH_ATTEMPTS - 1,
+  maxAttempts: MAX_PITCH_ATTEMPTS,
+  canStartNewAttempt: true,
+  attemptsExhausted: false,
+  isReportOnly: false,
+  retentionExpiresAt: null,
+  isPastRetention: false,
+});
+
 export const listSessions = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -54,11 +86,21 @@ export const listSessions = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to fetch sessions" });
     }
 
-    const formatted = (sessions || []).map((s: any) => ({
-      ...s,
-      created_at: s.created_at || s.timestamp,
-      evaluation_report: safeParseJSON(s.evaluation_report),
-    }));
+    // Attempt state is derived here, from the rows we just loaded — no extra
+    // query, and the numbers the UI renders are the same ones the session-start
+    // gate enforces. The frontend never counts attempts itself.
+    const attemptStates = computeAttemptStates((sessions || []) as any[]);
+
+    const formatted = (sessions || []).map((s: any) => {
+      const state = attemptStates.get(Number(s.id));
+      return {
+        ...s,
+        created_at: s.created_at || s.timestamp,
+        evaluation_report: safeParseJSON(s.evaluation_report),
+        has_recording: !!s.video_url,
+        attempts: state ? serializeAttemptState(state) : fallbackAttemptState(),
+      };
+    });
     res.json(formatted);
   } catch (error: any) {
     console.error("❌ listSessions exception:", error.message || error);
@@ -98,15 +140,149 @@ export const getSession = async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Session not found" });
     }
 
+    // Attempt state is owner-only: a public share link is a read-only view of
+    // one report and has no business exposing how many attempts the founder has
+    // left, or letting a visitor infer the size of their pitch history.
+    const isOwner = !!userId && session.user_id === userId;
+    let attempts: any = null;
+    if (isOwner) {
+      const state = (await loadAttemptStates(userId!)).get(Number(session.id));
+      attempts = state ? serializeAttemptState(state) : fallbackAttemptState();
+    }
+
     const formatted = {
       ...session,
       created_at: session.created_at || session.timestamp,
       evaluation_report: safeParseJSON(session.evaluation_report),
+      has_recording: !!session.video_url,
+      ...(attempts ? { attempts } : {}),
     };
     res.json(formatted);
   } catch (error: any) {
     console.error("❌ getSession exception:", error.message || error);
     res.status(500).json({ error: "Failed to fetch session" });
+  }
+};
+
+/**
+ * Short-lived playback URL for a completed session's AUDIO recording.
+ *
+ * ──────────────────────────────────────────────────────────────────────────────
+ * WHY THIS ROUTE HAD TO EXIST
+ * ──────────────────────────────────────────────────────────────────────────────
+ * The recording is written to a PRIVATE bucket and only its bare object path is
+ * stored (sessions.video_url). Until now nothing ever read it back — the upload
+ * path even documented recordings as "write-only, never replayed" — so there was
+ * no signed-URL route, and /api/files only authorises against the `decks` table.
+ * Replay could not play audio because the audio was unreachable, not missing.
+ *
+ * The column keeps its historical name. It is read by the account-deletion path
+ * to purge storage objects and is declared in the mobile client's session type,
+ * so renaming it would be a breaking change for no functional gain. What it
+ * holds is an audio recording — video is never captured (getUserMedia is called
+ * with video: false).
+ *
+ * Ownership is enforced on the row before anything is signed, and a 404 (not a
+ * 403) is returned for someone else's session so this cannot be used to probe
+ * which session ids exist.
+ */
+const RECORDING_URL_TTL_SECONDS = 3600; // 1h — long enough to play a full pitch
+
+export const getSessionRecording = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("id, user_id, video_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in getSessionRecording:", error);
+      return res.status(500).json({ error: "Failed to load session" });
+    }
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const stored = (session.video_url as string | null) || "";
+    if (!stored.trim()) {
+      // Not an error: sessions that predate audio capture, or whose upload
+      // failed, simply have no recording. Replay stays available on transcript.
+      return res.json({ url: "", available: false });
+    }
+
+    // Local-fallback recording — token-gated through /api/files, which verifies
+    // ownership against the sessions table for this name.
+    if (stored.startsWith("/uploads/")) {
+      const name = stored.slice("/uploads/".length);
+      return res.json({
+        url: signLocalFileUrl(name, userId, RECORDING_URL_TTL_SECONDS),
+        available: true,
+      });
+    }
+
+    const objectPath = storagePathFromUrl(stored);
+    if (!objectPath) {
+      return res.json({ url: stored, available: true });
+    }
+
+    const { data: signed, error: signErr } = await supabase.storage
+      .from(config.storageBucket)
+      .createSignedUrl(objectPath, RECORDING_URL_TTL_SECONDS);
+
+    if (signErr || !signed?.signedUrl) {
+      console.error("❌ createSignedUrl failed in getSessionRecording:", signErr);
+      return res.status(500).json({ error: "Failed to sign recording URL" });
+    }
+
+    res.json({ url: signed.signedUrl, available: true });
+  } catch (error: any) {
+    console.error("❌ getSessionRecording exception:", error.message || error);
+    res.status(500).json({ error: "Failed to load recording" });
+  }
+};
+
+/**
+ * Attempt/lifecycle state for one pitch chain, addressed by any session in it.
+ *
+ * The pre-pitch setup screen calls this before offering to start a re-pitch, so
+ * the button reflects server state rather than a client-side count. It is a
+ * convenience for the UI only — the authoritative gate runs at session start in
+ * restSocket, which is what makes refreshing, a second tab, re-login, or edited
+ * client state unable to buy a sixth attempt.
+ */
+export const getPitchAttempts = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("id")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in getPitchAttempts:", error);
+      return res.status(500).json({ error: "Failed to load session" });
+    }
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const state = (await loadAttemptStates(userId)).get(Number(session.id));
+    res.json({
+      ...(state ? serializeAttemptState(state) : fallbackAttemptState()),
+      retentionDays: PITCH_RETENTION_DAYS,
+    });
+  } catch (error: any) {
+    console.error("❌ getPitchAttempts exception:", error.message || error);
+    res.status(500).json({ error: "Failed to load attempt state" });
   }
 };
 
