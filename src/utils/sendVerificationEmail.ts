@@ -49,6 +49,15 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   const baseUrl = (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, "");
   const verifyUrl = `${baseUrl}/verify?token=${token}`;
 
+  // Log OTP in development so local testing never gets blocked by email deliverability / DNS
+  if (config.nodeEnv !== "production") {
+    console.log(`\n======================================================`);
+    console.log(`✉️  [LOCAL DEV OTP] Email: ${email}`);
+    console.log(`🔑 Verification Code: ${code}`);
+    console.log(`🔗 Direct Verify URL: ${verifyUrl}`);
+    console.log(`======================================================\n`);
+  }
+
   if (!process.env.RESEND_API_KEY) {
     throw new Error(
       "Mail is not configured (RESEND_API_KEY missing). " +

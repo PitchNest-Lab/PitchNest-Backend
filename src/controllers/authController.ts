@@ -175,24 +175,25 @@ export const signup = async (req: Request, res: Response) => {
 
     const is_verified = existingUser?.isEmailVerified;
 
-    // Uniform, non-enumerating response for every existing-account case
-    // (already-verified OR exists-but-unverified). CRITICAL: we NEVER return a
-    // session token here. The previous code handed back a valid JWT for an
-    // existing *unverified* account without checking the password — anyone who
-    // knew a target's email could obtain a working login for that account. The
-    // response body is identical in both branches so it also does not reveal
-    // whether the email is registered/verified (user enumeration).
     if (existingUser) {
       if (!is_verified) {
         // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
         sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
           console.error("Failed to resend verification email on signup retry:", err);
         });
+        return res.status(200).json({
+          requiresVerification: true,
+          email: cleanEmail,
+          message: "This email is registered but not verified yet. A new verification code has been sent to your email.",
+        });
       }
-      return res.status(200).json({
-        requiresVerification: true,
-        email: cleanEmail,
-        message: "Check your email to verify your account.",
+
+      // If the account is already verified, provide honest and actionable feedback:
+      // do not redirect them to /verify waiting for a phantom email that was never sent.
+      return res.status(409).json({
+        error: "An account with this email already exists. Please log in.",
+        code: "ACCOUNT_EXISTS",
+        isEmailVerified: true,
       });
     }
     // Hash password before storing
@@ -884,10 +885,17 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    // Always return success — don't reveal whether the email exists or is
-    // already verified. This prevents user enumeration via this endpoint.
-    if (!user || user?.isEmailVerified) {
+    // If no user exists, generic success to prevent enumeration
+    if (!user) {
       return res.json({ message: "If an unverified account exists for that email, a verification link has been sent." });
+    }
+
+    // If the account is already verified, give explicit feedback so the user knows to log in
+    if (user.isEmailVerified) {
+      return res.status(400).json({
+        error: "This account is already verified. Please log in.",
+        isEmailVerified: true,
+      });
     }
 
     // Don't block the response on email delivery
