@@ -19,7 +19,8 @@ const googleClient = new OAuth2Client(config.googleClientId);
 const ALLOWED_ROLES = ["Founder", "Investor", "Advisor"] as const;
 type Role = (typeof ALLOWED_ROLES)[number];
 const isValidRole = (value: unknown): value is Role =>
-  typeof value === "string" && (ALLOWED_ROLES as readonly string[]).includes(value);
+  typeof value === "string" &&
+  (ALLOWED_ROLES as readonly string[]).includes(value);
 
 const ALLOWED_SECTORS = [
   "Venture Capital",
@@ -49,29 +50,40 @@ function lockAuthProvider(userId: number, provider: "form" | "google") {
     });
 }
 
-import { isTrialActive, FREE_TRIAL_DAYS } from "../services/entitlementService.ts";
+import {
+  isTrialActive,
+  FREE_TRIAL_DAYS,
+} from "../services/entitlementService.ts";
 
 export function toPublicUser(u: any) {
-  const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
-  const isPaidActive = (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") && (!expiry || expiry.getTime() > Date.now());
-  const trial = isTrialActive(u?.trial_expires_at, u?.trial_status, u?.trial_started_at);
+  const expiry = u?.validity ? new Date(u.validity) : null;
+  const isPaidActive =
+    (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") &&
+    (!expiry || expiry > new Date());
+  const trial = isTrialActive(
+    u?.trial_expires_at,
+    u?.trial_status,
+    u?.trial_started_at,
+  );
 
   // During trial or paid plan, the user has full access
-  const effectivePlan = isPaidActive ? (u.plan as string) : (trial.active ? "pro" : "free");
+  const effectivePlan = isPaidActive
+    ? (u.plan as string)
+    : trial.active
+      ? "pro"
+      : "free";
 
   return {
     id: u?.id,
-    name: u?.name,
+    name: u?.org_name,
     email: u?.email,
-    role: u?.role,
-    bio: u?.bio,
-    avatarUrl: u?.avatar_url ?? null,
-    settings: u?.settings ?? {},
     plan: effectivePlan,
     planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
     isTrial: trial.active,
     trialDaysRemaining: trial.daysRemaining,
-    trialExpiresAt: u?.trial_expires_at ? new Date(u.trial_expires_at).toISOString() : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
+    trialExpiresAt: u?.trial_expires_at
+      ? new Date(u.trial_expires_at).toISOString()
+      : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
   };
 }
 
@@ -89,7 +101,8 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
   }
   if (s.aiToughness !== undefined) {
     const v = Number(s.aiToughness);
-    if (!Number.isNaN(v)) out.aiToughness = Math.min(100, Math.max(0, Math.round(v)));
+    if (!Number.isNaN(v))
+      out.aiToughness = Math.min(100, Math.max(0, Math.round(v)));
   }
   if (
     typeof s.activeSector === "string" &&
@@ -102,7 +115,9 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
   // only, capped so the column can't grow unbounded.
   if (Array.isArray(s.toursSeen)) {
     out.toursSeen = s.toursSeen
-      .filter((t: unknown) => typeof t === "string" && (t as string).length <= 64)
+      .filter(
+        (t: unknown) => typeof t === "string" && (t as string).length <= 64,
+      )
       .slice(0, 50);
   }
   return out;
@@ -140,7 +155,7 @@ export const refreshToken = (req: Request, res: Response) => {
 
 export const signup = async (req: Request, res: Response) => {
   try {
-    const { name, email, password } = req.body;
+    const { name, email, password, referralCode } = req.body;
     if (!name || !email || !password) {
       return res
         .status(400)
@@ -166,6 +181,7 @@ export const signup = async (req: Request, res: Response) => {
         .json({ error: "Password must be at least 6 characters." });
     }
     const cleanEmail = email.toLowerCase().trim();
+   
 
     const { data: existingUser } = await supabase
       .from("users")
@@ -186,7 +202,10 @@ export const signup = async (req: Request, res: Response) => {
       if (!is_verified) {
         // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
         sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
-          console.error("Failed to resend verification email on signup retry:", err);
+          console.error(
+            "Failed to resend verification email on signup retry:",
+            err,
+          );
         });
       }
       return res.status(200).json({
@@ -198,7 +217,9 @@ export const signup = async (req: Request, res: Response) => {
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
     const now = new Date();
-    const trialEnd = new Date(now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+    const trialEnd = new Date(
+      now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
+    );
 
     let { data: newUser, error } = await supabase
       .from("users")
@@ -211,6 +232,8 @@ export const signup = async (req: Request, res: Response) => {
           trial_started_at: now.toISOString(),
           trial_expires_at: trialEnd.toISOString(),
           trial_status: "active",
+          orgCode: referralCode,
+          enrolled_at: now.toISOString(),
         },
       ])
       .select()
@@ -236,6 +259,16 @@ export const signup = async (req: Request, res: Response) => {
     sendVerificationEmail(newUser.id, cleanEmail).catch((err) => {
       console.error("Failed to send verification email:", err);
     });
+
+    if (referralCode) {
+      const { error } = await supabase.rpc("increment_enroll_count", {
+        ref_code: referralCode,
+      });
+
+      if (error) {
+        console.error("Failed to increment enroll count:", error);
+      }
+    }
 
     // 200 (not 201) to match the existing-account branch above: a different
     // status would let an attacker distinguish a new email from a registered
@@ -333,15 +366,53 @@ export const login = async (req: Request, res: Response) => {
         .eq("id", user.id)
         .then(({ error: resetErr }) => {
           if (resetErr)
-            console.warn(
-              "lockout reset failed (non-fatal):",
-              resetErr.message,
-            );
+            console.warn("lockout reset failed (non-fatal):", resetErr.message);
         });
     }
 
     // First successful password login on a legacy row locks it to 'form'.
     if (!user.auth_provider) lockAuthProvider(user.id, "form");
+
+    const token = signToken(
+      { id: user.id, email: user.email },
+      rememberMe === true,
+    );
+
+    res.status(200).json({
+      user: toPublicUser(user),
+      token,
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "Login failed" });
+  }
+};
+
+export const orgLogin = async (req: Request, res: Response) => {
+  try {
+    const { email, password, rememberMe } = req.body;
+    if (!email || !password) {
+      return res
+        .status(400)
+        .json({ error: "Email and password are required." });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+
+    const { data: user, error } = await supabase
+      .from("Organizations")
+      .select("*")
+      .eq("email", cleanEmail)
+      .maybeSingle();
+    console.log(user);
+    if (error || !user) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    // Compare hashed password
+    // const isValidPassword = await bcrypt.compare(password, user.password);
+    // if (!isValidPassword) {
+    //   return res.status(401).json({ error: "Invalid credentials." });
+    // }
 
     const token = signToken(
       { id: user.id, email: user.email },
@@ -527,7 +598,9 @@ export const googleAuth = async (req: Request, res: Response) => {
         4,
       );
       const now = new Date();
-      const trialEnd = new Date(now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000);
+      const trialEnd = new Date(
+        now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
+      );
 
       let { data: created, error } = await supabase
         .from("users")
@@ -618,9 +691,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
 
     // Always return 200 with the SAME message to prevent email enumeration.
     if (!user)
-      return res
-        .status(200)
-        .json({ message: "If an account with that email exists, a reset link has been sent." });
+      return res.status(200).json({
+        message:
+          "If an account with that email exists, a reset link has been sent.",
+      });
 
     // Google accounts have no usable password — a reset would set one that
     // still can't log in (method lock). Point the user at Google instead.
@@ -691,7 +765,10 @@ export const forgotPassword = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to send email." });
     }
 
-    res.status(200).json({ message: "If an account with that email exists, a reset link has been sent." });
+    res.status(200).json({
+      message:
+        "If an account with that email exists, a reset link has been sent.",
+    });
   } catch (error) {
     console.error("Forgot password error:", error);
     res.status(500).json({ error: "Failed to process request." });
@@ -714,7 +791,10 @@ export const verifyEmail = async (req: Request, res: Response) => {
     if (error || !record) {
       // Token may have already been consumed (double-click). Check if the
       // user is already verified and return success so the UI isn't broken.
-      return res.status(400).json({ message: "This link has already been used or is invalid. Please log in or request a new verification email." });
+      return res.status(400).json({
+        message:
+          "This link has already been used or is invalid. Please log in or request a new verification email.",
+      });
     }
 
     // 2. Check expiry
@@ -725,7 +805,9 @@ export const verifyEmail = async (req: Request, res: Response) => {
     // 3. Check if already verified (idempotent for repeated clicks)
     const { data: existingUser } = await supabase
       .from("users")
-      .select("id, email, name, onboardingCompleted, role, bio, isEmailVerified")
+      .select(
+        "id, email, name, onboardingCompleted, role, bio, isEmailVerified",
+      )
       .eq("id", record.user_id)
       .single();
 
@@ -736,12 +818,17 @@ export const verifyEmail = async (req: Request, res: Response) => {
         .delete()
         .eq("token", token);
 
-      const JwtToken = signToken({ id: existingUser.id, email: existingUser.email });
+      const JwtToken = signToken({
+        id: existingUser.id,
+        email: existingUser.email,
+      });
       return res.json({
         user: toPublicUser(existingUser),
         token: JwtToken,
         message: "Email already verified",
-        redirectTo: existingUser.onboardingCompleted ? "/dashboard" : "/onboarding",
+        redirectTo: existingUser.onboardingCompleted
+          ? "/dashboard"
+          : "/onboarding",
       });
     }
 
@@ -757,13 +844,18 @@ export const verifyEmail = async (req: Request, res: Response) => {
       .delete()
       .eq("token", token);
 
-    const JwtToken = signToken({ id: existingUser!.id, email: existingUser!.email });
+    const JwtToken = signToken({
+      id: existingUser!.id,
+      email: existingUser!.email,
+    });
 
     res.json({
       user: toPublicUser(existingUser),
       token: JwtToken,
       message: "Email verified successfully",
-      redirectTo: existingUser!.onboardingCompleted ? "/dashboard" : "/onboarding",
+      redirectTo: existingUser!.onboardingCompleted
+        ? "/dashboard"
+        : "/onboarding",
     });
   } catch (error) {
     console.error("Email verification error:", error);
@@ -812,7 +904,10 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     // issuing a JWT without a matching code would be account takeover — any
     // known verified email would yield a free session. Point the user at login.
     if (user.isEmailVerified) {
-      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+      await supabase
+        .from("email_verification_tokens")
+        .delete()
+        .eq("user_id", user.id);
       return res.status(200).json({
         alreadyVerified: true,
         message: "Email already verified. Please log in.",
@@ -827,23 +922,35 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
 
     // No row, or a legacy row with no `code` column populated (pre-migration
     // link-only token) — cannot verify by code; the user must use the link.
-    if (!record || !record.code) return res.status(400).json({ message: GENERIC });
+    if (!record || !record.code)
+      return res.status(400).json({ message: GENERIC });
 
     if (new Date(record.expires_at) < new Date()) {
-      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
-      return res.status(400).json({ message: "Code expired. Please request a new one." });
+      await supabase
+        .from("email_verification_tokens")
+        .delete()
+        .eq("user_id", user.id);
+      return res
+        .status(400)
+        .json({ message: "Code expired. Please request a new one." });
     }
 
     if ((record.attempts ?? 0) >= MAX_OTP_ATTEMPTS) {
       // Burn the code so a locked-out attacker cannot keep guessing this window.
-      await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
-      return res.status(429).json({ message: "Too many incorrect attempts. Please request a new code." });
+      await supabase
+        .from("email_verification_tokens")
+        .delete()
+        .eq("user_id", user.id);
+      return res.status(429).json({
+        message: "Too many incorrect attempts. Please request a new code.",
+      });
     }
 
     // Constant-time compare so timing can't leak the code digit by digit.
     const stored = Buffer.from(String(record.code));
     const given = Buffer.from(cleanCode);
-    const match = stored.length === given.length && crypto.timingSafeEqual(stored, given);
+    const match =
+      stored.length === given.length && crypto.timingSafeEqual(stored, given);
 
     if (!match) {
       await supabase
@@ -853,8 +960,14 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
       return res.status(400).json({ message: GENERIC });
     }
 
-    await supabase.from("users").update({ isEmailVerified: true }).eq("id", user.id);
-    await supabase.from("email_verification_tokens").delete().eq("user_id", user.id);
+    await supabase
+      .from("users")
+      .update({ isEmailVerified: true })
+      .eq("id", user.id);
+    await supabase
+      .from("email_verification_tokens")
+      .delete()
+      .eq("user_id", user.id);
 
     const token = signToken({ id: user.id, email: user.email });
     return res.json({
@@ -877,7 +990,9 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
     // letter — and the /verify screen forwards it AS TYPED — so this endpoint
     // returned "Verification email resent" while sending nothing at all.
     // maybeSingle() because zero rows is an expected outcome here, not an error.
-    const cleanEmail = String(email || "").toLowerCase().trim();
+    const cleanEmail = String(email || "")
+      .toLowerCase()
+      .trim();
     const { data: user } = await supabase
       .from("users")
       .select("id, isEmailVerified")
@@ -887,7 +1002,10 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
     // Always return success — don't reveal whether the email exists or is
     // already verified. This prevents user enumeration via this endpoint.
     if (!user || user?.isEmailVerified) {
-      return res.json({ message: "If an unverified account exists for that email, a verification link has been sent." });
+      return res.json({
+        message:
+          "If an unverified account exists for that email, a verification link has been sent.",
+      });
     }
 
     // Don't block the response on email delivery
@@ -933,7 +1051,10 @@ async function purgeUserAccount(userId: number): Promise<void> {
 
   // Avatars live in a SEPARATE public bucket — extract with that bucket's marker
   // and remove from THAT bucket, never from the private media bucket.
-  const avatarPath = storagePathFromUrl(userRow?.avatar_url, config.avatarBucket);
+  const avatarPath = storagePathFromUrl(
+    userRow?.avatar_url,
+    config.avatarBucket,
+  );
   const avatarPaths = avatarPath ? [avatarPath] : [];
 
   if (mediaPaths.size > 0) {
@@ -941,7 +1062,10 @@ async function purgeUserAccount(userId: number): Promise<void> {
       .from(config.storageBucket)
       .remove([...mediaPaths]);
     if (storageError) {
-      console.warn("⚠️ Media storage cleanup partial failure:", storageError.message);
+      console.warn(
+        "⚠️ Media storage cleanup partial failure:",
+        storageError.message,
+      );
     }
   }
   if (avatarPaths.length > 0) {
@@ -949,7 +1073,10 @@ async function purgeUserAccount(userId: number): Promise<void> {
       .from(config.avatarBucket)
       .remove(avatarPaths);
     if (avatarError) {
-      console.warn("⚠️ Avatar storage cleanup partial failure:", avatarError.message);
+      console.warn(
+        "⚠️ Avatar storage cleanup partial failure:",
+        avatarError.message,
+      );
     }
   }
 
@@ -986,7 +1113,10 @@ async function purgeUserAccount(userId: number): Promise<void> {
   ): Promise<void> => {
     const { error } = await apply(supabase.from(table).delete());
     if (error) {
-      console.error(`❌ Account deletion: failed to purge ${table} for user ${userId}:`, error.message);
+      console.error(
+        `❌ Account deletion: failed to purge ${table} for user ${userId}:`,
+        error.message,
+      );
       failures.push(table);
     }
   };
