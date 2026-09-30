@@ -117,7 +117,7 @@ export const uploadDeck = async (req: Request, res: Response) => {
       // Local fallback
       const localFileName = `${Date.now()}_${originalName}`;
       fs.writeFileSync(path.join(uploadDir, localFileName), req.file.buffer);
-      publicUrl = `/uploads/${localFileName}`;
+     
     } else {
       // Item A: the bucket is private, so store the BARE object path (not a
       // public URL). Deck rendering goes through GET /:id/signed-url, which

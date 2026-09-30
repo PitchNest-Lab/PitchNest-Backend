@@ -13,6 +13,7 @@ import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
 import billingRoutes from "./routes/billingRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
+import router from "./routes/organization/organizationRoutes.ts";
 
 const app = express();
 
@@ -86,6 +87,7 @@ app.use("/api/files", fileRoutes);
 
 // API Routers
 app.use("/api/auth", authRoutes);
+app.use("/api/organization", router);
 app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
