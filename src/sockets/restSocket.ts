@@ -11,6 +11,8 @@ import {
   generatePanelResponse,
   streamPanelResponse,
   generateAnswerTip,
+  buildVerdictInstruction,
+  PROMPT_VERSION,
 } from "../services/aiService.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import {
@@ -31,6 +33,7 @@ import {
 } from "../utils/endSessionIntent.ts";
 import { detectFloorHandback } from "../utils/floorControl.ts";
 import { applyConversationWindow } from "../utils/conversationWindow.ts";
+import { splitVerdictsBySpeaker } from "../utils/verdictSplit.ts";
 import {
   researchStartup,
   buildMarketSnapshotBlock,
@@ -802,58 +805,57 @@ export function initRestSocket(wss: WebSocketServer) {
             { name: "Sarah" },
             { name: "Chen" },
           ];
-          const panelistNames = panelists.map((p: any) => p.name);
+          const panelistNames: string[] = panelists.map((p: any) => p.name);
+          const bySpeaker = splitVerdictsBySpeaker(aiResponse, panelistNames);
 
-          // In verdict mode, we need to extract each panelist's verdict and send them sequentially
+          // Extract every panelist's verdict first, then start all TTS up front
+          // (each panelist has its own voice, so they synthesize concurrently)
+          // and deliver in order — the founder waits for the slowest verdict,
+          // not the sum of all three.
+          const verdicts: Array<{ speaker: string; text: string; verdict: "invest" | "pass" | "maybe" }> = [];
           for (const pName of panelistNames) {
-            let panelistText = "";
-            const nameRegex = new RegExp(
-              `${pName}[:\\s]+(.+?)(?=(?:${panelistNames.join("|")})[:\\s]|$)`,
-              "is",
-            );
-            const nameMatch = aiResponse.match(nameRegex);
-
-            if (nameMatch) {
-              panelistText = nameMatch[1].trim();
-            } else {
-              if (panelists.length === 1) {
-                panelistText = aiResponse
-                  .replace(/^(Riley|Marcus|Coach)[\s:]+/i, "")
-                  .trim();
-              } else {
-                continue;
-              }
+            let panelistText = bySpeaker.get(pName) || "";
+            if (!panelistText) {
+              if (panelists.length !== 1) continue;
+              panelistText = aiResponse
+                .replace(/^(Riley|Marcus|Coach)[\s:]+/i, "")
+                .trim();
             }
-
             panelistText = sanitizeAiSpeech(panelistText) || panelistText;
+            verdicts.push({
+              speaker: pName,
+              text: panelistText,
+              verdict: classifyPanelVerdict(panelistText.toLowerCase()),
+            });
+          }
 
-            const lowerText = panelistText.toLowerCase();
-            let verdictVerdict: "invest" | "pass" | "maybe" =
-              classifyPanelVerdict(lowerText);
+          const verdictAudio = isTtsConfigured()
+            ? verdicts.map((v) =>
+                v.text.trim()
+                  ? synthesizeSpeech(v.text, resolveVoiceName(v.speaker)).catch((e) => {
+                      console.error("Verdict TTS error:", e);
+                      return null;
+                    })
+                  : Promise.resolve(null),
+              )
+            : [];
 
-            // Send verdict text to UI
+          for (let i = 0; i < verdicts.length; i++) {
+            const v = verdicts[i];
             sendJson(ws, {
               type: "verdict_message",
-              speaker: pName,
-              text: panelistText.substring(0, 300),
-              verdict: verdictVerdict,
+              speaker: v.speaker,
+              text: v.text.substring(0, 300),
+              verdict: v.verdict,
             });
-
-            // Synthesize audio for this panelist's verdict
-            if (isTtsConfigured() && panelistText.trim()) {
-              try {
-                const vName = resolveVoiceName(pName);
-                const buf = await synthesizeSpeech(panelistText, vName);
-                const base64Audio = Buffer.from(buf).toString("base64");
-                // DO NOT pass `text: panelistText` here to avoid duplicating the verdict message!
-                sendJson(ws, {
-                  type: "audio",
-                  data: base64Audio,
-                  speaker: pName,
-                });
-              } catch (e) {
-                console.error("Verdict TTS error:", e);
-              }
+            const buf = verdictAudio[i] ? await verdictAudio[i] : null;
+            if (buf) {
+              // DO NOT pass `text` here to avoid duplicating the verdict message!
+              sendJson(ws, {
+                type: "audio",
+                data: Buffer.from(buf).toString("base64"),
+                speaker: v.speaker,
+              });
             }
           }
           sendJson(ws, { type: "verdict_complete" });
@@ -2262,7 +2264,7 @@ export function initRestSocket(wss: WebSocketServer) {
             .join(", ");
 
           enqueueTurn({
-            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:") and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Weigh this fairly: actively look for the reasons to say YES, not just the reasons to say no. If the pitch genuinely supports it, say you are IN ("I'm in because…") — a conditional yes is allowed ("I'm in, provided you can prove out the retention numbers"). Only say you are OUT ("I'm out because…") when there is a specific, concrete blocker you cannot get past — never as a reflex. If you are genuinely on the fence, say so honestly and name the ONE thing that would tip you. Do not invent flaws to justify a pass, and do not manufacture enthusiasm you do not feel. Each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
+            text: buildVerdictInstruction(panelistNames),
             isVerdict: true,
             panelists: panelists,
           });
@@ -2384,6 +2386,7 @@ export function initRestSocket(wss: WebSocketServer) {
           // Persist the session mode both as a real column (for filtering) and
           // inside evaluation_report (back-compat with rows that predate the column).
           reportData.mode = sessionMode;
+          reportData.prompt_version = PROMPT_VERSION;
 
           // Re-pitch: snapshot the previous attempt's numbers into the report so
           // the frontend/PDF compute score deltas deterministically (never the LLM).
