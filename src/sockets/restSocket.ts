@@ -516,6 +516,8 @@ export function initRestSocket(wss: WebSocketServer) {
       trackUserWs(authenticatedUserId, ws);
       console.log("Tracked all ")
     } catch (err) {
+      console.error("🚨 [JWT VERIFICATION ERROR]:", err);
+
       sendJson(ws, { type: "error", message: "Invalid or expired token.", code: "AUTH_FAILED" });
       ws.close(4001, "Authentication failed");
       return;
