@@ -1434,18 +1434,31 @@ export function initRestSocket(wss: WebSocketServer) {
     };
 
     ws.on("message", async (message, isBinary) => {
-      if (isBinary) {
-        if (sttRecognizer && !sessionEnded) {
-          sttRecognizer.pushAudio(message as Buffer);
-        }
-        return;
-      }
+     
       try {
+         if (isBinary) {
+      if (sttRecognizer && !sessionEnded) {
+        try {
+          sttRecognizer.pushAudio(message as Buffer);
+        } catch (sttErr) {
+          console.error("🚨 [STT Push Audio Error]:", sttErr);
+        }
+      }
+      return;
+    }
         const data = JSON.parse(message.toString());
 
         if (sessionEnded && data.type !== "set_video_url") {
           return;
         }
+        if (data.type === "interrupt") {
+      if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
+        currentTurnAbort.abort();
+      }
+      lastUserActivityTime = Date.now();
+      hasNudged = false;
+      return;
+    }
 
         // ── Barge-in: client detected the founder talking over the panel ──
         // Abort the in-flight turn so the server stops generating + streaming
@@ -2553,9 +2566,10 @@ export function initRestSocket(wss: WebSocketServer) {
             shareId,
           });
         }
-      } catch {
-        // Ignore non-JSON messages (legacy raw audio payloads)
-      }
+      } catch (err) {
+    // 2. Catch and print any runtime error occurring during WS message processing
+    console.error("🚨 [WS MESSAGE HANDLING ERROR]:", err);
+  }
     });
   });
 }
