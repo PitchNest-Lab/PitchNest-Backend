@@ -132,7 +132,7 @@ function signToken(
   user: { id: number; email: string },
   rememberMe = false,
 ): string {
-  console.log(config.jwtSecret)
+ 
   return jwt.sign(
     { id: user.id, email: user.email, rememberMe },
     config.jwtSecret,

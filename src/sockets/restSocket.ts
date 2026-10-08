@@ -489,33 +489,26 @@ export function initRestSocket(wss: WebSocketServer) {
     // ── JWT Authentication ──────────────────────────────────────────────────
     // Clients must pass ?token=<JWT> as a query param on the WS URL.
     // Without a valid token the connection is closed immediately.
-    console.log(`[WS] Client connected from ${req.socket.remoteAddress}`);
     let authenticatedUserId: number | null = null;
     try {
       const url = new URL(req.url || "", `http://${req.headers.host}`);
-      console.log("url",url);
       const token = url.searchParams.get("token");
-      console.log("token",token);
       if (!token) {
         sendJson(ws, { type: "error", message: "Authentication required.", code: "AUTH_REQUIRED" });
         ws.close(4001, "Authentication required");
         return;
       }
-      console.log("🔑 [DEBUG] Verification secret used:", config.jwtSecret ? `${config.jwtSecret.slice(0, 3)}***` : "UNDEFINED");
-      // const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
-      // authenticatedUserId = decoded.id;
-      // console.log("decoded",decoded)
+      const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+      authenticatedUserId = decoded.id;
+
       // Concurrency cap
-      // const existing = activeWsByUser.get(authenticatedUserId);
-      // console.log("existing",existing)
-      // if (existing && existing.size >= MAX_WS_PER_USER) {
-      //   sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
-      //   ws.close(4002, "Too many sessions");
-      //   return;
-      // }
-      // console.log("Done")
-      // trackUserWs(authenticatedUserId, ws);
-      console.log("Tracked all ")
+      const existing = activeWsByUser.get(authenticatedUserId);
+      if (existing && existing.size >= MAX_WS_PER_USER) {
+        sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
+        ws.close(4002, "Too many sessions");
+        return;
+      }
+      trackUserWs(authenticatedUserId, ws);
     } catch (err) {
       console.error("🚨 [JWT VERIFICATION ERROR]:", err);
 
@@ -749,7 +742,6 @@ export function initRestSocket(wss: WebSocketServer) {
     }
 
     ws.on("close", () => {
-      
       console.log("🔌 Client disconnected.");
       if (authenticatedUserId) untrackUserWs(authenticatedUserId, ws);
       if (idleCheckInterval) clearInterval(idleCheckInterval);
@@ -762,7 +754,6 @@ export function initRestSocket(wss: WebSocketServer) {
         releaseLiveAttempt(reservedRootId);
         reservedRootId = null;
       }
-      
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
@@ -1442,35 +1433,18 @@ export function initRestSocket(wss: WebSocketServer) {
     };
 
     ws.on("message", async (message, isBinary) => {
-     
-    try {
       if (isBinary) {
         if (sttRecognizer && !sessionEnded) {
-          try {
-              sttRecognizer.pushAudio(message as Buffer);
-          } catch (e) {
-              console.error("🚨 STT push audio error:", e);
-          }
+          sttRecognizer.pushAudio(message as Buffer);
         }
         return;
       }
-
-    const data = JSON.parse(message.toString());
-
-    // 1. Log EVERY incoming text message type immediately
-    console.log(`📩 [WS RECV]: ${data.type}`);
+      try {
+        const data = JSON.parse(message.toString());
 
         if (sessionEnded && data.type !== "set_video_url") {
           return;
         }
-        if (data.type === "interrupt") {
-      if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
-        currentTurnAbort.abort();
-      }
-      lastUserActivityTime = Date.now();
-      hasNudged = false;
-      return;
-    }
 
         // ── Barge-in: client detected the founder talking over the panel ──
         // Abort the in-flight turn so the server stops generating + streaming
@@ -1520,17 +1494,8 @@ export function initRestSocket(wss: WebSocketServer) {
           }
           return;
         }
-      
-     
-
-      // Step A: Database check
-    
-
-      
 
         if (data.type === "client_ready" && !hasSentSetup) {
-
-           console.log("⚙️ [client_ready]: Starting session setup...");
           hasSentSetup = true;
           const clientConfig = data.config || {};
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
@@ -1548,7 +1513,6 @@ export function initRestSocket(wss: WebSocketServer) {
           // from pitching via WebSocket since WS bypasses Express auth middleware).
           // Also pulls `plan` and trial fields in the SAME query so the paywall costs no extra
           // round trip.
-           console.log("⚙️ [client_ready]: Checking Supabase user...");
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
@@ -1566,7 +1530,6 @@ export function initRestSocket(wss: WebSocketServer) {
               ws.close();
               return;
             }
-            console.log("⚙️ [client_ready]: Checking attempt claim...");
 
             // Email verification gate (mirrors authMiddleware + login). The WS
             // authenticates via its own jwt.verify, bypassing Express middleware,
@@ -2589,10 +2552,9 @@ export function initRestSocket(wss: WebSocketServer) {
             shareId,
           });
         }
-      } catch (err) {
-    // 2. Catch and print any runtime error occurring during WS message processing
-    console.error("🚨 [WS MESSAGE HANDLING ERROR]:", err);
-  }
+      } catch {
+        // Ignore non-JSON messages (legacy raw audio payloads)
+      }
     });
   });
 }
