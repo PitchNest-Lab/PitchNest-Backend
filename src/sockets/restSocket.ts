@@ -493,7 +493,9 @@ export function initRestSocket(wss: WebSocketServer) {
     let authenticatedUserId: number | null = null;
     try {
       const url = new URL(req.url || "", `http://${req.headers.host}`);
+      console.log("url",url);
       const token = url.searchParams.get("token");
+      console.log("token",token);
       if (!token) {
         sendJson(ws, { type: "error", message: "Authentication required.", code: "AUTH_REQUIRED" });
         ws.close(4001, "Authentication required");
@@ -501,15 +503,18 @@ export function initRestSocket(wss: WebSocketServer) {
       }
       const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
       authenticatedUserId = decoded.id;
-
+      console.log("decoded",decoded)
       // Concurrency cap
       const existing = activeWsByUser.get(authenticatedUserId);
+      console.log("existing",existing)
       if (existing && existing.size >= MAX_WS_PER_USER) {
         sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
         ws.close(4002, "Too many sessions");
         return;
       }
+      console.log("Done")
       trackUserWs(authenticatedUserId, ws);
+      console.log("Tracked all ")
     } catch (err) {
       sendJson(ws, { type: "error", message: "Invalid or expired token.", code: "AUTH_FAILED" });
       ws.close(4001, "Authentication failed");
