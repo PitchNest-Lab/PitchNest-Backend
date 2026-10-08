@@ -489,6 +489,7 @@ export function initRestSocket(wss: WebSocketServer) {
     // ── JWT Authentication ──────────────────────────────────────────────────
     // Clients must pass ?token=<JWT> as a query param on the WS URL.
     // Without a valid token the connection is closed immediately.
+    console.log(`[WS] Client connected from ${req.socket.remoteAddress}`);
     let authenticatedUserId: number | null = null;
     try {
       const url = new URL(req.url || "", `http://${req.headers.host}`);
@@ -740,6 +741,7 @@ export function initRestSocket(wss: WebSocketServer) {
     }
 
     ws.on("close", () => {
+      
       console.log("🔌 Client disconnected.");
       if (authenticatedUserId) untrackUserWs(authenticatedUserId, ws);
       if (idleCheckInterval) clearInterval(idleCheckInterval);
@@ -752,6 +754,7 @@ export function initRestSocket(wss: WebSocketServer) {
         releaseLiveAttempt(reservedRootId);
         reservedRootId = null;
       }
+      
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
