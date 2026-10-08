@@ -1435,18 +1435,22 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("message", async (message, isBinary) => {
      
-      try {
-         if (isBinary) {
-      if (sttRecognizer && !sessionEnded) {
-        try {
-          sttRecognizer.pushAudio(message as Buffer);
-        } catch (sttErr) {
-          console.error("🚨 [STT Push Audio Error]:", sttErr);
+    try {
+      if (isBinary) {
+        if (sttRecognizer && !sessionEnded) {
+          try {
+              sttRecognizer.pushAudio(message as Buffer);
+          } catch (e) {
+              console.error("🚨 STT push audio error:", e);
+          }
         }
+        return;
       }
-      return;
-    }
-        const data = JSON.parse(message.toString());
+
+    const data = JSON.parse(message.toString());
+
+    // 1. Log EVERY incoming text message type immediately
+    console.log(`📩 [WS RECV]: ${data.type}`);
 
         if (sessionEnded && data.type !== "set_video_url") {
           return;
@@ -1508,8 +1512,17 @@ export function initRestSocket(wss: WebSocketServer) {
           }
           return;
         }
+      
+     
+
+      // Step A: Database check
+    
+
+      
 
         if (data.type === "client_ready" && !hasSentSetup) {
+
+           console.log("⚙️ [client_ready]: Starting session setup...");
           hasSentSetup = true;
           const clientConfig = data.config || {};
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
@@ -1527,6 +1540,7 @@ export function initRestSocket(wss: WebSocketServer) {
           // from pitching via WebSocket since WS bypasses Express auth middleware).
           // Also pulls `plan` and trial fields in the SAME query so the paywall costs no extra
           // round trip.
+           console.log("⚙️ [client_ready]: Checking Supabase user...");
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
@@ -1544,6 +1558,7 @@ export function initRestSocket(wss: WebSocketServer) {
               ws.close();
               return;
             }
+            console.log("⚙️ [client_ready]: Checking attempt claim...");
 
             // Email verification gate (mirrors authMiddleware + login). The WS
             // authenticates via its own jwt.verify, bypassing Express middleware,
