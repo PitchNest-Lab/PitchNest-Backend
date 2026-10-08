@@ -501,6 +501,7 @@ export function initRestSocket(wss: WebSocketServer) {
         ws.close(4001, "Authentication required");
         return;
       }
+      console.log("🔑 [DEBUG] Verification secret used:", config.jwtSecret ? `${config.jwtSecret.slice(0, 3)}***` : "UNDEFINED");
       const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
       authenticatedUserId = decoded.id;
       console.log("decoded",decoded)
