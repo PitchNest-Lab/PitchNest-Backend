@@ -502,19 +502,19 @@ export function initRestSocket(wss: WebSocketServer) {
         return;
       }
       console.log("🔑 [DEBUG] Verification secret used:", config.jwtSecret ? `${config.jwtSecret.slice(0, 3)}***` : "UNDEFINED");
-      const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
-      authenticatedUserId = decoded.id;
-      console.log("decoded",decoded)
+      // const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+      // authenticatedUserId = decoded.id;
+      // console.log("decoded",decoded)
       // Concurrency cap
-      const existing = activeWsByUser.get(authenticatedUserId);
-      console.log("existing",existing)
-      if (existing && existing.size >= MAX_WS_PER_USER) {
-        sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
-        ws.close(4002, "Too many sessions");
-        return;
-      }
-      console.log("Done")
-      trackUserWs(authenticatedUserId, ws);
+      // const existing = activeWsByUser.get(authenticatedUserId);
+      // console.log("existing",existing)
+      // if (existing && existing.size >= MAX_WS_PER_USER) {
+      //   sendJson(ws, { type: "error", message: "Too many active sessions. Close an existing session first.", code: "TOO_MANY_SESSIONS" });
+      //   ws.close(4002, "Too many sessions");
+      //   return;
+      // }
+      // console.log("Done")
+      // trackUserWs(authenticatedUserId, ws);
       console.log("Tracked all ")
     } catch (err) {
       console.error("🚨 [JWT VERIFICATION ERROR]:", err);
