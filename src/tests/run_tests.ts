@@ -18,6 +18,7 @@ import {
   entitlementsForPlan,
   getTrialEntitlement,
 } from "../services/entitlementService.ts";
+import { parseAiContentReport } from "../controllers/contentReportController.ts";
 import { sanitizeUploadName, signLocalFileUrl, verifyLocalFileToken } from "../services/storageService.ts";
 import { sanitizeFounderInput, sanitizeDeckText } from "../utils/aiTextSanitizer.ts";
 
@@ -154,6 +155,17 @@ const entExpired = entitlementsForPlan(
   "expired",
 );
 assert(entExpired.plan === "free" && entExpired.pdfDownload === false, "Expired paid + expired trial falls closed to Free");
+
+// AI content reports (app store AI-content policy)
+const goodReport = parseAiContentReport({ content: "Marcus: that idea is stupid.", reason: "Offensive", sessionId: "42", speaker: "Marcus", source: "live", platform: "ios" });
+assert(goodReport.row?.reason === "offensive" && goodReport.row?.session_id === 42, "Valid AI report accepted and normalised");
+assert(!!parseAiContentReport({ reason: "offensive" }).error, "Report without the reported content rejected");
+assert(!!parseAiContentReport({ content: "x", reason: "spam-the-db" }).error, "Report with an unknown reason rejected");
+const weird = parseAiContentReport({ content: "a".repeat(5000), reason: "other", sessionId: "1; drop", platform: "hacker", source: "x" });
+assert(
+  (weird.row?.content as string).length === 2000 && weird.row?.session_id === null && weird.row?.platform === null && weird.row?.source === null,
+  "Report fields clipped and untrusted values dropped",
+);
 
 // 12. Security — local-fallback file delivery (S7): token-gated /api/files
 const s7Url = signLocalFileUrl("1710000000_deck.pdf", 42);
