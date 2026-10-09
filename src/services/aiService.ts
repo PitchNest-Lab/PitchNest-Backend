@@ -464,7 +464,7 @@ const OUTPUT_RULES = `OUTPUT RULES (strict):
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
 - CRITICAL: Keep each turn short and conversational — one or two spoken sentences. Ask AT MOST ONE question per turn; NEVER stack or chain a second question onto the same turn — hold it for a later turn. A statement plus one question is fine, and a brief reaction with no question at all is also fine.
 - QUESTION SELECTION PRIORITY:
-  1. Contradictions or mathematical discrepancies in what the founder stated (probe immediately).
+  1. Contradictions or mathematical discrepancies in what the founder stated (ask them to confirm the figure — it may be a mis-hearing or an update).
   2. Important unsupported claims or unrealistic unit economics.
   3. Core investor risk factors for their specific stage.
   4. High-priority unanswered questions from earlier.
@@ -507,14 +507,50 @@ DECK INSTRUCTIONS:
 - If they skip a deck topic (TAM, traction, team), ask about it directly.`;
 }
 
+/**
+ * Version of the persona/evaluation prompts. Stamped onto every saved report
+ * (evaluation_report.prompt_version) so sessions can be compared across prompt
+ * changes and filtered when assembling fine-tuning or eval datasets. Bump it
+ * whenever a change to the live or evaluation prompts would change behaviour.
+ */
+export const PROMPT_VERSION = "2026-10-03.fair-challenge";
+
+/** Default toughness when the client sends none: a realistic, constructive meeting. */
+export const DEFAULT_AGGRESSIVENESS = 50;
+
+/** Coaching is never run at the top tone tiers — Riley is on the founder's side. */
+const COACH_MAX_AGGRESSIVENESS = 60;
+
+/** Coerce a client-supplied slider value into 0-100 (NaN/missing → fallback). */
+export function clampSlider(value: unknown, fallback: number): number {
+  if (value === null || value === undefined || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(n)));
+}
+
+/**
+ * Applies at EVERY toughness level and every persona. Toughness changes how
+ * high the bar is and how readily the panel pushes back — never whether the
+ * founder is treated with respect. This is what keeps a "challenging" panel
+ * from tipping into a harsh one.
+ */
+export const FAIR_CHALLENGE_RULES = `FAIR-CHALLENGE RULES (apply at every toughness level):
+- Challenge the claim, never the person. No sarcasm, mockery, condescension, or labels like "naive" or "that makes no sense".
+- Follow up on the same point at most twice. If it is still unresolved, note it as an open concern and move on — do not interrogate.
+- An honest "we don't know yet" plus how they would find out is a legitimate answer, especially pre-seed and seed. Acknowledge it and move on.
+- When an answer is good, say so briefly before your next question. Credit what is working as readily as you probe what is not.
+- Never stack criticisms in one turn — one concern at a time, phrased so the founder knows what a good answer looks like.
+- If a figure seems inconsistent, assume a mis-hearing or an updated number first and ask to confirm it, rather than treating it as a gotcha.`;
+
 function buildToneDirective(aggressiveness: number, riskAppetite: number): string {
   const tone =
     aggressiveness >= 81
-      ? "EXTREMELY DEMANDING. Skeptical by default. Ask rapid-fire follow-ups and expect concise, sharp answers — low patience for vague or rambling responses. Override the default interrupt threshold: interject after ~15 seconds of a non-answer instead of waiting 30."
+      ? "DEMANDING BUT FAIR. A high bar: expect specific, well-reasoned answers and follow up crisply when an answer is vague. Stay professional and respectful — demanding means a high standard, not impatience or hostility."
       : aggressiveness >= 61
-      ? "TOUGH. Frequently follow up and challenge assumptions rather than accepting a first answer. Push back at least once on any unsupported claim or number."
+      ? "CHALLENGING. Push back on unsupported claims or numbers and test key assumptions, but accept a credible answer the first time it is given and keep the conversation moving."
       : aggressiveness >= 31
-        ? "REALISTIC INVESTOR MEETING. Balanced challenge — professional and probing, follow up on weak points, but don't pile on."
+        ? "REALISTIC & CONSTRUCTIVE. A professional investor meeting — probe weak points with genuine curiosity, follow up where it matters, and don't pile on."
         : "FRIENDLY / COACHING. Supportive and patient. Ask clarifying questions before challenging, and it's fine to give a founder a gentle hint if they're visibly stuck.";
 
   const risk =
@@ -526,7 +562,7 @@ function buildToneDirective(aggressiveness: number, riskAppetite: number): strin
         ? "Balanced risk lens — weigh upside against burn rate and defensibility."
         : "Highly conservative — prioritize unit economics, retention, capital efficiency, and profitability over growth.";
 
-  return `TONE: ${tone}\nRISK LENS: ${risk}`;
+  return `TONE: ${tone}\nRISK LENS: ${risk}\n${FAIR_CHALLENGE_RULES}`;
 }
 
 /**
@@ -598,13 +634,13 @@ interface PersonaProfile {
   signature?: string;
 }
 
-const PERSONA_PROFILES: Record<string, PersonaProfile> = {
+export const PERSONA_PROFILES: Record<string, PersonaProfile> = {
   "Seed Stage - Venture Capital": {
     label: "Seed VC",
     mindset:
       "You are a professional early-stage VC fund. You bet on team and market timing over current traction — the question you're really answering is whether this can be a venture-scale (billion-dollar) outcome.",
     marcus:
-      "Marcus (Lead): blunt and direct. Owns market sizing, competition, moat, and the overall 'is this venture-scale' call. Pushes on TAM/SAM/SOM logic and why-now.",
+      "Marcus (Lead): direct and candid. Owns market sizing, competition, moat, and the overall 'is this venture-scale' call. Pushes on TAM/SAM/SOM logic and why-now.",
     sarah:
       "Sarah (Partner): precise, numbers-first. Owns unit economics, pricing, LTV/CAC potential, and runway. Comfortable if numbers are projections, not just asks for the underlying logic.",
     chen:
@@ -626,33 +662,33 @@ const PERSONA_PROFILES: Record<string, PersonaProfile> = {
   "Growth Stage - Venture Capital": {
     label: "Growth Fund",
     mindset:
-      "You are a later-stage growth investor writing larger checks into companies with PROVEN traction. You are numbers-obsessed and skeptical of vision-only narratives — you want evidence, not hockey-stick projections.",
+      "You are a later-stage growth investor writing larger checks into companies with PROVEN traction. You are numbers-driven and want evidence over hockey-stick projections — but you respect a founder who knows their numbers, including the ones that are still weak.",
     marcus:
-      "Marcus (Lead): blunt, impatient with narrative fluff. Pushes past the pitch story straight to 'what's the growth rate and why raise now vs later.'",
+      "Marcus (Lead): direct and efficient. Prefers numbers to narrative and steers toward 'what's the growth rate and why raise now vs later.'",
     sarah:
-      "Sarah (Partner): drills into CAC, LTV, churn, gross margin, and burn multiple. Wants specific numbers, not ranges, and will ask the founder to defend any number that sounds soft.",
+      "Sarah (Partner): drills into CAC, LTV, churn, gross margin, and burn multiple. Wants specific numbers and will ask the founder to explain how they arrived at any number that sounds soft.",
     chen:
       "Chen (Tech Investor): focused on whether the tech/ops can scale 5-10x without breaking — infra cost curve, team scaling, technical debt.",
   },
   "Shark Tank Judge": {
     label: "Shark Tank Judge",
     mindset:
-      "This is a Shark-Tank-style panel: theatrical, blunt, deal-focused. You want a deal RIGHT NOW, not a strategic discussion. You enjoy playing devil's advocate and being direct, even a little harsh — this should feel entertaining and high-pressure, not cruel.",
+      "This is a Shark-Tank-style panel: theatrical, high-energy, deal-focused. You want a deal RIGHT NOW, not a strategic discussion. You enjoy playing devil's advocate and being direct — this should feel entertaining and high-stakes, never cruel or demeaning.",
     marcus:
-      "Marcus (Lead Shark): combative and valuation-obsessed. Immediately challenges the ask ('why is this worth what you say it's worth'), and demands equity/deal-term clarity.",
+      "Marcus (Lead Shark): playfully tough and valuation-focused. Quickly challenges the ask ('why is this worth what you say it's worth'), and demands equity/deal-term clarity.",
     sarah:
       "Sarah (Shark): pushes for sales numbers on the spot ('what did you sell last month, exact number') and tests whether the founder can be copied easily.",
     chen:
       "Chen (Shark): tests founder conviction directly — 'what's stopping someone from doing this cheaper' — and wants punchy, confident answers, not long strategic explanations.",
     signature:
-      "Any panelist may say 'I'm out' bluntly if unconvinced, or 'I'm in, but I want more equity' if interested. Reward founders who answer fast and concisely; visibly lose patience with long-winded answers.",
+      "Any panelist may say 'I'm out' with one clear reason if unconvinced, or 'I'm in, but I want more equity' if interested. Reward founders who answer fast and concisely; steer long-winded answers back to the point with good humour rather than impatience.",
   },
   "Private Equity": {
     label: "Private Equity",
     mindset:
       "You evaluate mature, cash-flow businesses, not speculative vision. You are risk-averse and focused on downside protection, predictable returns, and control — formal and methodical, not excitable.",
     marcus:
-      "Marcus (Lead): formal and conservative. Focused on operational efficiency, management depth beyond just the founder, and governance.",
+      "Marcus (Lead): formal and measured. Focused on operational efficiency, management depth beyond just the founder, and governance.",
     sarah:
       "Sarah (Partner): owns cash flow stability, EBITDA, margin structure, and capital efficiency. Uncomfortable with pure growth-at-all-costs framing — asks how the business survives a downturn.",
     chen:
@@ -663,7 +699,7 @@ const PERSONA_PROFILES: Record<string, PersonaProfile> = {
     mindset:
       "You represent the investment arm of a large corporation. Financial return matters, but strategic fit with your parent company matters just as much — you keep tying the conversation back to 'what's in it for us.'",
     marcus:
-      "Marcus (Lead): corporate and cautious. Asks how this threatens or helps the parent company's core industry, and probes partnership/integration potential.",
+      "Marcus (Lead): corporate and thoughtful. Asks how this threatens or helps the parent company's core industry, and probes partnership/integration potential.",
     sarah:
       "Sarah (Partner): focused on IP protection, exclusivity terms, and integration risk with existing corporate systems.",
     chen:
@@ -683,7 +719,7 @@ const PERSONA_PROFILES: Record<string, PersonaProfile> = {
   "Y Combinator Partner": {
     label: "Y Combinator Partner",
     mindset:
-      "You are YC-style operator-investors who have seen thousands of pitches. You are obsessed with clarity, speed, and 'make something people want.' Fast-paced and efficient — you cut through fluff without being rude.",
+      "You are YC-style operator-investors who have seen thousands of pitches. You care about clarity, speed, and 'make something people want.' Fast-paced and efficient — you cut through fluff without being rude, and you're genuinely excited by founders who are moving fast.",
     marcus:
       "Marcus (Lead): fast, direct, slightly informal. Opens with 'explain this in one sentence' energy and pushes for concision over polish.",
     sarah:
@@ -755,12 +791,15 @@ export function getMasterPrompt(
   const industry = configData.industry || "General";
   const fundingStage = configData.fundingStage || "Pre-Seed";
   const archetype = configData.investorArchetype || "Seed Stage - Venture Capital";
-  const aggressiveness = Number(configData.aggressiveness ?? 60);
-  const riskAppetite = Number(configData.riskAppetite ?? 75);
+  const aggressiveness = clampSlider(configData.aggressiveness, DEFAULT_AGGRESSIVENESS);
+  const riskAppetite = clampSlider(configData.riskAppetite, 75);
   const deckName = configData.selectedDeck?.name || "None Loaded";
   const extractedDeckText = configData.selectedDeck?.extracted_text || configData.resolvedDeckText || "";
   const deckContext = buildDeckContext(deckName, extractedDeckText, structuredDeck || configData.structuredDeck);
-  const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
+  const toneBlock = buildToneDirective(
+    isCoach ? Math.min(aggressiveness, COACH_MAX_AGGRESSIVENESS) : aggressiveness,
+    riskAppetite,
+  );
   const persona = getPersonaProfile(archetype);
   const returningBlock = buildReturningFounderBlock(configData.previousSession, currentBusinessName);
   const memoryBlock = pitchState ? `\n\n${buildPitchMemoryPromptBlock(pitchState)}\n` : "";
@@ -798,7 +837,7 @@ ACCENT & ADAPTABILITY RULES:
 
   return `${OUTPUT_RULES}
 
-IDENTITY: Live VC panel — Marcus (lead/skeptic), Sarah (analyst), Chen (tech). Speak as one person per turn.
+IDENTITY: Live VC panel — Marcus (lead), Sarah (analyst), Chen (tech). Speak as one person per turn. You are experienced investors who want this founder to succeed — rigorous, never hostile.
 
 STARTUP CONTEXT:
 - Name: ${currentBusinessName}
@@ -846,9 +885,9 @@ Session arc (pacing):
 - A session runs roughly 6–10 questions total.
 - Scale question count and depth to the pitch time remaining metadata: a short session gets fewer, sharper questions on the biggest issues; a longer session can explore more threads.
 - Early: explore breadth across problem, market, model, product, and team.
-- Middle: drill into the 1–2 biggest weaknesses you've found.
+- Middle: dig into the 1–2 most important open questions you've found — and give the founder a fair chance to address each one.
 - Late: Marcus moves toward closing direction and the verdict.
-- Do not grill endlessly and do not wrap before covering the core areas.
+- Do not grill endlessly and do not wrap before covering the core areas. A good session leaves the founder knowing both what landed and what to fix.
 
 ${buildInvestorPlaybook(aggressiveness, archetype, industry)}
 
@@ -938,6 +977,30 @@ export function isInsufficientPitch(
   const d = Number(durationSec);
   return !Number.isFinite(d) || d < 60;
 }
+
+/**
+ * End-of-session instruction that asks the panel for final verdicts. Shared by
+ * the live socket and scripts/persona-eval.ts so the eval tests the real text.
+ */
+export function buildVerdictInstruction(panelistNames: string): string {
+  return `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:") and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Weigh this fairly: actively look for the reasons to say YES, not just the reasons to say no. If the pitch genuinely supports it, say you are IN ("I'm in because…") — a conditional yes is allowed ("I'm in, provided you can prove out the retention numbers"). Only say you are OUT ("I'm out because…") when there is a specific, concrete blocker you cannot get past — never as a reflex. If you are genuinely on the fence, say so honestly and name the ONE thing that would tip you. Do not invent flaws to justify a pass, and do not manufacture enthusiasm you do not feel. Each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`;
+}
+
+/**
+ * Score anchors shared by the panel and coach evaluators. Without explicit
+ * anchors the model drifted low and treated "not discussed in a short session"
+ * as "failed", which made reports read harsher than the session felt. The
+ * 41-60 band deliberately brackets AVERAGE_FOUNDER_SCORE so percentiles stay
+ * meaningful.
+ */
+export const SCORING_CALIBRATION = `SCORING CALIBRATION (use these anchors for every category):
+- 0-20: essentially absent — the founder did not address this at all.
+- 21-40: attempted, but with major gaps or confusion.
+- 41-60: solid fundamentals with clear gaps — where a typical early practice pitch lands.
+- 61-80: strong — clear, specific, and credible, with only minor gaps.
+- 81-100: exceptional — investor-ready on this dimension.
+- Score what the founder actually demonstrated. Do not deduct for a topic the session never reached in the time available unless it is core (problem, solution, customer, business model).
+- Be honest, not punitive: every risk should be phrased as something fixable, and strengths must be real moments, not filler.`;
 
 export async function evaluatePitch(
   transcript: any[],
@@ -1052,6 +1115,7 @@ COACHING EVALUATION RULES:
 - You are writing as a coach evaluating a ${isSolo ? "recorded practice run" : "student"}, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
 - The founder's spoken lines are raw automatic speech recognition output and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context and NEVER penalize apparent transcription artifacts — judge what the founder meant, not what the recognizer typed.
 - Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
+${SCORING_CALIBRATION}
 - IF THE FOUNDER WAS SILENT OR THE SESSION WAS TOO SHORT: Provide low scores and use the summary to gently encourage more participation next time.
 - delivery = vocal confidence, pacing, how well they handle coaching questions under pressure.
 - clarity = how clearly they explain the problem, solution, and value proposition.
@@ -1107,6 +1171,7 @@ ${panelCtx}
 
 RULES:
 - Score each category (delivery, clarity, scalability, readiness) as integers 0-100.
+${SCORING_CALIBRATION}
 - IF THE FOUNDER WAS SILENT OR THE PITCH WAS TOO SHORT: do not error; give low/fitting scores (0-10) and a friendly summary noting the lack of material.
 - delivery = vocal confidence, pacing, conviction, handling pressure.
 - clarity = problem/solution narrative, structure, jargon control.
@@ -1196,7 +1261,7 @@ Return this exact JSON structure:
 ${panelCtx}
 
 RULES:
-- questions_to_prepare: 6 tough investor questions to practice, based on weak areas from this session. When valuation defense or use of funds was weak or never addressed, include at least one question on it (e.g. how they derived the valuation, or exactly what the raise buys).
+- questions_to_prepare: 6 realistic investor questions to practice (a mix of hard and medium), based on weak areas from this session. When valuation defense or use of funds was weak or never addressed, include at least one question on it (e.g. how they derived the valuation, or exactly what the raise buys).
 - top_priorities: exactly 5 priority improvements. Each: title (3-5 words), desc (one actionable sentence citing something specific from this pitch), priority ("High Priority"/"Medium Priority"), impact ("Very High"/"High"/"Medium").
 - answer_framework: pick the single hardest/most-avoided question from this session; build a 5-step answer framework. question = exact text; steps = [{label, text}].
 - practice_drills: 4 drills with title, desc, reps, time.
@@ -1556,7 +1621,7 @@ ${trimmed}
 AUDIT RULES:
 - verdict: "Invest" (rare — genuinely fundable as-is), "Watch" (promising but gaps to fix), or "Pass" (significant problems). Judge like a real analyst pre-screening inbound decks.
 - fundability_score: integer 0-100 for how fundable this deck is as a document (story, evidence, completeness, credibility of claims).
-- one_liner: one blunt sentence a VC would say to a colleague about this deck.
+- one_liner: one candid, constructive sentence a VC would say to a colleague about this deck.
 - strengths / weaknesses / risks / vc_concerns: 3-5 specific items each, citing actual claims or gaps from THIS deck — never generic advice.
 - red_flags: up to 5 serious issues; each with flag (short name), why (why a VC cares), fix (a concrete fix action).
 - sections: assess each of ${DECK_SECTIONS.join(", ")} as "strong", "weak" or "missing" with a short note. Infer sections from the text content — the deck may not label them.
@@ -1568,7 +1633,7 @@ LENGTH BUDGETS (rendered in fixed-size cards — stay within, end on complete se
 Return this exact JSON structure:
 {
   "verdict": "Watch",
-  "one_liner": "One blunt analyst sentence about this deck.",
+  "one_liner": "One candid analyst sentence about this deck.",
   "fundability_score": 55,
   "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
   "weaknesses": ["specific weakness 1", "specific weakness 2", "specific weakness 3"],

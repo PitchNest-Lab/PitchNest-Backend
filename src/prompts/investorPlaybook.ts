@@ -39,7 +39,7 @@ export function buildInvestorPlaybook(
 
   const conditionalConcerns = [
     flags.regulated
-      ? "- Regulatory path: what approval this needs, who grants it, and where they actually are in that process. Belief is not a filing."
+      ? "- Regulatory path: what approval this needs, who grants it, and where they actually are in that process. If they have not started that process yet, ask what their first step is."
       : "",
     flags.physicalProduct
       ? "- Channel economics: after their margin, is there room left for a distributor or retailer to make money — does the price survive the channel?"
@@ -59,9 +59,9 @@ ${conditionalConcerns ? conditionalConcerns + "\n" : ""}- Concentration: single-
 - The founder: why this person, why this problem — one warm origin-story question per session, usually early. If the answer lands, let a brief human moment show before moving on.
 
 TACTICS:
-- A vague answer to a numbers question is never accepted: the SAME panelist follows up until there is a number or an honest "we don't know yet".
+- A vague answer to a numbers question gets a follow-up from the SAME panelist — at most twice. An honest "we don't know yet" (ideally with how they'll find out) closes the thread; acknowledge it and move on.
 - Do simple investor math out loud so the founder hears how you think.
-- Circling back: if a panelist raised a concern and got a weak or evasive answer, that SAME panelist may return to it once later ("I'm still not comfortable with your margin story"). This is the only allowed reopening of an old topic.
+- Circling back: if a panelist raised a concern and got a weak or evasive answer, that SAME panelist may return to it once later, framed as an invitation ("I'd still love to understand your margins better — anything you'd add?"). This is the only allowed reopening of an old topic.
 
 STYLE EXAMPLES (these teach form only — never reuse the topics or words; react to THIS founder's actual claims):
 Founder: We sell each unit for about four fifty.
@@ -74,10 +74,17 @@ Marcus: You just told us you're in six stores. Why does a six-store business nee
 ${buildWalkOutDirective(aggressiveness, archetype)}`;
 }
 
+/** Aggressiveness at/above which a panelist may formally declare "I'm out". */
+export const DECLARE_OUT_MIN = 85;
+/** Aggressiveness at/above which a panelist may say they're leaning out. */
+export const LEANING_OUT_MIN = 50;
+
 /**
  * Walk-out ("I'm out") behavior, generalized from the old Shark-Tank-only
- * archetype line and tuned by aggressiveness. Supportive panels rarely walk;
- * analytical / Shark-Tank panels walk readily.
+ * archetype line and tuned by aggressiveness. Mid-session walk-outs were the
+ * single harshest moment in a session, so formal "declaring out" is reserved
+ * for the top toughness band and Shark Tank (where it is the format), and it
+ * is never allowed before the founder has had a real chance to respond.
  */
 function buildWalkOutDirective(aggressiveness: number, archetype: string): string {
   const sharkTank = (archetype || "").includes("Shark Tank");
@@ -91,16 +98,16 @@ LEANING IN:
 - When the founder credibly answers a concern or shows a genuine strength, say so out loud and let your interest move — "That retention number is exactly what I wanted to hear" — rather than only ever probing for weakness.
 - If the pitch is genuinely landing for you, you may signal you're leaning in and name the one thing that would fully win you over. A warming panelist is as real as a cooling one; do not withhold earned enthusiasm.`;
 
-  if (aggressiveness >= 70 || sharkTank) {
+  if (aggressiveness >= DECLARE_OUT_MIN || sharkTank) {
     return `${leaningIn}
 
 DECLARING OUT:
 - When you are genuinely convinced this is a no for you, you may declare out — once, with ONE specific reason tied to something the founder said ("There's not enough margin left for the channel — I'm out.").
 - Out is permanent for the session. After declaring out you only make brief comments; you never ask new questions. The other panelists carry on.
-- Never declare out casually or early; it is the end of your interest, not a pressure tactic.`;
+- Never declare out casually or early — not before the founder has had a fair chance to answer your concern, and never in the first half of the session. It is the end of your interest, not a pressure tactic.`;
   }
 
-  if (aggressiveness >= 40) {
+  if (aggressiveness >= LEANING_OUT_MIN) {
     return `${leaningIn}
 
 LEANING OUT:
