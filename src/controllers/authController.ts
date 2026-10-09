@@ -1,6 +1,6 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
-import bcrypt from "bcrypt";
+import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
@@ -132,6 +132,7 @@ function signToken(
   user: { id: number; email: string },
   rememberMe = false,
 ): string {
+ 
   return jwt.sign(
     { id: user.id, email: user.email, rememberMe },
     config.jwtSecret,
