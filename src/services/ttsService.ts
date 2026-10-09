@@ -1,7 +1,7 @@
 import * as sdk from "microsoft-cognitiveservices-speech-sdk";
 import { config } from "../config/env.ts";
 
-export const PANELIST_VOICES: Record<string, string> = {
+const DEFAULT_VOICES: Record<string, string> = {
   Marcus: "en-US-DavisNeural",
   Sarah: "en-US-AriaNeural",
   Chen: "en-US-JasonNeural",
@@ -11,6 +11,31 @@ export const PANELIST_VOICES: Record<string, string> = {
   James: "en-US-JasonNeural",
   Taylor: "en-US-JennyNeural",
 };
+
+// Azure voice ids: "en-US-AvaNeural", "en-NG-EzinneNeural", and HD voices
+// such as "en-US-Andrew2:DragonHDLatestNeural".
+const VOICE_NAME_RE = /^[a-z]{2,3}-[A-Z]{2}-[A-Za-z0-9]+(?::[A-Za-z0-9]+)?$/;
+
+export function isValidVoiceName(v: string): boolean {
+  return VOICE_NAME_RE.test(v);
+}
+
+/**
+ * Each panelist's voice can be swapped without a code change, e.g.
+ * TTS_VOICE_MARCUS=en-US-Andrew2:DragonHDLatestNeural, so the team can trial
+ * more natural (HD) or regional (en-NG) voices. Invalid values are ignored.
+ */
+function voiceFromEnv(name: string, fallback: string): string {
+  const raw = process.env[`TTS_VOICE_${name.toUpperCase()}`]?.trim();
+  if (!raw) return fallback;
+  if (isValidVoiceName(raw)) return raw;
+  console.warn(`⚠️ Ignoring invalid TTS_VOICE_${name.toUpperCase()}="${raw}"; using ${fallback}`);
+  return fallback;
+}
+
+export const PANELIST_VOICES: Record<string, string> = Object.fromEntries(
+  Object.entries(DEFAULT_VOICES).map(([name, voice]) => [name, voiceFromEnv(name, voice)]),
+);
 
 export function resolveVoiceName(speaker: string): string {
   const normalized = speaker?.trim() || "Marcus";
