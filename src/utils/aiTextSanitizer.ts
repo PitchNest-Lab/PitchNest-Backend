@@ -89,7 +89,7 @@ export function sanitizeFounderInput(text: string): string {
   // bracket. LOOP until stable: a single pass on a doubled bracket ("[[SYSTEM:")
   // would only strip the inner bracket and leave "[SYSTEM:" — reconstituting the
   // directive. Iterating collapses any depth of nesting/spacing.
-  const bracketRe = /\[\s*(SYSTEM|PANEL STATE|PITCH TIME REMAINING|CURRENT SLIDE)\s*:/gi;
+  const bracketRe = /\[\s*(SYSTEM|PANEL STATE|PITCH TIME REMAINING|CURRENT SLIDE|SPEECH RECOGNITION NOTE)\s*:/gi;
   let prev: string;
   do {
     prev = out;
