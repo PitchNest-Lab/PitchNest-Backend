@@ -534,6 +534,74 @@ export function initRestSocket(wss: WebSocketServer) {
       return;
     }
 
+    // ── Connection principal check (B1) ────────────────────────────────────
+    // The JWT alone is not enough: the founder row must exist, match the
+    // token's email (blocks legacy untyped ORG tokens that collide with a
+    // founder id) and be email-verified. Started immediately but NOT awaited
+    // here, so the message listener below is registered synchronously and an
+    // early client_ready is never dropped; every message awaits the result.
+    const principalCheck: Promise<boolean> = (async () => {
+      try {
+        const { data: row, error } = await supabase
+          .from("users")
+          .select("id, email, isEmailVerified")
+          .eq("id", authenticatedUserId)
+          .maybeSingle();
+        if (error || !row || !sameEmail((row as any).email, authenticatedEmail)) {
+          sendJson(ws, {
+            type: "error",
+            message: "User account no longer exists. Please log in again.",
+            code: "USER_DELETED",
+          });
+          ws.close(4001, "Authentication failed");
+          return false;
+        }
+        if (!(row as any).isEmailVerified) {
+          sendJson(ws, {
+            type: "error",
+            message: "Please verify your email to continue.",
+            code: "EMAIL_NOT_VERIFIED",
+          });
+          ws.close(4001, "Email not verified");
+          return false;
+        }
+        return true;
+      } catch {
+        ws.close(4001, "Authentication failed");
+        return false;
+      }
+    })();
+
+    // ── Session admission (B1) ─────────────────────────────────────────────
+    // A connection is ADMITTED only once client_ready has passed every check
+    // (principal, verification, attempt + quota claims — or a validated
+    // resume). Every action that costs money or writes a session row requires
+    // admission; previously verdict_request / prepare_evaluation / end_session
+    // ran without client_ready at all, bypassing quota, verification and the
+    // token/email binding.
+    let admitted = false;
+    let settleAdmission: (ok: boolean) => void = () => {};
+    const admission = new Promise<boolean>((resolve) => {
+      settleAdmission = resolve;
+    });
+    // An action that arrives while client_ready is still running waits for
+    // its outcome instead of being dropped (the legitimate client sends
+    // client_ready first). Bounded so a crashed setup cannot hang a handler.
+    const ADMISSION_WAIT_MS = 30_000;
+    const requireAdmission = async (action: string): Promise<boolean> => {
+      if (admitted) return true;
+      if (!hasSentSetup) {
+        console.warn(`🚫 WS ${action} refused for user ${authenticatedUserId}: no client_ready (not admitted).`);
+        return false;
+      }
+      const ok = await Promise.race([
+        admission,
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), ADMISSION_WAIT_MS)),
+      ]);
+      if (!ok) console.warn(`🚫 WS ${action} refused for user ${authenticatedUserId}: admission failed.`);
+      return ok;
+    };
+
     let currentVideoUrl = "";
     let currentBusinessName = "Unknown Pitch";
     let currentUserId: number | null = authenticatedUserId;
@@ -776,6 +844,7 @@ export function initRestSocket(wss: WebSocketServer) {
         reservedRootId = null;
       }
       if (liveGrant) detachConnection(liveGrant.sid, ws);
+      settleAdmission(false);
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
@@ -1455,7 +1524,9 @@ export function initRestSocket(wss: WebSocketServer) {
     };
 
     ws.on("message", async (message, isBinary) => {
+      if (!(await principalCheck)) return;
       if (isBinary) {
+        if (!admitted) return;
         if (sttRecognizer && !sessionEnded) {
           sttRecognizer.pushAudio(message as Buffer);
         }
@@ -1472,6 +1543,7 @@ export function initRestSocket(wss: WebSocketServer) {
         // Abort the in-flight turn so the server stops generating + streaming
         // audio (the client has already silenced local playback).
         if (data.type === "interrupt") {
+          if (!admitted) return;
           if (currentTurnAbort && !currentTurnAbort.signal.aborted) {
             currentTurnAbort.abort();
           }
@@ -1489,6 +1561,7 @@ export function initRestSocket(wss: WebSocketServer) {
         // Both values are clamped to a sane range — this is client input, and a
         // nonsense page number would end up inside the model prompt.
         if (data.type === "deck_slide") {
+          if (!admitted) return;
           const slide = Number(data.slide);
           const total = Number(data.total);
           viewerSlideNumber =
@@ -1503,6 +1576,7 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "set_video_url") {
+          if (!(await requireAdmission("set_video_url"))) return;
           // Only a recording key issued to THIS user by /api/upload-video is
           // accepted. The value is later signed for playback and deleted on
           // account purge, so an arbitrary path here would expose or destroy
@@ -1787,6 +1861,14 @@ export function initRestSocket(wss: WebSocketServer) {
               resumeToken: issued.resumeToken,
               expiresAt: new Date(liveGrant.deadlineMs).toISOString(),
             });
+          }
+
+          // Every gate has passed (fresh claims or validated resume): the
+          // connection may now run billable actions. Any earlier failure
+          // closed the socket, which settles admission as false.
+          if (currentUserId && liveGrant) {
+            admitted = true;
+            settleAdmission(true);
           }
           if (Number(requestedDuration) !== grantedMinutes) {
             console.log(
@@ -2154,7 +2236,7 @@ export function initRestSocket(wss: WebSocketServer) {
           return;
         }
 
-        if (data.type === "audio_chunk" && hasSentSetup) {
+        if (data.type === "audio_chunk" && admitted) {
           if (sttRecognizer && !sessionEnded) {
             try {
               const buf = Buffer.from(data.data, "base64");
@@ -2172,7 +2254,7 @@ export function initRestSocket(wss: WebSocketServer) {
           return;
         }
 
-        if (data.type === "chat_message" && hasSentSetup) {
+        if (data.type === "chat_message" && admitted) {
           lastUserActivityTime = Date.now();
           hasNudged = false;
 
@@ -2272,6 +2354,7 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "verdict_request") {
+          if (!(await requireAdmission("verdict_request"))) return;
           console.log("🗳️ Verdict requested by user.");
           if (idleCheckInterval) {
             clearInterval(idleCheckInterval);
@@ -2369,6 +2452,7 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "prepare_evaluation") {
+          if (!(await requireAdmission("prepare_evaluation"))) return;
           // Kick off the evaluation in the background the moment the user ends
           // their pitch, so it runs in parallel with the verdict phase. By the
           // time the panel finishes speaking, the report is usually ready.
@@ -2406,6 +2490,7 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "end_session") {
+          if (!(await requireAdmission("end_session"))) return;
           if (sessionEnded) return;
           sessionEnded = true;
           // The admission is spent: it can produce exactly one session row.

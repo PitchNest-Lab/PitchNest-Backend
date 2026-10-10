@@ -78,6 +78,21 @@ The baseline H5 run shows a quota-exhausted user getting a live session after se
 
 ---
 
+## B1 — Live Pitch actions without admission (found in release review)
+
+- **Root cause:**
+  - `verdict_request`, `prepare_evaluation` and `end_session` had no `client_ready`/setup guard. Any accepted token could obtain an AI evaluation and a saved session row.
+  - That skipped the quota and attempt claims, the email-verification check and the token↔email binding. A legacy org token colliding with a founder id could write rows into that founder's account.
+  - Reproduced with a probe on `7d47276`: a quota-exhausted founder, an unverified founder and a colliding legacy org token all received a report and a row.
+- **Fix** (`restSocket.ts`):
+  1. **At connect,** the founder row must exist, match the token email and be verified, otherwise the socket closes with 4001 (`USER_DELETED` / `EMAIL_NOT_VERIFIED`). The check starts immediately but isn't awaited before the message listener is registered; every message awaits it, so a fast `client_ready` is never dropped.
+  2. **Admission:** the connection is admitted only after `client_ready` passes every gate (fresh quota and attempt claims, or a validated resume).
+     - `end_session`, `verdict_request`, `prepare_evaluation` and `set_video_url` require admission. If they arrive while `client_ready` is still running, they wait for its outcome (bounded to 30 s) rather than being dropped.
+     - `chat_message`, `audio_chunk`, binary audio, `interrupt` and `deck_slide` are dropped until admitted.
+     - A closed socket settles admission as failed.
+- **Legitimate flows preserved:** normal pitch, `end_session` sent immediately after `client_ready`, and refresh resume (existing tests) all still work. One admission still yields exactly one report and one quota slot.
+- **Tests:** `src/tests/security/ws-admission.test.ts` has 7 tests. Each refusal case is paired with a positive control.
+
 ## Files changed
 
 | File | Change |
@@ -89,7 +104,7 @@ The baseline H5 run shows a quota-exhausted user getting a live session after se
 | `src/controllers/organization/organizationController.ts` | Scope from authenticated org |
 | `src/controllers/authController.ts` | Org login with bcrypt; typed tokens; no row logging; purge uses recording ownership |
 | `src/services/liveSessionGrants.ts` (new) | Server-side resume grants |
-| `src/sockets/restSocket.ts` | Typed verify + email binding; validated resume; `set_video_url` validation; grant lifecycle |
+| `src/sockets/restSocket.ts` | Typed verify + email binding; validated resume; `set_video_url` validation; grant lifecycle; B1 connect-time principal check + admission gate |
 | `src/utils/recordingAuth.ts` (new) | Recording key ownership rules |
 | `src/controllers/uploadController.ts` | User-scoped recording keys |
 | `src/controllers/sessionController.ts` | Sign only authorized recordings |
@@ -103,7 +118,7 @@ The baseline H5 run shows a quota-exhausted user getting a live session after se
 |---|---|
 | `npx tsc --noEmit` | Pass |
 | Existing `run_tests.ts` (45 assertions), `deck_type_test.ts` | Pass |
-| `npx tsx --test src/tests/security/*.test.ts` | **32/32 pass** |
+| `npx tsx --test src/tests/security/*.test.ts` | **39/39 pass** (32 + 7 for B1) |
 | Same vulnerability tests on unfixed `main` | Fail as expected (above) |
 | Lambda bundle (esbuild, same flags, built to a scratch directory) | Builds; `dist/` untouched |
 | `server.ts` (Render entry point) local boot | `/api/health` 200; org route with no token → 401; WebSocket with bad token → close 4001 |
