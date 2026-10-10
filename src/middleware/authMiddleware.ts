@@ -1,12 +1,21 @@
 import { Request, Response, NextFunction } from "express";
-import jwt from "jsonwebtoken";
-import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
+import {
+  bearerToken,
+  sameEmail,
+  verifyUserToken,
+} from "../services/tokenService.ts";
 
 /**
- * Express middleware that validates JWT tokens on protected routes.
+ * Express middleware that validates FOUNDER tokens on protected routes.
  * Extracts the token from the Authorization header (Bearer <token>),
  * verifies it, checks if the user still exists, and attaches the decoded user payload to req.user.
+ *
+ * Organization tokens are rejected here (see tokenService). Legacy untyped
+ * tokens are accepted only when their email matches the resolved users row,
+ * which is what stops a pre-fix organization token — same untyped shape,
+ * carrying Organizations.id — from authenticating as the founder who shares
+ * that numeric id.
  */
 
 // Extend Express Request type to include user payload
@@ -19,26 +28,29 @@ declare global {
 }
 
 export const authMiddleware = async (req: Request, res: Response, next: NextFunction) => {
-  const authHeader = req.headers.authorization;
+  const token = bearerToken(req.headers.authorization);
 
-  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+  if (!token) {
     return res.status(401).json({ error: "Authentication required. Please log in." });
   }
 
-  const token = authHeader.split(" ")[1];
+  let decoded;
+  try {
+    decoded = verifyUserToken(token);
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token. Please log in again." });
+  }
 
   try {
-    const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string; rememberMe?: boolean };
-    
     // Verify user still exists in the database, and pull their verification
     // state in the same round trip.
     const { data: user, error } = await supabase
       .from("users")
-      .select("id, isEmailVerified")
+      .select("id, email, isEmailVerified")
       .eq("id", decoded.id)
       .maybeSingle();
 
-    if (error || !user) {
+    if (error || !user || !sameEmail(user.email, decoded.email)) {
       return res.status(401).json({ error: "User no longer exists or access revoked. Please log in again." });
     }
 
@@ -55,7 +67,7 @@ export const authMiddleware = async (req: Request, res: Response, next: NextFunc
       });
     }
 
-    req.user = decoded;
+    req.user = { id: decoded.id, email: decoded.email, rememberMe: decoded.rememberMe };
     next();
   } catch (err) {
     return res.status(401).json({ error: "Invalid or expired token. Please log in again." });

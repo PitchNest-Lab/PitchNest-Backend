@@ -4,7 +4,7 @@ import { config } from "../config/env.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { getEntitlements } from "../services/entitlementService.ts";
 import { signLocalFileUrl } from "../services/storageService.ts";
-import { storagePathFromUrl } from "../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 import {
   computeAttemptStates,
   loadAttemptStates,
@@ -215,24 +215,29 @@ export const getSessionRecording = async (req: Request, res: Response) => {
       return res.json({ url: "", available: false });
     }
 
-    // Local-fallback recording — token-gated through /api/files, which verifies
-    // ownership against the sessions table for this name.
-    if (stored.startsWith("/uploads/")) {
-      const name = stored.slice("/uploads/".length);
+    // The stored value must resolve to a recording THIS user owns. Owning the
+    // session row is not enough on its own: video_url historically came from
+    // the client, so it could name any object in the private bucket. Anything
+    // unauthorised is reported as "no recording" rather than an error, so the
+    // response does not reveal whether some other object exists.
+    const target = await authorizedRecordingTarget(stored, userId);
+    if (!target) {
+      console.warn(`⚠️ getSessionRecording: session ${session.id} has an unauthorised recording reference; not signing.`);
+      return res.json({ url: "", available: false });
+    }
+
+    // Local-fallback recording — token-gated through /api/files, which
+    // re-verifies ownership at serve time.
+    if (target.kind === "local") {
       return res.json({
-        url: signLocalFileUrl(name, userId, RECORDING_URL_TTL_SECONDS),
+        url: signLocalFileUrl(target.name, userId, RECORDING_URL_TTL_SECONDS),
         available: true,
       });
     }
 
-    const objectPath = storagePathFromUrl(stored);
-    if (!objectPath) {
-      return res.json({ url: stored, available: true });
-    }
-
     const { data: signed, error: signErr } = await supabase.storage
       .from(config.storageBucket)
-      .createSignedUrl(objectPath, RECORDING_URL_TTL_SECONDS);
+      .createSignedUrl(target.path, RECORDING_URL_TTL_SECONDS);
 
     if (signErr || !signed?.signedUrl) {
       console.error("❌ createSignedUrl failed in getSessionRecording:", signErr);

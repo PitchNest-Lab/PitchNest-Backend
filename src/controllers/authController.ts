@@ -1,13 +1,14 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
-import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
+import { signOrgToken, signUserToken } from "../services/tokenService.ts";
 import { config } from "../config/env.ts";
 import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -132,12 +133,8 @@ function signToken(
   user: { id: number; email: string },
   rememberMe = false,
 ): string {
- 
-  return jwt.sign(
-    { id: user.id, email: user.email, rememberMe },
-    config.jwtSecret,
-    { expiresIn: rememberMe ? "30d" : "24h" },
-  );
+  // Typed founder token (typ:"user") — see tokenService for why the type exists.
+  return signUserToken(user, rememberMe);
 }
 
 /**
@@ -389,43 +386,86 @@ export const login = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * A real bcrypt hash ($2a$/$2b$/$2y$ + cost + 53 chars). Anything else — NULL,
+ * empty, plaintext, a placeholder — is treated as "no usable password" and the
+ * login is refused. We never compare against, upgrade, or create a password
+ * here: an organization without a hash must go through an explicit, out-of-band
+ * password-setup flow (see docs/security/phase-0-remediation.md).
+ */
+const BCRYPT_HASH_RE = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
+
+// Compared against when the email is unknown or the row has no usable hash, so
+// "no such org" and "wrong password" take the same time. A hash of a random
+// value that is never stored anywhere; built on first use so it adds nothing
+// to cold start.
+let dummyBcryptHash: string | null = null;
+function getDummyBcryptHash(): string {
+  dummyBcryptHash ??= bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
+  return dummyBcryptHash;
+}
+
 export const orgLogin = async (req: Request, res: Response) => {
   try {
-    const { email, password, rememberMe } = req.body;
-    if (!email || !password) {
+    const { email, password, rememberMe } = req.body ?? {};
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email ||
+      !password
+    ) {
       return res
         .status(400)
         .json({ error: "Email and password are required." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
-    const { data: user, error } = await supabase
+    // select("*") because toPublicUser reads plan/trial columns whose presence
+    // on Organizations is not recorded in migrations. The row is never logged.
+    const { data: org, error } = await supabase
       .from("Organizations")
       .select("*")
       .eq("email", cleanEmail)
       .maybeSingle();
-    console.log(user);
-    if (error || !user) {
+
+    const storedHash: unknown = org?.password;
+    const hasUsableHash =
+      typeof storedHash === "string" && BCRYPT_HASH_RE.test(storedHash);
+
+    const passwordOk = await bcrypt.compare(
+      password,
+      hasUsableHash ? (storedHash as string) : getDummyBcryptHash(),
+    );
+
+    if (error || !org || !hasUsableHash || !passwordOk) {
+      if (org && !hasUsableHash) {
+        // Operator signal only — id, never the row, email or hash.
+        console.warn(
+          `⚠️ Organization login refused: org ${org.id} has no usable password hash (password setup required).`,
+        );
+      }
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    // Compare hashed password
-    // const isValidPassword = await bcrypt.compare(password, user.password);
-    // if (!isValidPassword) {
-    //   return res.status(401).json({ error: "Invalid credentials." });
-    // }
+    const orgCode = Number(org.org_code);
+    if (!Number.isFinite(orgCode)) {
+      console.error(`❌ Organization login refused: org ${org.id} has no valid org_code.`);
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
 
-    const token = signToken(
-      { id: user.id, email: user.email },
+    const token = signOrgToken(
+      { id: Number(org.id), orgCode, email: org.email },
       rememberMe === true,
     );
 
+    // Same `user` shape the (unreleased) dashboard already stores, plus two
+    // additive fields so a client can tell an org session from a founder one.
     res.status(200).json({
-      user: toPublicUser(user),
+      user: { ...toPublicUser(org), principal: "org", orgCode },
       token,
     });
   } catch (error) {
-    console.error("Login error:", error);
+    console.error("Organization login error:", (error as any)?.message || error);
     res.status(500).json({ error: "Login failed" });
   }
 };
@@ -1046,8 +1086,10 @@ async function purgeUserAccount(userId: number): Promise<void> {
     if (path) mediaPaths.add(path);
   }
   for (const session of sessions || []) {
-    const path = storagePathFromUrl(session.video_url); // main media bucket
-    if (path) mediaPaths.add(path);
+    // video_url used to be client-supplied, so it is only deleted when it
+    // resolves to a recording this user owns — never another user's object.
+    const target = await authorizedRecordingTarget(session.video_url, userId);
+    if (target?.kind === "storage") mediaPaths.add(target.path);
   }
 
   // Avatars live in a SEPARATE public bucket — extract with that bucket's marker

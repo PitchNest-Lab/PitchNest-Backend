@@ -1,6 +1,5 @@
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage } from "http";
-import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import {
@@ -65,6 +64,17 @@ import {
   type AttemptClaim,
 } from "../services/pitchAttemptService.ts";
 import crypto from "crypto";
+import { sameEmail, verifyUserToken } from "../services/tokenService.ts";
+import {
+  attachConnection,
+  detachConnection,
+  issueGrant,
+  markGrantEnded,
+  remainingSeconds,
+  resolveResume,
+  type LiveSessionGrant,
+} from "../services/liveSessionGrants.ts";
+import { isClientRecordingValueAcceptable } from "../utils/recordingAuth.ts";
 
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
 // garbled and ask the founder to repeat instead of answering it.
@@ -490,6 +500,10 @@ export function initRestSocket(wss: WebSocketServer) {
     // Clients must pass ?token=<JWT> as a query param on the WS URL.
     // Without a valid token the connection is closed immediately.
     let authenticatedUserId: number | null = null;
+    // Email carried by the token; bound to the users row at client_ready so a
+    // legacy untyped ORGANIZATION token (same shape, Organizations.id) can never
+    // open a founder's session. See tokenService.
+    let authenticatedEmail = "";
     try {
       const url = new URL(req.url || "", `http://${req.headers.host}`);
       const token = url.searchParams.get("token");
@@ -498,8 +512,11 @@ export function initRestSocket(wss: WebSocketServer) {
         ws.close(4001, "Authentication required");
         return;
       }
-      const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+      // Founder tokens only — organization tokens and other signed artefacts
+      // (file tokens, resume grants) are rejected here.
+      const decoded = verifyUserToken(token);
       authenticatedUserId = decoded.id;
+      authenticatedEmail = decoded.email;
 
       // Concurrency cap
       const existing = activeWsByUser.get(authenticatedUserId);
@@ -510,7 +527,7 @@ export function initRestSocket(wss: WebSocketServer) {
       }
       trackUserWs(authenticatedUserId, ws);
     } catch (err) {
-      console.error("🚨 [JWT VERIFICATION ERROR]:", err);
+      console.warn("🚫 WS auth rejected:", (err as any)?.message || "invalid token");
 
       sendJson(ws, { type: "error", message: "Invalid or expired token.", code: "AUTH_FAILED" });
       ws.close(4001, "Authentication failed");
@@ -546,6 +563,10 @@ export function initRestSocket(wss: WebSocketServer) {
     // Root id this connection reserved a live slot for, so the reservation is
     // released exactly once on close even if the session ended earlier.
     let reservedRootId: number | null = null;
+    // The server-side admission this connection holds (fresh or resumed). Set
+    // at client_ready once quota/attempt claims pass, or when a resume is
+    // validated against an existing admission. See liveSessionGrants.
+    let liveGrant: LiveSessionGrant | null = null;
     let sttRecognizer: StreamingRecognizer | null = null;
     // Structured Pitch Memory State & Deck Intelligence
     let pitchSessionState: PitchSessionState = createPitchSessionState();
@@ -754,6 +775,7 @@ export function initRestSocket(wss: WebSocketServer) {
         releaseLiveAttempt(reservedRootId);
         reservedRootId = null;
       }
+      if (liveGrant) detachConnection(liveGrant.sid, ws);
     });
 
     sendJson(ws, { type: "status", status: "vertex_ready" });
@@ -1481,7 +1503,20 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "set_video_url") {
-          currentVideoUrl = data.url;
+          // Only a recording key issued to THIS user by /api/upload-video is
+          // accepted. The value is later signed for playback and deleted on
+          // account purge, so an arbitrary path here would expose or destroy
+          // another user's object. See utils/recordingAuth.ts.
+          if (!isClientRecordingValueAcceptable(data.url, currentUserId)) {
+            console.warn(`🚫 set_video_url rejected for user ${currentUserId}: not an owned recording key.`);
+            sendJson(ws, {
+              type: "error",
+              code: "INVALID_RECORDING",
+              message: "That recording could not be attached to this session.",
+            });
+            return;
+          }
+          currentVideoUrl = String(data.url).trim();
           if (sessionId && config.supabaseUrl && config.supabaseAnonKey) {
             try {
               await supabase
@@ -1516,11 +1551,11 @@ export function initRestSocket(wss: WebSocketServer) {
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
-              .select("id, isEmailVerified, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
+              .select("id, email, isEmailVerified, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
               .eq("id", currentUserId)
               .maybeSingle();
 
-            if (userErr || !dbUser) {
+            if (userErr || !dbUser || !sameEmail((dbUser as any).email, authenticatedEmail)) {
               console.error("❌ WS client_ready: User not found in database. Rejecting.");
               sendJson(ws, {
                 type: "error",
@@ -1618,7 +1653,45 @@ export function initRestSocket(wss: WebSocketServer) {
           //
           // A resume is not a new attempt — it rejoins a session that was
           // already admitted and already counted.
-          if (currentUserId && !isResume) {
+          // A resume skips the quota and attempt claims ONLY when it continues a
+          // session this server already admitted for this user. The client's
+          // `resume: true` is a UX hint (rebuild history, skip greeting), never
+          // an authorisation. An unverifiable resume is admitted as a NEW
+          // session and pays the normal claims.
+          let resumeAuthorized = false;
+          if (currentUserId && isResume) {
+            const resolution = resolveResume({
+              userId: currentUserId,
+              resumeToken: data.resumeToken,
+            });
+            if (resolution.ok) {
+              resumeAuthorized = true;
+              liveGrant = resolution.grant;
+              const displaced = attachConnection(liveGrant.sid, ws) as WebSocket | null;
+              if (displaced && displaced.readyState === WebSocket.OPEN) {
+                displaced.close(4007, "Session resumed elsewhere");
+              }
+              if (liveGrant.attempt) {
+                attemptClaim = {
+                  allowed: true,
+                  pitchRootId: liveGrant.attempt.pitchRootId,
+                  attemptNumber: liveGrant.attempt.attemptNumber,
+                  attemptsUsed: Math.max(0, liveGrant.attempt.attemptNumber - 1),
+                  attemptsRemaining: Math.max(0, MAX_PITCH_ATTEMPTS - liveGrant.attempt.attemptNumber),
+                  maxAttempts: MAX_PITCH_ATTEMPTS,
+                };
+                reserveLiveAttempt(liveGrant.attempt.pitchRootId);
+                reservedRootId = liveGrant.attempt.pitchRootId;
+              }
+              console.log(`🔁 Resume authorised for user ${currentUserId} via ${resolution.source}.`);
+            } else {
+              console.warn(
+                `⚠️ Resume not authorised for user ${currentUserId} (${"reason" in resolution ? resolution.reason : "unknown"}) — admitting as a new session.`,
+              );
+            }
+          }
+
+          if (currentUserId && !resumeAuthorized) {
             attemptClaim = await claimPitchAttempt(currentUserId, parentSessionId);
             if (!attemptClaim.allowed) {
               console.warn(
@@ -1656,8 +1729,9 @@ export function initRestSocket(wss: WebSocketServer) {
           // ── Paywall: quota ────────────────────────────────────────────────
           // Checked BEFORE any Azure STT/LLM/TTS work so a refused session costs
           // nothing. A resume continues an already-metered session, so it never
-          // re-checks and never re-meters.
-          if (currentUserId && !isResume) {
+          // re-checks and never re-meters — but only a resume VALIDATED against
+          // a server-side admission (resumeAuthorized), not the client flag.
+          if (currentUserId && !resumeAuthorized) {
             // Atomic claim (check + record in one op) closes the race where two
             // concurrent connections could both pass a separate check and both
             // record, exceeding the weekly cap.
@@ -1694,6 +1768,26 @@ export function initRestSocket(wss: WebSocketServer) {
           // "Pitch Again" prefills what the user may actually run.
           const requestedDuration = clientConfig.duration;
           const grantedMinutes = resolveDuration(requestedDuration, entitlement);
+
+          // Record the admission so a later reconnect can be validated, and give
+          // the client a signed resume token (clients that ignore this message
+          // still resume via the per-process registry).
+          if (currentUserId && !resumeAuthorized) {
+            const issued = issueGrant({
+              userId: currentUserId,
+              attempt: attemptClaim?.pitchRootId
+                ? { pitchRootId: attemptClaim.pitchRootId, attemptNumber: attemptClaim.attemptNumber }
+                : null,
+              grantedMinutes,
+            });
+            liveGrant = issued.grant;
+            attachConnection(liveGrant.sid, ws);
+            sendJson(ws, {
+              type: "session_grant",
+              resumeToken: issued.resumeToken,
+              expiresAt: new Date(liveGrant.deadlineMs).toISOString(),
+            });
+          }
           if (Number(requestedDuration) !== grantedMinutes) {
             console.log(
               `⏱️ Duration clamped for user ${currentUserId} (${entitlement.plan}): requested ${requestedDuration} → granted ${grantedMinutes} min`,
@@ -1966,6 +2060,9 @@ export function initRestSocket(wss: WebSocketServer) {
           // On resume (reconnect after refresh) the client reports how much
           // time was actually left — otherwise the server clock would restart
           // at the full duration and time_sync would extend the session.
+          if (resumeAuthorized && liveGrant) {
+            initialDurationSeconds = Math.min(initialDurationSeconds, remainingSeconds(liveGrant));
+          }
           if (isResume && Number.isFinite(Number(data.timeLeftSeconds))) {
             initialDurationSeconds = Math.min(
               initialDurationSeconds,
@@ -2311,6 +2408,8 @@ export function initRestSocket(wss: WebSocketServer) {
         if (data.type === "end_session") {
           if (sessionEnded) return;
           sessionEnded = true;
+          // The admission is spent: it can produce exactly one session row.
+          if (liveGrant) markGrantEnded(liveGrant.sid);
           if (sttRecognizer) {
             sttRecognizer.stop();
             sttRecognizer = null;

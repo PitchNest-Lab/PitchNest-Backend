@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import { supabase } from "../config/supabase.ts";
 import { uploadDir, verifyLocalFileToken } from "../services/storageService.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 
 /**
  * S7: token-gated delivery for LOCAL-FALLBACK files.
@@ -57,13 +58,19 @@ export const getLocalFile = async (req: Request, res: Response) => {
   let owned = !!deck;
 
   if (!owned) {
-    const { data: session } = await supabase
+    const { data: sessions } = await supabase
       .from("sessions")
       .select("id")
       .eq("video_url", storedPath)
       .eq("user_id", uid)
-      .maybeSingle();
-    owned = !!session;
+      .limit(1);
+    // A session row pointing at the file is not proof on its own: video_url
+    // used to be client-supplied, so the name must also be a recording this
+    // user owns (rec_<uid>_… or an unshared legacy name).
+    owned =
+      Array.isArray(sessions) &&
+      sessions.length > 0 &&
+      (await authorizedRecordingTarget(storedPath, uid)) !== null;
   }
 
   if (!owned) {

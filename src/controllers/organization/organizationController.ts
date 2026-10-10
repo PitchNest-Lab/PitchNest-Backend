@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { supabase } from "../../config/supabase.ts";
+import { resolveOrgScope } from "../../middleware/orgAuthMiddleware.ts";
 import {
   pitchScoreFromReport,
   isCompletePitch,
@@ -37,7 +38,9 @@ const getOrg = async (orgId: string) => {
 /* ---------------- ORGANIZATION DETAILS (full profile + QR link) ---------------- */
 export const orgDetails = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const org = await getOrg(orgId);
 
     if (!org) {
@@ -76,7 +79,9 @@ export const orgDetails = async (req: Request, res: Response) => {
 /* ---------------- OVERVIEW ---------------- */
 export const overview = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const org = await getOrg(orgId);
 
     const users = await getOrgUsers(orgId);
@@ -144,7 +149,9 @@ export const overview = async (req: Request, res: Response) => {
 /* ---------------- SEATS ---------------- */
 export const seats = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const org = await getOrg(orgId);
     const users = await getOrgUsers(orgId);
 
@@ -184,7 +191,9 @@ export const seats = async (req: Request, res: Response) => {
 /* ---------------- ACTIVITY ---------------- */
 export const activity = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(users.map((u) => u.id));
 
@@ -236,7 +245,9 @@ export const activity = async (req: Request, res: Response) => {
 /* ---------------- FOUNDER DRILL-DOWN ---------------- */
 export const founderDrill = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(users.map((u) => u.id));
 
@@ -321,7 +332,9 @@ export const founderDrill = async (req: Request, res: Response) => {
 /* ---------------- MEMBER LIST ---------------- */
 export const memberList = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(users.map((u) => u.id));
 
@@ -406,7 +419,10 @@ const buildReport = (sessions: any[], users: any[], rangeStart: Date, rangeEnd: 
 // weekly: pass any date inside the target week (defaults to current week)
 export const weeklyReport = async (req: Request, res: Response) => {
   try {
-    const { orgId, date } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
+    const { date } = req.body ?? {};
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(users.map((u) => u.id));
 
@@ -436,7 +452,10 @@ export const weeklyReport = async (req: Request, res: Response) => {
 // monthly: pass month (0-11) + year, defaults to current month
 export const monthlyReport = async (req: Request, res: Response) => {
   try {
-    const { orgId, month, year } = req.body;
+    const scope = resolveOrgScope(req, res);
+    if (scope === null) return;
+    const orgId = String(scope);
+    const { month, year } = req.body ?? {};
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(users.map((u) => u.id));
 

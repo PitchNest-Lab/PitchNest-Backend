@@ -4,6 +4,7 @@ import { config } from "../config/env.ts";
 import { uploadDir, sanitizeUploadName } from "../services/storageService.ts";
 import path from "path";
 import fs from "fs";
+import { localRecordingNameFor, recordingObjectPathFor } from "../utils/recordingAuth.ts";
 
 /**
  * Stores a completed session's AUDIO recording.
@@ -19,8 +20,15 @@ export const uploadVideo = async (req: Request, res: Response) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No audio file provided" });
 
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ error: "Authentication required" });
+
+    // The key carries the owner's id so ownership can be proven later from the
+    // key alone — the client echoes this value back over the WebSocket
+    // (set_video_url), and the server only accepts keys under the caller's own
+    // prefix. See utils/recordingAuth.ts.
     const originalName = sanitizeUploadName(req.file.originalname || `pitch.webm`);
-    const filePath = `pitches/${Date.now()}_${originalName}`;
+    const filePath = recordingObjectPathFor(userId, originalName);
 
     const { data, error } = await supabase.storage
       .from(config.storageBucket)
@@ -31,7 +39,7 @@ export const uploadVideo = async (req: Request, res: Response) => {
 
     if (error) {
       // Local fallback if Supabase Storage has an issue
-      const localName = `${Date.now()}_${originalName}`;
+      const localName = localRecordingNameFor(userId, originalName);
       fs.writeFileSync(path.join(uploadDir, localName), req.file.buffer);
       return res.status(200).json({ videoUrl: `/uploads/${localName}` });
     }
