@@ -16,17 +16,20 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   const token = crypto.randomBytes(32).toString("hex");
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+  console.log("done")
 
   // 2. Delete any old tokens for this user
   await supabase
     .from("email_verification_tokens")
     .delete()
     .eq("user_id", userId);
+     console.log("done2")
 
   // 3. Save new token to Supabase
   let { error } = await supabase
     .from("email_verification_tokens")
     .insert({ user_id: userId, token, code, expires_at: expiresAt, attempts: 0 });
+   console.log("done3")
 
   // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
   // fall back to storing just the high-entropy link token so signup and the
@@ -48,6 +51,8 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   // broken double-slash link (e.g. https://app//verify).
   const baseUrl = (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, "");
   const verifyUrl = `${baseUrl}/verify?token=${token}`;
+
+   console.log("base",baseUrl)
 
   if (!process.env.RESEND_API_KEY) {
     throw new Error(
@@ -89,6 +94,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
         </div>
       `,
     });
+    console.log("done final")
 
     if (error) {
       throw new Error(error.message);
