@@ -4,8 +4,8 @@ import {
   hasBillingConfig,
   resolvePlanPrice,
   listBillingCatalog,
-  isPaidPlan,
-  isBillingTerm,
+  isPurchasable,
+  PURCHASABLE_SKU,
   type PaidPlan,
   type BillingTerm,
 } from "../config/env.ts";
@@ -39,14 +39,18 @@ function pricingPayload() {
 }
 
 /**
- * Parses the requested SKU from a checkout request body, defaulting to the
- * headline Pro monthly. Anything unrecognised falls back rather than 400-ing, so
- * a stale client can still buy the default plan.
+ * Resolves the requested SKU from a checkout request body.
+ *
+ * Only Pro monthly is purchasable (PURCHASABLE_SKU). A request that names no
+ * plan/term — what the web client sends — means Pro monthly. A request that
+ * EXPLICITLY names anything else (annual, Prep) is refused rather than
+ * silently converted, so a client can never believe it bought one SKU while
+ * being charged for another. Returns null when the selection is refused.
  */
-function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } {
-  const plan: PaidPlan = isPaidPlan(body?.plan) ? body.plan : "pro";
-  const term: BillingTerm = isBillingTerm(body?.term) ? body.term : "monthly";
-  return { plan, term };
+function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } | null {
+  const plan: PaidPlan = body?.plan === undefined ? PURCHASABLE_SKU.plan : body.plan;
+  const term: BillingTerm = body?.term === undefined ? PURCHASABLE_SKU.term : body.term;
+  return isPurchasable(plan, term) ? { plan, term } : null;
 }
 
 /**
@@ -167,6 +171,14 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
+    const selection = parseSelection(req.body);
+    if (!selection) {
+      return res.status(400).json({
+        error: "plan_not_available",
+        message: "Only the Pro monthly plan is available.",
+      });
+    }
+
     const { data: user } = await supabase
       .from("users")
       .select("id, email, name, plan, plan_expires_at")
@@ -183,8 +195,6 @@ export const startCheckout = async (req: Request, res: Response) => {
         message: "Your account already has full access.",
       });
     }
-
-    const selection = parseSelection(req.body);
 
     const session = await createCheckout(
       {
@@ -204,6 +214,7 @@ export const startCheckout = async (req: Request, res: Response) => {
     const code: string = err?.code ?? "UNKNOWN";
     const status =
       code === "BILLING_NOT_CONFIGURED" ? 503 :
+      code === "PLAN_NOT_AVAILABLE" ? 400 :
       code === "PAYMENT_RECORD_FAILED" ? 500 :
       502; // CHECKOUT_INIT_FAILED and anything unexpected: upstream/transient.
 
@@ -211,6 +222,7 @@ export const startCheckout = async (req: Request, res: Response) => {
     // the same friendly text. Neither carries `err.detail`, which is log-only.
     const reason =
       code === "BILLING_NOT_CONFIGURED" ? "billing_unavailable" :
+      code === "PLAN_NOT_AVAILABLE" ? "plan_not_available" :
       code === "PAYMENT_RECORD_FAILED" ? "record_failed" :
       code === "CHECKOUT_INIT_FAILED" ? "provider_rejected" :
       "unknown";

@@ -1,6 +1,8 @@
 import crypto from "crypto";
 import {
   config,
+  hasBillingConfig,
+  isPurchasable,
   resolvePlanPrice,
   type PaidPlan,
   type BillingTerm,
@@ -41,6 +43,7 @@ export class CheckoutError extends Error {
   constructor(
     public code:
       | "BILLING_NOT_CONFIGURED"
+      | "PLAN_NOT_AVAILABLE"
       | "PAYMENT_RECORD_FAILED"
       | "CHECKOUT_INIT_FAILED",
     public detail?: string,
@@ -75,8 +78,13 @@ export async function createCheckout(
     term: BillingTerm;
   },
 ): Promise<CheckoutSession> {
-  if (!config.flutterwaveSecretKey) {
+  // Same gates as the controller, enforced again here so no other caller can
+  // create a charge: the kill switch + keys, and the single purchasable SKU.
+  if (!hasBillingConfig()) {
     throw new CheckoutError("BILLING_NOT_CONFIGURED");
+  }
+  if (!isPurchasable(selection.plan, selection.term)) {
+    throw new CheckoutError("PLAN_NOT_AVAILABLE");
   }
 
   const txRef = mintTxRef(user.id);

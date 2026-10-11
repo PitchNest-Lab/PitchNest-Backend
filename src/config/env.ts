@@ -63,6 +63,11 @@ export const config = {
   // so billing is treated as NOT configured until it is set (see
   // hasBillingConfig) — the webhook also independently refuses every request.
   flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
+  // Explicit operator kill switch for checkout. Billing is only ever enabled
+  // when this is the exact string "true" AND both Flutterwave values are
+  // present — so loading the keys (e.g. granting the Lambda SSM access) can
+  // never turn checkout on by itself. Anything else, including unset, is off.
+  billingCheckoutEnabled: process.env.BILLING_CHECKOUT_ENABLED === "true",
   // Price is config, not code, so a currency or amount change is a deploy env
   // change. Amount is MAJOR units (15 = $15.00 USD).
   proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 15.00,
@@ -124,6 +129,21 @@ const TERM_DAYS: Record<BillingTerm, number> = {
 
 export function isPaidPlan(v: unknown): v is PaidPlan {
   return v === "prep" || v === "pro";
+}
+
+/**
+ * The ONLY (plan, term) combination checkout may sell: Pro, monthly.
+ * The wider catalog above stays for display compatibility, but annual terms
+ * and the Prep level are not purchasable. Checked by both the controller and
+ * createCheckout, so no caller can charge for another SKU.
+ */
+export const PURCHASABLE_SKU: Readonly<{ plan: PaidPlan; term: BillingTerm }> = Object.freeze({
+  plan: "pro",
+  term: "monthly",
+});
+
+export function isPurchasable(plan: unknown, term: unknown): boolean {
+  return plan === PURCHASABLE_SKU.plan && term === PURCHASABLE_SKU.term;
 }
 
 export function isBillingTerm(v: unknown): v is BillingTerm {
@@ -215,7 +235,20 @@ export function hasResearchConfig(): boolean {
  * missing hash must never take down auth, pitching, and everything else.
  */
 export function hasBillingConfig(): boolean {
-  return !!(config.flutterwaveSecretKey && config.flutterwaveWebhookHash);
+  // Three independent conditions: the explicit kill switch AND both
+  // Flutterwave values. Keys alone never enable checkout.
+  return !!(
+    config.billingCheckoutEnabled &&
+    config.flutterwaveSecretKey &&
+    config.flutterwaveWebhookHash
+  );
+}
+
+// Operator signal (no values): keys are present but checkout is switched off.
+if (config.flutterwaveSecretKey && config.flutterwaveWebhookHash && !config.billingCheckoutEnabled) {
+  console.info(
+    "ℹ️ Billing checkout disabled: Flutterwave keys are present but BILLING_CHECKOUT_ENABLED is not 'true'.",
+  );
 }
 
 // Loud, non-fatal warning when the secret is present but the hash is not: this

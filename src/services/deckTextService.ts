@@ -1,3 +1,4 @@
+import { ensurePdfjsNodePolyfills } from "../utils/pdfjsNodePolyfills.ts";
 /**
  * DeckTextService — extract deck text WITH its page boundaries intact.
  *
@@ -57,6 +58,9 @@ function normalizePageText(raw: string): string {
  */
 export async function extractPdfPages(buffer: Buffer): Promise<DeckExtraction> {
   try {
+    // pdfjs needs DOMMatrix at import time; on Lambda there is no native
+    // canvas to provide it (see utils/pdfjsNodePolyfills.ts).
+    ensurePdfjsNodePolyfills();
     const { PDFParse } = await import("pdf-parse");
     const parser = new PDFParse({ data: buffer });
     try {

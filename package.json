@@ -10,7 +10,9 @@
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
     "test": "tsx src/tests/run_tests.ts",
-    "build:lambda": "bash build-lambda.sh"
+    "build:lambda": "bash build-lambda.sh",
+    "build:lambda:prod": "node scripts/build-lambda-prod.mjs",
+    "verify:lambda:prod": "node scripts/verify-lambda-artifact.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ssm": "^3.1147.0",
