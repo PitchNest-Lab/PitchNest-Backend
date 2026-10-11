@@ -4,10 +4,15 @@ import fs from "fs";
 import jwt from "jsonwebtoken";
 import { config } from "../config/env.ts";
 
-// Set uploads directory based on environment (local vs GAE/GCF /tmp)
-export const uploadDir = config.isGoogleCloud 
-  ? '/tmp/uploads' 
-  : path.join(process.cwd(), 'uploads');
+// Use writable temporary storage in serverless environments.
+// AWS Lambda exposes AWS_LAMBDA_FUNCTION_NAME automatically.
+const isServerless =
+  config.isGoogleCloud ||
+  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+export const uploadDir = isServerless
+  ? "/tmp/uploads"
+  : path.join(process.cwd(), "uploads");
 
 // Ensure directory exists
 if (!fs.existsSync(uploadDir)) {
