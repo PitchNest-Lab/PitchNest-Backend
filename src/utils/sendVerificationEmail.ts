@@ -5,7 +5,10 @@ import { config } from "../config/env.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-export async function sendVerificationEmail(userId: string | number, email: string) {
+export async function sendVerificationEmail(
+  userId: string | number,
+  email: string,
+) {
   // Two factors, both cryptographically random:
   //  • token — a long, high-entropy value for the emailed LINK. Because it is
   //    unguessable, the link's global lookup (verifyEmail) is safe.
@@ -16,20 +19,26 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   const token = crypto.randomBytes(32).toString("hex");
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
-  console.log("done")
+  console.log("done");
 
   // 2. Delete any old tokens for this user
   await supabase
     .from("email_verification_tokens")
     .delete()
     .eq("user_id", userId);
-     console.log("done2")
+  console.log("done2");
 
   // 3. Save new token to Supabase
   let { error } = await supabase
     .from("email_verification_tokens")
-    .insert({ user_id: userId, token, code, expires_at: expiresAt, attempts: 0 });
-   console.log("done3")
+    .insert({
+      user_id: userId,
+      token,
+      code,
+      expires_at: expiresAt,
+      attempts: 0,
+    });
+  console.log("done3");
 
   // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
   // fall back to storing just the high-entropy link token so signup and the
@@ -49,10 +58,17 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   // 4. Send email
   // Normalize the base URL so a trailing slash in CLIENT_URL doesn't produce a
   // broken double-slash link (e.g. https://app//verify).
-  const baseUrl = (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, "");
+  const env = process.env.NODE_ENV;
+  const baseUrl =
+    env == "development"
+      ? "https://pitchnest-development.vercel.app"
+      : env == "localhost"
+        ? "http://localhost:5174"
+        : "https://www.pitchnest.app";
+
   const verifyUrl = `${baseUrl}/verify?token=${token}`;
 
-   console.log("base",baseUrl)
+  console.log("base", baseUrl);
 
   if (!process.env.RESEND_API_KEY) {
     throw new Error(
@@ -94,13 +110,15 @@ export async function sendVerificationEmail(userId: string | number, email: stri
         </div>
       `,
     });
-    console.log("done final")
+    console.log("done final");
 
     if (error) {
       throw new Error(error.message);
     }
   } catch (err: any) {
     console.error("❌ Verification email send failed:", err?.message || err);
-    throw new Error(`Failed to send verification email: ${err?.message || err}`);
+    throw new Error(
+      `Failed to send verification email: ${err?.message || err}`,
+    );
   }
 }
