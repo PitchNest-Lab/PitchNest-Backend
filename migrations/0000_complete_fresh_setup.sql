@@ -265,21 +265,6 @@ INSERT INTO storage.buckets (id, name, public)
   VALUES ('pitchnest-media', 'pitchnest-media', false)
   ON CONFLICT (id) DO UPDATE SET public = false;
 
--- Storage object policies
-ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
-
-DROP POLICY IF EXISTS "pitchnest_media_deny_anon_read" ON storage.objects;
-CREATE POLICY "pitchnest_media_deny_anon_read" ON storage.objects
-  FOR SELECT
-  TO anon
-  USING (bucket_id = 'pitchnest-media' AND false);
-
-DROP POLICY IF EXISTS "pitchnest_avatars_public_read" ON storage.objects;
-CREATE POLICY "pitchnest_avatars_public_read" ON storage.objects
-  FOR SELECT
-  TO anon, authenticated
-  USING (bucket_id = 'pitchnest-avatars');
-
 -- 16. ROW LEVEL SECURITY (RLS) ON ALL TABLES
 -- (Backend connects with service_role key which automatically bypasses RLS)
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
