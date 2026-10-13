@@ -45,8 +45,17 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (curl, server-to-server, native clients).
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Allow requests with no origin (curl, server-to-server, native clients),
+    // configured origins, wildcard '*', or Cloudflare / Vercel preview domains.
+    const isAllowed =
+      !origin ||
+      allowedOrigins.includes(origin) ||
+      allowedOrigins.includes('*') ||
+      origin.endsWith('.pages.dev') ||
+      origin.endsWith('.workers.dev') ||
+      origin.endsWith('.vercel.app');
+
+    if (isAllowed) {
       callback(null, true);
     } else if (isProduction) {
       console.warn(`⚠️ CORS blocked origin: ${origin}`);
