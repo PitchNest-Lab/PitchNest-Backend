@@ -12,6 +12,9 @@ export const config = {
   allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
+  // Default speech-recognition accent when the client does not choose one
+  // (e.g. "en-NG"). See SPEECH_LOCALES in services/speechLocale.ts.
+  azureSpeechDefaultLocale: process.env.AZURE_SPEECH_DEFAULT_LOCALE || "",
   openAiApiKey: process.env.OPENAI_API_KEY || "",
   azureOpenAiEndpoint: process.env.AZURE_OPENAI_ENDPOINT || "",
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",

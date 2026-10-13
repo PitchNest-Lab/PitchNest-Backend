@@ -24,6 +24,7 @@ import {
   hasAzureSttConfig,
   StreamingRecognizer,
 } from "../services/sttService.ts";
+import { buildSpeechPhrases, resolveSpeechLocale } from "../services/speechLocale.ts";
 import { detectSpeaker, sanitizeAiSpeech, sanitizeFounderInput } from "../utils/aiTextSanitizer.ts";
 import {
   detectEndSessionIntent,
@@ -69,6 +70,12 @@ import crypto from "crypto";
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
 // garbled and ask the founder to repeat instead of answering it.
 const LOW_STT_CONFIDENCE = 0.2;
+// Below this, a recognition is kept but flagged to the panel as possibly
+// misheard, so it clarifies instead of confidently answering garbled words.
+// Accented speech lands here far more often than outright noise does.
+const UNCERTAIN_STT_CONFIDENCE = 0.55;
+const UNCERTAIN_STT_NOTE =
+  "\n[SPEECH RECOGNITION NOTE: low confidence on this utterance; some words may be misheard. Infer the meaning from context. If a key fact (a number, name or claim) is unclear, ask the founder to repeat just that part, politely.]";
 
 // Hard wrap-up window: in the final seconds of a session the panel must not
 // launch a NEW spoken turn in response to the founder — no new questions right
@@ -1712,6 +1719,10 @@ export function initRestSocket(wss: WebSocketServer) {
             fundingStage: clientConfig.fundingStage || "",
             aggressiveness: clientConfig.aggressiveness ?? null,
             riskAppetite: clientConfig.riskAppetite ?? null,
+            speechLocale: resolveSpeechLocale(
+              clientConfig.speechLocale,
+              config.azureSpeechDefaultLocale,
+            ),
             // The GRANTED duration, not the requested one — otherwise a free
             // user's "Pitch Again" would prefill a locked value.
             duration: grantedMinutes,
@@ -1846,6 +1857,18 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           if (hasAzureSttConfig()) {
+            // Accent-aware recognition: the founder's chosen regional English
+            // model, biased towards their own business name and deck terms.
+            const speechOptions = {
+              locale: clientConfig.speechLocale,
+              phrases: buildSpeechPhrases({
+                businessName: currentBusinessName,
+                industry: clientConfig.industry,
+                // The server-side deck lookup resolves in the background, so
+                // fall back to the deck text the client sent with its config.
+                deckText: resolvedDeckText || clientConfig.selectedDeck?.extracted_text || "",
+              }),
+            };
             sttRecognizer = createStreamingRecognizer(
               (text, confidence) => {
                 if (sessionEnded) return;
@@ -1898,7 +1921,10 @@ export function initRestSocket(wss: WebSocketServer) {
                 if (!consumedByFloor && !consumedByEndFlow && !inHardWrapUp) {
                   noteFounderTurnForRoomRead();
                   enqueueTurn({
-                    text,
+                    text:
+                      confidence < UNCERTAIN_STT_CONFIDENCE
+                        ? text + UNCERTAIN_STT_NOTE
+                        : text,
                     inputMethod: "voice",
                     timeLeft: getTimeLeftSeconds(),
                   });
@@ -1949,6 +1975,7 @@ export function initRestSocket(wss: WebSocketServer) {
                   sendJson(ws, { type: "stop_audio" });
                 }
               },
+              speechOptions,
             );
           } else {
             console.warn(
