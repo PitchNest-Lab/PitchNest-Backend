@@ -3,7 +3,7 @@ import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 export async function sendVerificationEmail(userId: string | number, email: string) {
   // Two factors, both cryptographically random:
@@ -58,7 +58,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
     console.log(`======================================================\n`);
   }
 
-  if (!process.env.RESEND_API_KEY) {
+  if (!resend) {
     throw new Error(
       "Mail is not configured (RESEND_API_KEY missing). " +
         "Set this in the backend environment so verification emails can send.",

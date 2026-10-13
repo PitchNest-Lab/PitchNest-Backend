@@ -9,7 +9,7 @@ import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 const BCRYPT_ROUNDS = 12;
 const googleClient = new OAuth2Client(config.googleClientId);
@@ -721,7 +721,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
     );
     const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
 
-    if (!process.env.RESEND_API_KEY) {
+    if (!resend) {
       console.error(
         "❌ Password reset email not sent: RESEND_API_KEY missing.",
       );
