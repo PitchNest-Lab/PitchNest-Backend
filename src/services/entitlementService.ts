@@ -28,8 +28,16 @@ export const PREP_DURATIONS = [10, 20] as const;
 /** Durations a paid Pro user or Trial user may choose, in minutes. */
 export const PRO_DURATIONS = [10, 20, 30, 40] as const;
 
-/** Default trial duration in days for new users during testing period. */
-export const FREE_TRIAL_DAYS = 30;
+/**
+ * Full-access trial length for NEW signups, in days. 3 by product decision
+ * (was 30 during testing); override with FREE_TRIAL_DAYS. The end date is
+ * stored at signup, so changing this never shortens an existing user's trial;
+ * see migrations/0016_cap_existing_trials.sql for that.
+ */
+export const FREE_TRIAL_DAYS = (() => {
+  const v = Number(process.env.FREE_TRIAL_DAYS);
+  return Number.isFinite(v) && v >= 0 && v <= 90 ? Math.round(v) : 3;
+})();
 
 export interface Entitlement {
   plan: Plan;
@@ -41,7 +49,7 @@ export interface Entitlement {
   pdfDownload: boolean;
   /** May have the panel enriched with live market research. */
   liveResearch: boolean;
-  /** True when user is in the 30-day full access trial period. */
+  /** True when user is in the full-access trial period (FREE_TRIAL_DAYS). */
   isTrial: boolean;
   /** Trial days remaining if active. */
   trialDaysRemaining?: number;
@@ -74,7 +82,7 @@ const PRO: Entitlement = {
   isTrial: false,
 };
 
-/** Full Access Trial Entitlement — grants complete Pro capabilities during the 30-day testing period. */
+/** Full Access Trial Entitlement — grants complete Pro capabilities during the free trial. */
 export function getTrialEntitlement(daysRemaining: number = 30): Entitlement {
   return {
     plan: "pro",
@@ -100,7 +108,7 @@ export function isTrialActive(
   }
 
   // Derive explicit end date: if trialExpiresAt is present use it;
-  // otherwise, if trialStartedAt is present, calculate trialStartedAt + 30 days.
+  // otherwise, if trialStartedAt is present, calculate trialStartedAt + FREE_TRIAL_DAYS.
   // If neither timestamp is set, the trial is inactive (prevents perpetual free access).
   let end: Date | null = null;
   if (trialExpiresAt) {
@@ -155,7 +163,7 @@ export function entitlementsForPlan(
     }
   }
 
-  // 2. 30-Day Free Trial / Full Access check
+  // 2. Free Trial / Full Access check
   const trial = isTrialActive(trialExpiresAt, trialStatus, trialStartedAt);
   if (trial.active) {
     return getTrialEntitlement(trial.daysRemaining);
