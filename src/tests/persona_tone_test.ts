@@ -10,6 +10,7 @@ import {
   getMasterPrompt,
   PERSONA_PROFILES,
   FAIR_CHALLENGE_RULES,
+  LANGUAGE_RULE,
   SCORING_CALIBRATION,
   DEFAULT_AGGRESSIVENESS,
   clampSlider,
@@ -86,6 +87,11 @@ for (const archetype of ARCHETYPES) {
 
 assert(built === ARCHETYPES.length * LEVELS.length * 2, `Built ${built} prompts across ${ARCHETYPES.length} personas`);
 assert(retiredHits.length === 0, `No retired harsh phrases in any prompt${retiredHits.length ? ` — ${retiredHits.slice(0, 3).join("; ")}` : ""}`);
+assert(
+  ARCHETYPES.every((a) => getMasterPrompt(false, "TraderSave", baseConfig(a, 50)).includes(LANGUAGE_RULE)) &&
+    getMasterPrompt(true, "TraderSave", baseConfig(ARCHETYPES[0], 50)).includes(LANGUAGE_RULE),
+  "Reply-in-the-founder's-language rule present for every persona and the coach",
+);
 assert(missingFairRules.length === 0, `Fair-challenge rules present at every level and persona${missingFairRules.length ? ` — missing: ${missingFairRules.slice(0, 3).join("; ")}` : ""}`);
 assert(walkOutLeaks.length === 0, `"I'm out" only unlocked at ${DECLARE_OUT_MIN}+ or Shark Tank${walkOutLeaks.length ? ` — ${walkOutLeaks.slice(0, 3).join("; ")}` : ""}`);
 

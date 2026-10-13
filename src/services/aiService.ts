@@ -459,7 +459,15 @@ import { DeckIntelligence, buildStructuredDeckContextBlock, parseDeckIntoSlides 
 
 const DECK_TEXT_LIMIT = 8000;
 
+/**
+ * Reply in the founder's language. User feedback: a founder who spoke or typed
+ * in another language got answers in a different one. Shared by the live
+ * panel, the coach and the evaluators.
+ */
+export const LANGUAGE_RULE = `LANGUAGE (strict): Reply in the language the founder is using (spoken or typed). Default to English. If the founder switches language, switch with them from your next turn. Never switch language on your own, never answer in a language the founder has not used, and never mix two languages in one turn. Keep names, numbers and standard business terms (CAC, MRR, Series A) as they are.`;
+
 const OUTPUT_RULES = `OUTPUT RULES (strict):
+- ${LANGUAGE_RULE}
 - Speak ONLY words a human would say out loud. No asterisks, brackets, headers, stage directions, or chain-of-thought.
 - Never describe your plan ("I will ask...", "Let me think...", "Based on the deck...").
 - CRITICAL: Keep each turn short and conversational — one or two spoken sentences. Ask AT MOST ONE question per turn; NEVER stack or chain a second question onto the same turn — hold it for a later turn. A statement plus one question is fine, and a brief reaction with no question at all is also fine.
@@ -513,7 +521,7 @@ DECK INSTRUCTIONS:
  * changes and filtered when assembling fine-tuning or eval datasets. Bump it
  * whenever a change to the live or evaluation prompts would change behaviour.
  */
-export const PROMPT_VERSION = "2026-10-03.fair-challenge";
+export const PROMPT_VERSION = "2026-10-13.fair-challenge-language";
 
 /** Default toughness when the client sends none: a realistic, constructive meeting. */
 export const DEFAULT_AGGRESSIVENESS = 50;
@@ -1112,6 +1120,7 @@ SESSION TRANSCRIPT:
 ${transcriptText}
 
 COACHING EVALUATION RULES:
+- Write every text field in the language the founder mainly used in the session (default English).
 - You are writing as a coach evaluating a ${isSolo ? "recorded practice run" : "student"}, NOT as an investor making an investment decision. Do NOT use language like "invest", "pass", or "fund".
 - The founder's spoken lines are raw automatic speech recognition output and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context and NEVER penalize apparent transcription artifacts — judge what the founder meant, not what the recognizer typed.
 - Score each category (delivery, clarity, scalability, readiness) as integers from 0 to 100.
@@ -1161,7 +1170,8 @@ ${deckSection}${previousSection}
 TRANSCRIPT:
 ${transcriptText}`;
 
-  const sharedRules = `- NEVER invent a specific fundraising amount; only use a concrete raise figure if the founder explicitly stated it, otherwise say "your target raise".
+  const sharedRules = `- Write every text field in the language the founder mainly used in the session (default English). Keep JSON keys and enum values (e.g. "High Priority") exactly as specified.
+- NEVER invent a specific fundraising amount; only use a concrete raise figure if the founder explicitly stated it, otherwise say "your target raise".
 - Be specific — cite actual topics discussed, not generic advice. Cross-check against the deck when provided.
 - The founder's spoken lines are raw automatic speech recognition output and may contain mis-transcribed words, odd jargon, or dropped words. Infer the intended meaning from context and NEVER penalize apparent transcription artifacts — judge what the founder meant, not what the recognizer typed.`;
 

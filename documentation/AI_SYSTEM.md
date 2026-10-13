@@ -1,6 +1,6 @@
 # PitchNest AI System
 
-**Owner:** AI / ML · **Last updated:** 3 Oct 2026 · **Prompt version:** `2026-10-03.fair-challenge`
+**Owner:** AI / ML · **Last updated:** 3 Oct 2026 · **Prompt version:** `2026-10-13.fair-challenge-language`
 
 This document describes what the AI in PitchNest currently does, how each investor persona judges a pitch, how reports are scored, and how to run, test and maintain it. It describes the system as it is today, not who built which part.
 
@@ -94,6 +94,8 @@ Unknown or legacy archetype strings fall back by keyword (e.g. anything containi
 4. Briefly acknowledge good answers. Credit what works as readily as probing what doesn't.
 5. One concern per turn, phrased so the founder knows what a good answer looks like.
 6. A number that looks inconsistent is treated as a possible mis-hearing or update first, not a gotcha.
+
+7. **Language:** reply in the language the founder is using, spoken or typed (default English). Follow them if they switch; never switch on your own or mix languages in a turn. Reports are written in the founder's main language. Limits: speech recognition is English-only (regional English models), so non-English *speech* is not yet understood, only typed chat; and the default voices are English. For spoken non-English sessions, set the `TTS_VOICE_*` env vars to Azure *Multilingual* voices and add the locale to speech recognition. Fixed lines (greetings, the end-of-session confirmation) are still English.
 
 Plus the existing structural rules: one speaker and one question per turn, no new topic while a question is open, roughly 6–10 questions per session, and polite two-step interruptions only after 30+ seconds of non-answer.
 
