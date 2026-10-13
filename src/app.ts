@@ -12,6 +12,7 @@ import sessionRoutes from "./routes/sessionRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
 import billingRoutes from "./routes/billingRoutes.ts";
+import contentReportRoutes from "./routes/contentReportRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 import router from "./routes/organization/organizationRoutes.ts";
 
@@ -96,6 +97,8 @@ app.use("/api/profile", profileRoutes);
 app.use("/api/admin", adminRoutes);
 // Billing: checkout + the webhook that grants paid access.
 app.use("/api/billing", billingRoutes);
+// In-app reporting of AI-generated content (app store AI-content policies).
+app.use("/api/reports", contentReportRoutes);
 app.post("/api/waitlist", handleWaitlist);
 app.post("/api/survey", handleSurvey);
 
