@@ -592,7 +592,7 @@ export function buildPitchMemoryPromptBlock(state: PitchSessionState): string {
   if (state.numericalNotes.length > 0 || state.contradictionsDetected.length > 0) {
     parts.push(`NUMERICAL INTEGRITY:`);
     for (const n of state.numericalNotes) parts.push(`- ✓ ${n}`);
-    for (const c of state.contradictionsDetected) parts.push(`- 🚨 CONTRADICTION: ${c} (Prioritize probing this!)`);
+    for (const c of state.contradictionsDetected) parts.push(`- 🚨 CONTRADICTION: ${c} (Ask the founder to confirm this figure — it may be a mis-hearing or an updated number.)`);
   }
 
   // Deck Discrepancies vs Speech
@@ -622,7 +622,7 @@ export function buildPitchMemoryPromptBlock(state: PitchSessionState): string {
   } else if (state.inferredStage === "early_revenue") {
     parts.push(`- Early revenue stage: Focus on paying customer feedback, pricing logic, early growth, unit economics direction, and acquisition channels.`);
   } else {
-    parts.push(`- Growth stage: Expect concrete metrics (CAC, LTV, churn, growth rate, sales efficiency, margins). Push hard on defensibility and capital efficiency.`);
+    parts.push(`- Growth stage: Expect concrete metrics (CAC, LTV, churn, growth rate, sales efficiency, margins). Probe defensibility and capital efficiency.`);
   }
 
   parts.push(`=== END PITCH MEMORY ===`);

@@ -9,7 +9,7 @@
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx src/tests/run_tests.ts",
+    "test": "tsx src/tests/run_tests.ts && tsx src/tests/persona_tone_test.ts && tsx src/tests/deck_type_test.ts",
     "build:lambda": "bash build-lambda.sh"
   },
   "dependencies": {
