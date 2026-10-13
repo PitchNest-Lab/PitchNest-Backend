@@ -15,6 +15,7 @@ import {
 } from "../services/deckIntelligenceService.ts";
 import {
   isTrialActive,
+  FREE_TRIAL_DAYS,
   entitlementsForPlan,
   getTrialEntitlement,
 } from "../services/entitlementService.ts";
@@ -96,7 +97,13 @@ assert(nullTrialCheck.active === false && nullTrialCheck.daysRemaining === 0, "N
 
 const startedRecent = new Date(Date.now() - 1 * 86400000).toISOString();
 const derivedTrial = isTrialActive(null, "active", startedRecent);
-assert(derivedTrial.active === true && derivedTrial.daysRemaining >= 28, "Active trial derived correctly from trial_started_at + 30 days");
+assert(
+  derivedTrial.active === (FREE_TRIAL_DAYS > 1) && derivedTrial.daysRemaining >= Math.max(0, FREE_TRIAL_DAYS - 2),
+  `Trial derived from trial_started_at + ${FREE_TRIAL_DAYS} days`,
+);
+assert(FREE_TRIAL_DAYS === 3 || !!process.env.FREE_TRIAL_DAYS, "New signups get a 3-day full-access trial by default");
+const startedLongAgo = new Date(Date.now() - 5 * 86400000).toISOString();
+assert(isTrialActive(null, "active", startedLongAgo).active === (FREE_TRIAL_DAYS > 5), "A trial started 5 days ago has ended under the 3-day default");
 
 const trialEnt = entitlementsForPlan("free", null, futureDate, "active");
 assert(trialEnt.plan === "pro", "Trial user granted Pro plan tier");
