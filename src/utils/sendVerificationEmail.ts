@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
+import { frontendBaseUrl } from "./appUrl.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -56,19 +57,11 @@ export async function sendVerificationEmail(
   if (error) throw new Error("Failed to save token");
 
   // 4. Send email
-  // Normalize the base URL so a trailing slash in CLIENT_URL doesn't produce a
-  // broken double-slash link (e.g. https://app//verify).
-  const env = process.env.NODE_ENV;
-  const baseUrl =
-    env == "development"
-      ? "https://pitchnest-development.vercel.app"
-      : env == "localhost"
-        ? "http://localhost:5174"
-        : "https://www.pitchnest.app";
+  // Explicit APP_BASE_URL / CLIENT_URL win over NODE_ENV (see utils/appUrl.ts).
+  const baseUrl = frontendBaseUrl();
 
   const verifyUrl = `${baseUrl}/verify?token=${token}`;
 
-  console.log("base", baseUrl);
 
   if (!process.env.RESEND_API_KEY) {
     throw new Error(

@@ -8,6 +8,7 @@ import {
   buildPitchMemoryPromptBlock,
   rebuildPitchMemoryFromTranscript,
 } from "../services/pitchMemoryService.ts";
+import { frontendBaseUrl, withTimeout } from "../utils/appUrl.ts";
 import {
   parseDeckIntoSlides,
   inferActiveSlide,
@@ -143,6 +144,20 @@ const rebuilt = rebuildPitchMemoryFromTranscript(
 );
 assert(!!rebuilt.metrics.payingCustomers, "Resume replay reconstructs stated metrics");
 assert(rebuilt.questionsAsked.length >= 1, "Resume replay reconstructs the asked-question ledger");
+
+// 10b. Email links point at the right frontend (verify + reset password)
+assert(
+  frontendBaseUrl({ NODE_ENV: "development", CLIENT_URL: "https://www.pitchnest.app/" } as any) === "https://www.pitchnest.app",
+  "Explicit CLIENT_URL beats NODE_ENV (prod Render runs with NODE_ENV=development)",
+);
+assert(
+  frontendBaseUrl({ APP_BASE_URL: "https://pitchnest-development.vercel.app", CLIENT_URL: "https://x.test" } as any) === "https://pitchnest-development.vercel.app",
+  "APP_BASE_URL wins over CLIENT_URL",
+);
+assert(frontendBaseUrl({ NODE_ENV: "development" } as any) === "https://pitchnest-development.vercel.app", "DEV deploy without URLs -> DEV frontend");
+assert(frontendBaseUrl({ NODE_ENV: "production" } as any) === "https://www.pitchnest.app", "Unset URLs never fall back to localhost in a deploy");
+assert(frontendBaseUrl({ CLIENT_URL: "not a url" } as any) === "https://www.pitchnest.app", "Malformed CLIENT_URL ignored");
+assert(frontendBaseUrl({ CLIENT_URL: "https://a.test, https://b.test" } as any) === "https://a.test", "Comma list -> first origin");
 
 // 11. Entitlements — enterprise resolves to full Pro; expired paid+trial falls closed to Free
 const entEnterprise = entitlementsForPlan("enterprise", null, null, null);

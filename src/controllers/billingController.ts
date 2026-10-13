@@ -240,6 +240,11 @@ export const startCheckout = async (req: Request, res: Response) => {
  * Always answers 200 once authenticated, even on internal failure: a non-2xx
  * makes Flutterwave retry, and retrying will not fix a bug on our side. Real
  * problems are logged loudly instead.
+ *
+ * The 200 is sent AFTER settling, not before. On AWS Lambda the function is
+ * frozen as soon as the response is sent, so work done after an early
+ * acknowledgement was delayed or lost and paid users were not granted Pro.
+ * Settling is two quick round trips, well inside Flutterwave's 60s timeout.
  */
 export const handleWebhook = async (req: Request, res: Response) => {
   if (!verifyWebhookSignature(req.headers["verif-hash"])) {
@@ -256,10 +261,6 @@ export const handleWebhook = async (req: Request, res: Response) => {
     console.warn("🚫 Billing webhook: unparseable body");
     return res.status(400).json({ error: "invalid payload" });
   }
-
-  // Acknowledge immediately — Flutterwave times out at 60s, and settling can
-  // involve two network round trips.
-  res.status(200).json({ received: true });
 
   try {
     const data = payload?.data ?? {};
@@ -320,5 +321,7 @@ export const handleWebhook = async (req: Request, res: Response) => {
     );
   } catch (err: any) {
     console.error("❌ Billing webhook processing failed:", err?.message || err);
+  } finally {
+    res.status(200).json({ received: true });
   }
 };

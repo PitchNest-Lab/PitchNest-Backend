@@ -4,12 +4,16 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
+import { frontendBaseUrl, withTimeout } from "../utils/appUrl.ts";
 import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
 
 const resend = new Resend(process.env.RESEND_API_KEY);
+
+/** Max time a request waits for the mail provider before responding anyway. */
+const EMAIL_SEND_TIMEOUT_MS = 10_000;
 
 const BCRYPT_ROUNDS = 12;
 const googleClient = new OAuth2Client(config.googleClientId);
@@ -201,8 +205,13 @@ export const signup = async (req: Request, res: Response) => {
     // whether the email is registered/verified (user enumeration).
     if (existingUser) {
       if (!is_verified) {
-        // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
-        sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
+        // Auto-resend so a genuinely-stuck owner can still verify. Best-effort,
+        // but awaited: on Lambda nothing runs after the response is sent.
+        await withTimeout(
+          sendVerificationEmail(existingUser.id, cleanEmail),
+          EMAIL_SEND_TIMEOUT_MS,
+          "verification email",
+        ).catch((err) => {
           console.error(
             "Failed to resend verification email on signup retry:",
             err,
@@ -257,7 +266,13 @@ export const signup = async (req: Request, res: Response) => {
     // this), so returning a token here would be a usable session for an
     // unverified account — the takeover vector we are closing. The client routes
     // to the /verify screen on `requiresVerification`.
-    sendVerificationEmail(newUser.id, cleanEmail).catch((err) => {
+    // Awaited: on AWS Lambda the function is frozen as soon as the response
+    // is sent, so a fire-and-forget send was delayed for hours or lost.
+    await withTimeout(
+      sendVerificationEmail(newUser.id, cleanEmail),
+      EMAIL_SEND_TIMEOUT_MS,
+      "verification email",
+    ).catch((err) => {
       console.error("Failed to send verification email:", err);
     });
 
@@ -715,11 +730,8 @@ export const forgotPassword = async (req: Request, res: Response) => {
         used: false,
       },
     ]);
-    const baseUrl = (config.allowedOrigin || "http://localhost:5174").replace(
-      /\/+$/,
-      "",
-    );
-    const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
+    // Same frontend URL as verification emails (never localhost in a deploy).
+    const resetLink = `${frontendBaseUrl()}/reset-password?token=${resetToken}`;
 
     if (!process.env.RESEND_API_KEY) {
       console.error(
@@ -1009,8 +1021,12 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       });
     }
 
-    // Don't block the response on email delivery
-    sendVerificationEmail(user.id, cleanEmail).catch((err) => {
+    // Awaited (with a cap): on Lambda nothing runs after the response is sent.
+    await withTimeout(
+      sendVerificationEmail(user.id, cleanEmail),
+      EMAIL_SEND_TIMEOUT_MS,
+      "verification email",
+    ).catch((err) => {
       console.error("Failed to resend verification email:", err);
     });
 
