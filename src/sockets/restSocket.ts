@@ -63,6 +63,7 @@ import {
   DeckIntelligence,
   parseDeckIntoSlides,
   inferActiveSlide,
+  pickClientDeckText,
 } from "../services/deckIntelligenceService.ts";
 import {
   claimPitchAttempt,
@@ -327,11 +328,12 @@ async function resolveDeckText(clientConfig: any, userId: number | null): Promis
   // No deck id: an ad-hoc/unsaved deck the founder is pitching in-session. The
   // client-supplied text is their own content and only affects their own
   // session, so it is safe to use directly.
-  if (deck.extracted_text?.trim()) {
-    return deck.extracted_text.trim();
-  }
-
-  return "";
+  //
+  // The coercion lives in pickClientDeckText (deckIntelligenceService) rather
+  // than inline here, because that module is importable by the test suite and
+  // this one opens sockets and a database client on import. See that function
+  // for why the type check is load-bearing rather than defensive.
+  return pickClientDeckText(deck);
 }
 
 // Sanitize the founder ("user") turns of a CLIENT-supplied transcript before it
@@ -1925,6 +1927,25 @@ export function initRestSocket(wss: WebSocketServer) {
             })
             .catch((err) => console.warn("⚠️ Founder memory unavailable:", err?.message || err));
 
+          // Arm the live prompt. Split out so the failure path below can reach
+          // exactly the same state instead of leaving the session mute.
+          const armLivePrompt = (deckText: string) => {
+            if (isSoloMode) return;
+            liveConfig = {
+              ...clientConfig,
+              resolvedDeckText: deckText,
+              structuredDeck,
+              previousSession: previousSessionCtx,
+              // Which mode this session is running as. getMasterPrompt uses it
+              // to restrict cross-session trends to comparable sessions — a
+              // coach rubric and a panel rubric are not the same measuring
+              // stick, so a "trend" spanning both is an artefact of the mode
+              // switch rather than a change in the founder.
+              mode: sessionMode,
+            };
+            rebuildMasterPrompt();
+          };
+
           resolveDeckText(clientConfig, currentUserId)
             .then((text) => {
               resolvedDeckText = text;
@@ -1934,22 +1955,21 @@ export function initRestSocket(wss: WebSocketServer) {
                   clientConfig.selectedDeck?.name || "Pitch Deck",
                 );
               }
-              if (isSoloMode) return;
-              liveConfig = {
-                ...clientConfig,
-                resolvedDeckText,
-                structuredDeck,
-                previousSession: previousSessionCtx,
-                // Which mode this session is running as. getMasterPrompt uses it
-                // to restrict cross-session trends to comparable sessions — a
-                // coach rubric and a panel rubric are not the same measuring
-                // stick, so a "trend" spanning both is an artefact of the mode
-                // switch rather than a change in the founder.
-                mode: sessionMode,
-              };
-              rebuildMasterPrompt();
+              armLivePrompt(resolvedDeckText);
             })
-            .catch((err) => console.error("Error resolving deck text:", err));
+            .catch((err) => {
+              // SAFETY NET, not a log line. liveConfig is what arms the system
+              // prompt, so a throw anywhere in the chain above used to leave
+              // masterPrompt at "" and run the ENTIRE session with no prompt at
+              // all — panel identity, output rules, personas and memory all
+              // silently gone, with nothing reported to the client. build
+              // liveConfig anyway: the only thing actually lost is the deck
+              // text, and a session that pitches without its deck context is
+              // vastly better than one talking to a model that was never told
+              // who it is.
+              console.error("Error resolving deck text:", err);
+              armLivePrompt(resolvedDeckText || "");
+            });
 
           // Fire-and-forget web research (panel + coach; solo has no live
           // turns and its coach-style report has no competitor section).
