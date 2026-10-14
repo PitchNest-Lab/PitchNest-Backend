@@ -1,5 +1,13 @@
 import { config } from "../config/env.ts";
 import { buildInvestorPlaybook } from "../prompts/investorPlaybook.ts";
+// Cross-session founder memory. This is a module CYCLE — founderMemoryService
+// imports computeOverallScore from here and this file imports the prompt
+// builder back. It is safe and deliberate: both are hoisted function
+// declarations that each side only calls at runtime, long after both modules
+// have finished evaluating. The alternative was a third module holding
+// computeOverallScore, which would move the single canonical definition of
+// "overall score" out of the file that owns the evaluation rubric.
+import { buildFounderMemoryPromptBlock } from "./founderMemoryService.ts";
 
 /**
  * Interface representing standard evaluation metrics and sentiments returned by the AI model.
@@ -763,6 +771,16 @@ export function getMasterPrompt(
   const toneBlock = buildToneDirective(aggressiveness, riskAppetite);
   const persona = getPersonaProfile(archetype);
   const returningBlock = buildReturningFounderBlock(configData.previousSession, currentBusinessName);
+  // Cross-session memory (how this founder pitches across attempts), distinct
+  // from returningBlock (what they scored last time on this specific startup).
+  // The current mode is passed through because trends are only meaningful within
+  // one mode — see buildFounderMemoryPromptBlock. Solo never builds this prompt
+  // (the socket skips it), so the fallback is coach-or-panel, not a third case.
+  const founderMemoryBlock = buildFounderMemoryPromptBlock(
+    configData.founderProfile,
+    currentBusinessName,
+    configData.mode || (isCoach ? "coach" : "panel"),
+  );
   const memoryBlock = pitchState ? `\n\n${buildPitchMemoryPromptBlock(pitchState)}\n` : "";
 
   if (isCoach) {
@@ -781,7 +799,7 @@ ${deckContext}
 ${memoryBlock}
 ${toneBlock}
 ${buildTractionDirective(fundingStage)}
-${returningBlock}` + `
+${returningBlock}${founderMemoryBlock}` + `
 SESSION FLOW — YOU ARE AN ACTIVE COACH, NOT AN INTERVIEWER:
 1. OPENING (your first turn only): Welcome the founder warmly by referencing one specific detail from their deck or concept. Set the expectation that this is a working session: tell them you'll jump in as they go to sharpen their delivery, and invite them to start with their opening line or hook.
 2. COACH IN THE MOMENT: Do NOT bank questions for the end. After each chunk the founder delivers (their hook, the problem, the solution, traction, the ask), respond with concrete coaching before they move on. Every turn should do TWO things:
@@ -811,7 +829,7 @@ ${memoryBlock}
 ${buildArchetypeDirective(archetype)}
 ${toneBlock}
 ${buildTractionDirective(fundingStage)}
-${returningBlock}
+${returningBlock}${founderMemoryBlock}
 SPEAKER OUTPUT FORMAT (mechanics — always apply):
 - You must ALWAYS prefix your response with the speaking panelist's name followed by a colon. Example: "Marcus: Your valuation seems high." or "Sarah: Let's talk about CAC."
 - ONLY ONE panelist speaks per turn. NEVER write multiple speakers in one response. Once your chosen panelist asks their one question, STOP IMMEDIATELY.

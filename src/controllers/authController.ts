@@ -9,7 +9,10 @@ import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
 
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const resend =
+  config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
+    ? new Resend(config.resendApiKey)
+    : null;
 
 const BCRYPT_ROUNDS = 12;
 const googleClient = new OAuth2Client(config.googleClientId);
@@ -54,6 +57,7 @@ import {
   isTrialActive,
   FREE_TRIAL_DAYS,
 } from "../services/entitlementService.ts";
+import { isSupportedSttLocale } from "../utils/transcriptionLocales.ts";
 
 export function toPublicUser(u: any) {
   const expiry = u?.validity ? new Date(u.validity) : null;
@@ -84,6 +88,13 @@ export function toPublicUser(u: any) {
     trialExpiresAt: u?.trial_expires_at
       ? new Date(u.trial_expires_at).toISOString()
       : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
+    // The app-preferences bag (notification toggles, AI toughness, sector, the
+    // chosen recognition locale). This was previously omitted from the payload
+    // entirely, so every client silently reverted to hardcoded defaults on a
+    // fresh login and a setting only LOOKED persistent for as long as that one
+    // browser's localStorage survived. Always the owner's own bag: sanitizeSettings
+    // is the sole writer, so the shape is bounded and nothing raw lands here.
+    settings: u?.settings && typeof u.settings === "object" ? u.settings : {},
   };
 }
 
@@ -120,6 +131,14 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
       )
       .slice(0, 50);
   }
+  // Recognition language for live sessions. Allowlist-only: the value is handed
+  // straight to the Azure Speech SDK when the recognizer is built, so an
+  // arbitrary string here would be an invalid recognition config at the start of
+  // every session. An unsupported value is DROPPED rather than coerced, so the
+  // stored preference can only ever be something we can actually honour.
+  if (isSupportedSttLocale(s.sttLocale)) {
+    out.sttLocale = s.sttLocale;
+  }
   return out;
 }
 
@@ -155,7 +174,7 @@ export const refreshToken = (req: Request, res: Response) => {
 
 export const signup = async (req: Request, res: Response) => {
   try {
-    const { name, email, password, referralCode } = req.body;
+    const { name, email, password, role, referralCode } = req.body;
     if (!name || !email || !password) {
       return res
         .status(400)
@@ -180,8 +199,13 @@ export const signup = async (req: Request, res: Response) => {
         .status(400)
         .json({ error: "Password must be at least 6 characters." });
     }
+    if (role !== undefined && !isValidRole(role)) {
+      return res.status(400).json({ error: "Please select a valid role." });
+    }
+
     const cleanEmail = email.toLowerCase().trim();
-   
+    const cleanReferralCode =
+      typeof referralCode === "string" ? referralCode.trim() : "";
 
     const { data: existingUser } = await supabase
       .from("users")
@@ -222,21 +246,22 @@ export const signup = async (req: Request, res: Response) => {
       now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
     );
 
+    const newUserPayload = {
+      name: name.trim(),
+      email: cleanEmail,
+      password: hashedPassword,
+      role: role || "Founder",
+      auth_provider: "form",
+      trial_started_at: now.toISOString(),
+      trial_expires_at: trialEnd.toISOString(),
+      trial_status: "active",
+      enrolled_at: now.toISOString(),
+      ...(cleanReferralCode ? { orgCode: cleanReferralCode } : {}),
+    };
+
     let { data: newUser, error } = await supabase
       .from("users")
-      .insert([
-        {
-          name,
-          email: cleanEmail,
-          password: hashedPassword,
-          auth_provider: "form",
-          trial_started_at: now.toISOString(),
-          trial_expires_at: trialEnd.toISOString(),
-          trial_status: "active",
-          orgCode: referralCode,
-          enrolled_at: now.toISOString(),
-        },
-      ])
+      .insert([newUserPayload])
       .select()
       .single();
 
@@ -249,8 +274,14 @@ export const signup = async (req: Request, res: Response) => {
         .single());
     }
 
-    if (error || !newUser)
-      return res.status(500).json({ error: "Signup failed" });
+    if (error || !newUser) {
+      console.error("Signup user insert failed:", error || "No user returned");
+      const message =
+        config.nodeEnv === "production"
+          ? "Signup failed"
+          : `Signup failed: ${error?.message || "database returned no user"}`;
+      return res.status(500).json({ error: message });
+    }
 
     // Send verification email; do NOT issue a session token. The account cannot
     // be used until its email is verified (authMiddleware + the WS both enforce
@@ -261,9 +292,9 @@ export const signup = async (req: Request, res: Response) => {
       console.error("Failed to send verification email:", err);
     });
 
-    if (referralCode) {
+    if (cleanReferralCode) {
       const { error } = await supabase.rpc("increment_enroll_count", {
-        ref_code: referralCode,
+        ref_code: cleanReferralCode,
       });
 
       if (error) {
@@ -723,7 +754,7 @@ export const forgotPassword = async (req: Request, res: Response) => {
 
     if (!resend) {
       console.error(
-        "❌ Password reset email not sent: RESEND_API_KEY missing.",
+        "❌ Password reset email not sent: RESEND_API_KEY is missing or still set to re_xxxxxxxxx.",
       );
       return res.status(500).json({ error: "Failed to send email." });
     }

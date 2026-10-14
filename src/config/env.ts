@@ -1,9 +1,22 @@
 import dotenv from "dotenv";
+import { DEFAULT_STT_LOCALE } from "../utils/transcriptionLocales.ts";
 
 dotenv.config();
 
+/**
+ * createClient expects the Supabase project base URL. Dashboard API docs also
+ * display a `/rest/v1` endpoint, which is easy to copy by mistake; the SDK adds
+ * that path itself and a pre-appended value produces `/rest/v1/rest/v1/...`.
+ */
+function normalizeSupabaseProjectUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/rest\/v1\/?$/i, "")
+    .replace(/\/+$/, "");
+}
+
 export const config = {
-  supabaseUrl: process.env.SUPABASE_URL || "",
+  supabaseUrl: normalizeSupabaseProjectUrl(process.env.SUPABASE_URL || ""),
   supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
@@ -12,12 +25,24 @@ export const config = {
   allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
+  // Fallback speech-to-text language for anyone who has not chosen one. en-NG is
+  // the Africa-first default — recognition was previously hardcoded to en-US
+  // while the panel prompts apologised for Nigerian English, so every
+  // mis-transcribed word was scored as though the founder had said it.
+  //
+  // Config rather than a constant so the global default can be moved without a
+  // deploy, and backed out if a Speech region turns out not to serve en-NG.
+  // Validated against the allowlist in utils/transcriptionLocales at use time,
+  // so a bad value here degrades to the default instead of breaking sessions.
+  sttDefaultLocale:
+    (process.env.STT_DEFAULT_LOCALE || "").trim() || DEFAULT_STT_LOCALE,
   openAiApiKey: process.env.OPENAI_API_KEY || "",
   azureOpenAiEndpoint: process.env.AZURE_OPENAI_ENDPOINT || "",
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
   azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
+  resendApiKey: (process.env.RESEND_API_KEY || "").trim(),
   // Defaults to "production" so a deploy that FORGETS to set NODE_ENV fails
   // CLOSED. Getting this backwards is silent and severe: `isProduction` gates
   // the CORS allow-list in app.ts, so a "development" default would reflect
@@ -31,6 +56,12 @@ export const config = {
   // so a Gmail address cannot be the sender. Reply-To is the supported way to
   // route replies into that inbox while still sending from pitchnest.app.
   emailReplyTo: process.env.EMAIL_REPLY_TO || "pitchnestapp@gmail.com",
+  // The public origin of the FRONTEND, used to build links inside outbound email.
+  // A verification link or a trial reminder that points at localhost is a dead
+  // end for the recipient and silently unrecoverable, so this is read through
+  // config rather than scattered process.env lookups. Trailing slashes are
+  // tolerated by the consumers, which strip them before composing a path.
+  clientUrl: (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, ""),
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.

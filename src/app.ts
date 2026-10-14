@@ -9,6 +9,7 @@ import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import fileRoutes from "./routes/fileRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
+import publicRoutes from "./routes/publicRoutes.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
 import billingRoutes from "./routes/billingRoutes.ts";
@@ -108,6 +109,9 @@ app.use("/api/organization", router);
 app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
+// The public share read — unauthenticated by definition, and the only route in
+// the app a stranger can reach without a token. See routes/publicRoutes.ts.
+app.use("/api/public", publicRoutes);
 app.use("/api/profile", profileRoutes);
 // Internal admin surface (Item C) — gated by ADMIN_API_KEY, 404 when unset.
 app.use("/api/admin", adminRoutes);

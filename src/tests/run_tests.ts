@@ -20,6 +20,16 @@ import {
 } from "../services/entitlementService.ts";
 import { sanitizeUploadName, signLocalFileUrl, verifyLocalFileToken } from "../services/storageService.ts";
 import { sanitizeFounderInput, sanitizeDeckText } from "../utils/aiTextSanitizer.ts";
+import {
+  buildFounderSessionSnapshot,
+  foldFounderProfile,
+  clampFounderProfile,
+  emptyFounderProfile,
+  buildFounderMemoryPromptBlock,
+  weakestOf,
+  MAX_SNAPSHOTS,
+} from "../services/founderMemoryService.ts";
+import { computeDeliveryMetrics } from "../utils/deliveryMetrics.ts";
 
 function assert(condition: boolean, msg: string) {
   if (!condition) {
@@ -186,5 +196,219 @@ assert(
   verifyLocalFileToken(s7Token, "../../etc/passwd") === null,
   "Token cannot authorize a path-traversal filename",
 );
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cross-session founder memory
+//
+// The assertions below are almost all NEGATIVE. Founder memory's failure mode is
+// not crashing — it is claiming something about a founder that its own data does
+// not support, and a wrong call-back ("you always do X") is worse than no
+// call-back at all. So the tests guard the gates: no trend from one sample, no
+// comparison across modes, no snapshot from an incomplete evaluation, no double
+// count on re-fold.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A minimal complete evaluation report, with fields the snapshot reads. */
+function founderReport(over: any = {}): any {
+  return {
+    evaluationStatus: "complete",
+    scores: { delivery: 60, clarity: 70, scalability: 65, readiness: 68 },
+    risks: ["Numbers are asserted rather than explained"],
+    category_matrix: [
+      { category: "Unit Economics", impact: "High", needs_improvement: "CAC payback never stated" },
+      { category: "Market", impact: "Low", needs_improvement: "" },
+    ],
+    topic_coverage: [
+      { topic: "Market Size", percentage: 80 },
+      { topic: "Valuation", percentage: 10 },
+    ],
+    transcript: [],
+    ...over,
+  };
+}
+
+const snapInput = (id: number, mode = "panel", date = "2026-10-01T10:00:00.000Z") => ({
+  sessionId: id,
+  date,
+  mode,
+  businessName: "Acme",
+});
+
+// 8. Snapshot gating
+const snapIncomplete = buildFounderSessionSnapshot(founderReport({ evaluationStatus: "insufficient_data" }), snapInput(1));
+assert(snapIncomplete === null, "Founder snapshot refused for an incomplete evaluation");
+
+const snapZero = buildFounderSessionSnapshot(
+  founderReport({ scores: { delivery: 0, clarity: 0, scalability: 0, readiness: 0 } }),
+  snapInput(1),
+);
+assert(snapZero === null, "Founder snapshot refused when every score is zero");
+
+const snapOk = buildFounderSessionSnapshot(founderReport(), snapInput(1));
+assert(snapOk !== null, "Founder snapshot built from a complete evaluation");
+assert(snapOk?.weakestDimension === "delivery", "Weakest dimension identified as delivery");
+assert(
+  snapOk?.weakCategories.join() === "Unit Economics",
+  "Only High-impact categories recorded as weak (Low with empty text dropped)",
+);
+assert(snapOk?.weakTopics.join() === "Valuation", "Only under-covered topics recorded as weak");
+assert(snapOk?.paceWpm === null, "Pace is null when the transcript carries no utterance timing");
+
+// 9. Weakest-dimension ties must be deterministic, or a stable pattern flickers
+assert(
+  weakestOf({ delivery: 70, clarity: 70, scalability: 70, readiness: 70 }) === "delivery",
+  "All-four-way tie breaks deterministically to the first dimension",
+);
+
+// 10. No memory block at all for a founder with no history
+assert(
+  buildFounderMemoryPromptBlock(emptyFounderProfile(), "Acme", "panel") === "",
+  "No prompt block for a founder with no prior sessions",
+);
+
+// 11. ONE session must not produce a trend claim
+const profileOne = foldFounderProfile(null, snapOk!, "2026-10-01T10:05:00.000Z");
+const blockOne = buildFounderMemoryPromptBlock(profileOne, "Acme", "panel");
+assert(blockOne.includes("FOUNDER HISTORY"), "Single-session history still states the one known fact");
+assert(!/Recurring/.test(blockOne), "No recurrence claimed from a single session");
+assert(!/kept surfacing|keeps surfacing/.test(blockOne), "No 'keeps surfacing' claim from a single session");
+assert(!/held steady|Filler-word rate is/.test(blockOne), "No filler trend from a single session");
+
+// 12. Re-folding the same session must not manufacture a second sample
+const profileRepeated = foldFounderProfile(profileOne, snapOk!, "2026-10-01T10:06:00.000Z");
+assert(
+  profileRepeated.sessions.length === 1 && profileRepeated.sessionCount === 1,
+  "Re-folding the same session id replaces rather than duplicates it",
+);
+assert(
+  !/Recurring/.test(buildFounderMemoryPromptBlock(profileRepeated, "Acme", "panel")),
+  "Re-folding one session cannot fabricate a recurring pattern",
+);
+
+// 13. Two agreeing sessions DO produce recurrence
+const snapB = buildFounderSessionSnapshot(founderReport(), snapInput(2, "panel", "2026-10-08T10:00:00.000Z"))!;
+const profileTwo = foldFounderProfile(profileOne, snapB, "2026-10-08T10:05:00.000Z");
+const blockTwo = buildFounderMemoryPromptBlock(profileTwo, "Acme", "panel");
+assert(/Recurring/.test(blockTwo), "Two agreeing sessions produce a recurrence claim");
+assert(blockTwo.includes("delivery has been their lowest dimension 2 times"), "Recurrence names the dimension and count");
+
+// 14. THE MODE GUARD: the same two sessions under a different current mode
+const blockCrossMode = buildFounderMemoryPromptBlock(profileTwo, "Acme", "coach");
+assert(
+  !/Recurring/.test(blockCrossMode),
+  "No trend is claimed across modes (panel history vs a coach session)",
+);
+
+// 15. Two disagreeing sessions must NOT produce recurrence
+const snapOther = buildFounderSessionSnapshot(
+  founderReport({ scores: { delivery: 90, clarity: 90, scalability: 30, readiness: 80 } }),
+  snapInput(3, "panel", "2026-10-09T10:00:00.000Z"),
+)!;
+const profileMixed = foldFounderProfile(profileOne, snapOther, "2026-10-09T10:05:00.000Z");
+assert(
+  !/lowest dimension/.test(buildFounderMemoryPromptBlock(profileMixed, "Acme", "panel")),
+  "Sessions disagreeing on the weakest dimension claim no pattern",
+);
+
+// 16. Ring buffer cap and ordering
+let capped = emptyFounderProfile();
+for (let i = 1; i <= 9; i++) {
+  const s = buildFounderSessionSnapshot(founderReport(), snapInput(i, "panel", `2026-10-0${i}T10:00:00.000Z`))!;
+  capped = foldFounderProfile(capped, s, `2026-10-0${i}T10:05:00.000Z`);
+}
+assert(capped.sessions.length === MAX_SNAPSHOTS, `Snapshot ring buffer capped at ${MAX_SNAPSHOTS}`);
+assert(capped.sessionCount === 9, "sessionCount tracks every session, not just the retained window");
+assert(capped.sessions[0].sessionId === 9, "Newest session is first in the buffer");
+
+// 17. Filler trend requires two measurable samples
+const withFiller = (pct: number, id: number, date: string) => {
+  const words = "we are building a platform for founders and we have customers now um basically like";
+  const transcript = [{ type: "user", text: words }];
+  const s = buildFounderSessionSnapshot(founderReport({ transcript }), snapInput(id, "panel", date))!;
+  return { s, pct };
+};
+const { s: fA } = withFiller(5, 11, "2026-10-01T10:00:00.000Z");
+assert(fA.fillerPct !== null, "Filler rate computed from a real transcript");
+assert(
+  !/Filler-word rate/.test(buildFounderMemoryPromptBlock(foldFounderProfile(null, fA, "x"), "Acme", "panel")),
+  "No filler trend from a single measured session",
+);
+
+// 18. clampFounderProfile must survive arbitrary JSONB garbage
+for (const garbage of [null, undefined, 42, "string", [], { sessions: "nope" }, { sessions: [null, 7, {}] }]) {
+  const clamped = clampFounderProfile(garbage);
+  assert(
+    Array.isArray(clamped.sessions) && clamped.sessions.every((s) => typeof s.sessionId === "number" && s.sessionId > 0),
+    `Garbage profile input (${JSON.stringify(garbage)}) clamps to a valid profile`,
+  );
+}
+assert(
+  clampFounderProfile({ sessions: [{ sessionId: 5, scores: { delivery: "999", clarity: -4 } }] }).sessions[0].scores
+    .clarity === 0,
+  "Out-of-range category scores clamp into 0-100",
+);
+
+// 19. The block must never instruct the panel to read numbers aloud — the whole
+//     point of the feature is that it sounds like a person who was there.
+const fullBlock = buildFounderMemoryPromptBlock(profileTwo, "Acme", "panel");
+assert(/Never recite a score/.test(fullBlock), "Block forbids reciting the stored numbers aloud");
+assert(/Claim a pattern ONLY/.test(fullBlock), "Block scopes pattern claims to what the history shows");
+
+// 19b. Which company the history was about must be stated whenever it differs,
+//      or the panel attributes a different pitch's weakness to this one.
+const sameBiz = buildFounderMemoryPromptBlock(profileTwo, "Acme", "panel");
+assert(!/pitching/.test(sameBiz), "No company qualifier when the history is about the same company");
+const otherBiz = buildFounderMemoryPromptBlock(profileTwo, "Zenith Labs", "panel");
+assert(/pitching Acme/.test(otherBiz), "Company qualifier names the company the history was about");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Speaking pace from real turn timing (stage 2)
+//
+// Pace is the one delivery number the product cannot reconstruct after the fact,
+// so it is measured at record time (LivePitchRoom stamps speakSeconds from the
+// VAD) and travels on the transcript. These assertions pin the two things that
+// matter: a correctly timed session yields a rate, and a badly timed one yields
+// NOTHING — never a clamped or extrapolated value.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** A transcript of n founder turns, each `words` long and `secs` spoken. */
+function timedTranscript(turns: number, words: number, secs: number) {
+  const sentence = Array.from({ length: words }, (_, i) => `word${i}`).join(" ");
+  const out: any[] = [];
+  for (let i = 0; i < turns; i++) {
+    out.push({ type: "ai", text: `Question number ${i}?` });
+    out.push({ type: "user", text: sentence, speakSeconds: secs });
+  }
+  return out;
+}
+
+// 20. A properly timed session produces a rate
+const paceOk = computeDeliveryMetrics(timedTranscript(4, 100, 40));
+assert(paceOk.paceWpm === 150, `Pace computed from measured turn timing (got ${paceOk.paceWpm}, expected 150)`);
+
+// 21. Untimed transcripts (every session recorded before stage 2) report nothing
+const paceUntimed = computeDeliveryMetrics([
+  { type: "ai", text: "Tell me about the market?" },
+  { type: "user", text: "We serve fifty thousand merchants across three states" },
+]);
+assert(paceUntimed.paceWpm === null, "No pace reported when turns carry no timing");
+
+// 22. Too little timed speech is not enough to extrapolate from
+const paceThin = computeDeliveryMetrics(timedTranscript(1, 100, 10));
+assert(paceThin.paceWpm === null, "No pace reported from a single 10-second turn");
+
+// 23. Implausible timing is REJECTED, not clamped — bad data, not a fast talker
+const paceFast = computeDeliveryMetrics(timedTranscript(3, 100, 2));
+assert(paceFast.paceWpm === null, "Implausible fast pace (3000 wpm) rejected rather than clamped");
+const paceSlow = computeDeliveryMetrics(timedTranscript(3, 3, 60));
+assert(paceSlow.paceWpm === null, "Implausible slow pace rejected rather than clamped");
+
+// 24. A zero or negative speakSeconds is not timing data
+const paceZero = computeDeliveryMetrics([
+  { type: "ai", text: "Q?" },
+  { type: "user", text: "some words here", speakSeconds: 0 },
+  { type: "user", text: "more words here", speakSeconds: -30 },
+]);
+assert(paceZero.paceWpm === null, "Zero and negative turn durations are ignored, not counted");
 
 console.log("\n🎉 All security & reasoning test assertions PASSED successfully!\n");

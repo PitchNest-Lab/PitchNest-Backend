@@ -3,7 +3,10 @@ import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
 
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
+const resend =
+  config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
+    ? new Resend(config.resendApiKey)
+    : null;
 
 export async function sendVerificationEmail(userId: string | number, email: string) {
   // Two factors, both cryptographically random:
@@ -44,10 +47,9 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   if (error) throw new Error("Failed to save token");
 
   // 4. Send email
-  // Normalize the base URL so a trailing slash in CLIENT_URL doesn't produce a
-  // broken double-slash link (e.g. https://app//verify).
-  const baseUrl = (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, "");
-  const verifyUrl = `${baseUrl}/verify?token=${token}`;
+  // Compose the link from the configured frontend origin (trailing slashes are
+  // already stripped in config, so this cannot produce a broken double-slash).
+  const verifyUrl = `${config.clientUrl}/verify?token=${token}`;
 
   // Log OTP in development so local testing never gets blocked by email deliverability / DNS
   if (config.nodeEnv !== "production") {
@@ -60,8 +62,8 @@ export async function sendVerificationEmail(userId: string | number, email: stri
 
   if (!resend) {
     throw new Error(
-      "Mail is not configured (RESEND_API_KEY missing). " +
-        "Set this in the backend environment so verification emails can send.",
+      "Mail is not configured (RESEND_API_KEY is missing or still set to re_xxxxxxxxx). " +
+        "Replace the placeholder in the backend environment so verification emails can send.",
     );
   }
 

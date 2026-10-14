@@ -24,6 +24,14 @@ import {
   hasAzureSttConfig,
   StreamingRecognizer,
 } from "../services/sttService.ts";
+import { resolveSttLocale } from "../utils/transcriptionLocales.ts";
+import {
+  buildFounderSessionSnapshot,
+  foldFounderProfile,
+  clampFounderProfile,
+  emptyFounderProfile,
+  type FounderProfile,
+} from "../services/founderMemoryService.ts";
 import { detectSpeaker, sanitizeAiSpeech, sanitizeFounderInput } from "../utils/aiTextSanitizer.ts";
 import {
   detectEndSessionIntent,
@@ -213,6 +221,78 @@ function clampPreviousSession(raw: any): {
 // can flow through the same sentence/TTS pipeline as streamed LLM output.
 async function* singleChunkStream(text: string): AsyncGenerator<string, void, unknown> {
   yield text;
+}
+
+/**
+ * Read this founder's cross-session profile.
+ *
+ * NEVER THROWS. Founder memory is an enrichment: a founder whose profile row is
+ * missing, whose migration has not been run yet, or whose read times out must
+ * still get a full session. Every failure path returns the empty profile, which
+ * buildFounderMemoryPromptBlock renders as nothing at all — so a broken memory
+ * is invisible in the prompt rather than an empty section the model can see and
+ * try to fill in.
+ *
+ * Anonymous sessions have no user id and therefore no history: return empty
+ * without a round trip.
+ */
+async function loadFounderProfile(userId: number | null): Promise<FounderProfile> {
+  if (!userId) return emptyFounderProfile();
+  try {
+    const { data, error } = await supabase
+      .from("founder_profiles")
+      .select("profile")
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (error) {
+      // Most likely 0017 has not been applied in this environment. Warn, do not
+      // throw: the feature is dormant until the operator runs the migration.
+      console.warn("⚠️ Founder memory read skipped:", error.message);
+      return emptyFounderProfile();
+    }
+    return clampFounderProfile(data?.profile);
+  } catch (err: any) {
+    console.warn("⚠️ Founder memory read failed:", err?.message || err);
+    return emptyFounderProfile();
+  }
+}
+
+/**
+ * Fold a completed session into this founder's profile.
+ *
+ * READ-MODIFY-WRITE, and deliberately not atomic. Two tabs finishing at once can
+ * lose one snapshot, which costs that founder a little memory and nothing else —
+ * no score, no report, no entitlement depends on this row. A transaction would
+ * mean an RPC and a migration to protect a cache, which is the wrong trade for
+ * this data. The cap (MAX_SNAPSHOTS) bounds the damage and the next session
+ * re-establishes the trend.
+ *
+ * NEVER THROWS, for the same reason as the read: end_session must not fail
+ * because a memory write did.
+ */
+function saveFounderSnapshot(
+  userId: number | null,
+  snapshot: ReturnType<typeof buildFounderSessionSnapshot>,
+  nowIso: string,
+): void {
+  if (!userId || !snapshot) return;
+  void (async () => {
+    try {
+      const current = await loadFounderProfile(userId);
+      const next = foldFounderProfile(current, snapshot, nowIso);
+      const { error } = await supabase.from("founder_profiles").upsert(
+        {
+          user_id: userId,
+          profile: next,
+          updated_at: nowIso,
+        },
+        { onConflict: "user_id" },
+      );
+      if (error) console.warn("⚠️ Founder memory write skipped:", error.message);
+    } catch (err: any) {
+      console.warn("⚠️ Founder memory write failed:", err?.message || err);
+    }
+  })();
 }
 
 async function resolveDeckText(clientConfig: any, userId: number | null): Promise<string> {
@@ -536,6 +616,11 @@ export function initRestSocket(wss: WebSocketServer) {
     let pitchConfigSnapshot: any = null;
     let parentSessionId: number | null = null;
     let previousSessionCtx: ReturnType<typeof clampPreviousSession> = null;
+    // Cross-session founder memory, loaded once at client_ready and folded back
+    // in when this session's evaluation completes. Null until the read lands;
+    // the panel simply runs without the block for that window, which is the
+    // correct degradation for a cache-like enrichment.
+    let founderProfile: FounderProfile | null = null;
     // Server-authoritative per-pitch attempt claim, decided once at client_ready
     // and reused at end_session to stamp the row's position in the chain. Held
     // here (not read back from the client) so nothing the browser sends can move
@@ -560,6 +645,14 @@ export function initRestSocket(wss: WebSocketServer) {
     // (fail closed). client_ready overwrites this from the user's real row, or
     // refuses the session outright on a lookup error.
     let entitlement: Entitlement = FREE;
+
+    // Recognition language for this session, resolved from the SAME user row as
+    // the entitlement above (so it costs no extra round trip) and held for the
+    // connection's life. Starts at the configured default — en-NG — so a founder
+    // whose preference lookup fails is still recognized in the product's primary
+    // market rather than silently reverting to US English. Applied at the single
+    // place the recognizer is constructed.
+    let sessionSttLocale: string = config.sttDefaultLocale;
 
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
@@ -1510,11 +1603,12 @@ export function initRestSocket(wss: WebSocketServer) {
           // Verify that the user still exists in the database (prevents deleted users
           // from pitching via WebSocket since WS bypasses Express auth middleware).
           // Also pulls `plan` and trial fields in the SAME query so the paywall costs no extra
-          // round trip.
+          // round trip, plus `settings` so the founder's chosen recognition
+          // language rides along on the same read rather than adding a second one.
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
-              .select("id, isEmailVerified, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
+              .select("id, isEmailVerified, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, settings")
               .eq("id", currentUserId)
               .maybeSingle();
 
@@ -1550,6 +1644,16 @@ export function initRestSocket(wss: WebSocketServer) {
               (dbUser as any).trial_expires_at,
               (dbUser as any).trial_status,
               (dbUser as any).trial_started_at,
+            );
+
+            // Recognition language, from this same row. resolveSttLocale is the
+            // read-side half of the allowlist (sanitizeSettings is the write-side
+            // half): a value that is missing, hand-edited in the DB, or written by
+            // an older client degrades to the configured default instead of
+            // reaching Azure as an invalid locale.
+            sessionSttLocale = resolveSttLocale(
+              (dbUser as any).settings?.sttLocale,
+              config.sttDefaultLocale,
             );
           }
 
@@ -1786,6 +1890,11 @@ export function initRestSocket(wss: WebSocketServer) {
           // available at that moment.
           const rebuildMasterPrompt = () => {
             if (isSoloMode || !liveConfig) return;
+            // Fold in the latest founder memory before composing. The profile
+            // read races both the deck resolution and the web research, so this
+            // is called again whenever any of them lands — same reason the deck
+            // text is re-read here rather than captured once.
+            liveConfig.founderProfile = founderProfile;
             masterPrompt = getMasterPrompt(
               isCoachMode,
               currentBusinessName,
@@ -1797,6 +1906,24 @@ export function initRestSocket(wss: WebSocketServer) {
               masterPrompt += "\n" + buildMarketSnapshotBlock(marketSnapshot);
             }
           };
+
+          // Cross-session founder memory: the panel's memory of HOW this founder
+          // pitches, as opposed to previousSessionCtx (what they scored on this
+          // particular startup last time). Fired without awaiting, exactly like
+          // the deck text and the research call below — a session must never wait
+          // on it, and later turns still carry it because rebuildMasterPrompt is
+          // re-run when it lands.
+          loadFounderProfile(currentUserId)
+            .then((profile) => {
+              founderProfile = profile;
+              if (profile.sessions.length > 0) {
+                console.log(
+                  `🧠 Founder memory loaded: ${profile.sessions.length} prior session(s).`,
+                );
+              }
+              rebuildMasterPrompt();
+            })
+            .catch((err) => console.warn("⚠️ Founder memory unavailable:", err?.message || err));
 
           resolveDeckText(clientConfig, currentUserId)
             .then((text) => {
@@ -1813,6 +1940,12 @@ export function initRestSocket(wss: WebSocketServer) {
                 resolvedDeckText,
                 structuredDeck,
                 previousSession: previousSessionCtx,
+                // Which mode this session is running as. getMasterPrompt uses it
+                // to restrict cross-session trends to comparable sessions — a
+                // coach rubric and a panel rubric are not the same measuring
+                // stick, so a "trend" spanning both is an artefact of the mode
+                // switch rather than a change in the founder.
+                mode: sessionMode,
               };
               rebuildMasterPrompt();
             })
@@ -1947,6 +2080,9 @@ export function initRestSocket(wss: WebSocketServer) {
                   sendJson(ws, { type: "stop_audio" });
                 }
               },
+              // The founder's recognition language, resolved from the same user
+              // row the paywall already read — no extra query.
+              sessionSttLocale,
             );
           } else {
             console.warn(
@@ -2454,6 +2590,40 @@ export function initRestSocket(wss: WebSocketServer) {
             if (!dbError && dbData) {
               sessionId = dbData.id;
               if (dbData.share_id) shareId = dbData.share_id;
+
+              // Cross-session founder memory: fold THIS session into the profile
+              // so the panel remembers it next time. Placed here, after the row
+              // exists, because the snapshot is keyed by session id and a
+              // snapshot that cannot be de-duplicated on re-fold would let one
+              // session be counted twice and manufacture a "recurring" pattern
+              // out of a single pitch.
+              //
+              // Fire-and-forget, like the PDF below: saveFounderSnapshot never
+              // throws, and a memory write must never be able to fail a session
+              // that has already been saved successfully.
+              saveFounderSnapshot(
+                currentUserId,
+                buildFounderSessionSnapshot(reportData, {
+                  sessionId: dbData.id,
+                  date: new Date().toISOString(),
+                  mode: sessionMode,
+                  businessName: currentBusinessName,
+                  // Questions the panel raised that the founder never actually
+                  // answered. unresolvedTopics is the live tracker; unanswered
+                  // ledger entries cover anything it missed. Both are plain data
+                  // by now — the ledger is rebuilt from the transcript during
+                  // evaluation, so this is not a race on live state.
+                  dodgedTopics: [
+                    ...(pitchSessionState?.unresolvedTopics
+                      ? [...pitchSessionState.unresolvedTopics]
+                      : []),
+                    ...(pitchSessionState?.questionsAsked || [])
+                      .filter((q) => !q.answered)
+                      .map((q) => q.topic),
+                  ],
+                }),
+                new Date().toISOString(),
+              );
 
               // A ROOT attempt is its own chain root, but it could not know its
               // id before the insert. Patch it now so the attempt count never
