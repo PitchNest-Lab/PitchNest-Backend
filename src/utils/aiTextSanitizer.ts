@@ -128,15 +128,18 @@ export function sanitizeFounderInput(text: string): string {
  * content is a record, never a direction. This closes the structure; the framing
  * closes the meaning.
  *
- * `max` is applied last, so the truncation cannot reintroduce a break mid-way
- * through a multi-byte character.
+ * `max` is applied last, so it bounds what is actually rendered. It counts UTF-16
+ * code units, so a cut can land between the two halves of a surrogate pair (an
+ * emoji, say); the orphaned high surrogate is dropped rather than sent as
+ * invalid Unicode.
  */
 export function inlinePromptFragment(text: unknown, max: number): string {
   return String(sanitizeFounderInput(String(text ?? "")) || "")
     .replace(/["`\\]/g, "")
     .replace(/\s+/g, " ")
     .trim()
-    .slice(0, max);
+    .slice(0, max)
+    .replace(/[\uD800-\uDBFF]$/, "");
 }
 
 /**
