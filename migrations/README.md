@@ -36,6 +36,9 @@ Apply in order, staging first:
 | `0025` | Privacy-safe product events (allowlisted names and properties) and a staff summary | Staff view counts at `/staff/analytics` |
 | `0026` | Public text pitches (draft, consented publish, withdraw), pitch feedback categories on comments, pitch reports with hide and restore in the staff queue, pitch event names | Needs `FEATURE_DISCOVER_ENGAGEMENT=true`. Then set `FEATURE_PITCH_ARENA=true` |
 | `0027` | Revokes direct billing-settlement RPC access, fixes function search paths, and locks down the trial-email ledger | Apply immediately. Verify only `service_role` can execute `grant_pro_access` afterward |
+| `0028` | Business logo and cover images (`logo_file`, `cover_file`, recorded in the publication snapshot), image changes bump `profile_version`, and `business_members.public_title` for consenting public team members | Apply before deploying the backend that uses it. Published images are copied to `SUPABASE_PUBLIC_MEDIA_BUCKET` (defaults to the avatar bucket) under `business-media/` |
+| `0029` | Founder pages and follows: `founder_handles`, `founder_follows`, `founder_business_announcements`, `notifications.actor_id`, `founder_update` / `founder_business` notifications (honouring `followedFounders`), and `list_user_notifications` with founder columns | Apply after `0028` and before deploying. Founder follows use `FEATURE_DISCOVER_ENGAGEMENT`; founder pages are public whenever a member consents on a published business |
+| `0030` | JWT revocation version and account-erasure-safe business provenance foreign keys; reasserts the private publish RPC grant | Apply after `0029` before deploying the matching authentication code |
 
 Grant moderation access to a trusted account:
 

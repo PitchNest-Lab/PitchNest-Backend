@@ -4,6 +4,7 @@ import { BUSINESS_TYPES } from "./businessController.ts";
 import { loadDirectoryEngagement } from "./discoverEngagementController.ts";
 import { renderPublicBusinessShareDocument } from "../utils/publicBusinessMetadata.ts";
 import { logEvent } from "../services/eventService.ts";
+import { loadPublicTeam, publicMediaUrl, type PublicTeamMember } from "../services/businessMediaService.ts";
 
 const DEFAULT_PAGE_SIZE = 12;
 const MAX_PAGE_SIZE = 24;
@@ -22,6 +23,9 @@ export interface PublicBusinessSummary {
   industry: string;
   stage: string;
   region: string;
+  /** Approved images, served from public storage; null when there is none. */
+  logoUrl: string | null;
+  coverUrl: string | null;
   publishedAt: string | null;
 }
 
@@ -31,6 +35,8 @@ export interface PublicBusinessProfile extends PublicBusinessSummary {
   solution: string;
   targetCustomer: string;
   websiteUrl: string;
+  /** Members who personally chose to appear. Filled by readPublicBusinessProfile. */
+  team: PublicTeamMember[];
 }
 
 function safeString(value: unknown, maxLength: number): string {
@@ -68,6 +74,9 @@ export function toPublicBusinessSummary(
     industry: safeString(snapshot.industry, 100),
     stage: safeString(snapshot.stage, 80),
     region: safeString(snapshot.region, 120),
+    // Built from the approved file names only; the business id stays server-side.
+    logoUrl: publicMediaUrl("logo", snapshot.id, snapshot.logoFile),
+    coverUrl: publicMediaUrl("cover", snapshot.id, snapshot.coverFile),
     publishedAt: typeof publishedAt === "string" ? publishedAt : null,
   };
 }
@@ -84,6 +93,7 @@ export function toPublicBusinessProfile(
     solution: safeString(snapshot.solution, 1500),
     targetCustomer: safeString(snapshot.targetCustomer, 800),
     websiteUrl: safeWebsite(snapshot.websiteUrl),
+    team: [],
   };
 }
 
@@ -241,7 +251,10 @@ export async function readPublicBusinessProfile(
   const row = Array.isArray(data) ? data[0] : data;
   if (!row) return null;
   const business = toPublicBusinessProfile(row.public_snapshot, row.published_at);
-  return business.slug && business.name ? business : null;
+  if (!business.slug || !business.name) return null;
+  // Read live, so a member who withdraws consent disappears on the next request.
+  business.team = await loadPublicTeam(row.public_snapshot?.id);
+  return business;
 }
 
 function xmlEscape(value: string): string {

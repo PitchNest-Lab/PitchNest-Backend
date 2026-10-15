@@ -1,7 +1,6 @@
 import { Request, Response, NextFunction } from "express";
-import jwt from "jsonwebtoken";
-import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
+import { verifyAccessToken } from "../utils/accessToken.ts";
 
 export type AccountType = "user" | "organization";
 export type OrganizationRole = "owner" | "admin" | "facilitator" | "member";
@@ -10,6 +9,7 @@ export interface AuthenticatedIdentity {
   id: number;
   email: string;
   rememberMe?: boolean;
+  authVersion?: number;
   accountType: AccountType;
   orgCode?: string;
 }
@@ -47,13 +47,12 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
     }
 
     try {
-      const decoded = jwt.verify(token, config.jwtSecret) as Partial<AuthenticatedIdentity>;
+      const decoded = verifyAccessToken(token);
       const accountType: AccountType =
         decoded.accountType === "organization" ? "organization" : "user";
 
       if (
         !Number.isInteger(decoded.id) ||
-        typeof decoded.email !== "string" ||
         (requiredType !== "any" && accountType !== requiredType)
       ) {
         return res.status(403).json({ error: "This account cannot access that resource." });
@@ -62,7 +61,7 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
       if (accountType === "organization") {
         const { data: organization, error } = await supabase
           .from("Organizations")
-          .select("id, email, org_code")
+          .select("id, email, org_code, auth_version")
           .eq("id", decoded.id)
           .maybeSingle();
 
@@ -72,10 +71,20 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
           });
         }
 
+        const tokenAuthVersion = Number.isInteger(decoded.authVersion)
+          ? Number(decoded.authVersion)
+          : 0;
+        if ((organization.auth_version ?? 0) !== tokenAuthVersion) {
+          return res.status(401).json({
+            error: "This session was revoked. Please log in again.",
+          });
+        }
+
         const identity: AuthenticatedIdentity = {
           id: organization.id,
           email: organization.email,
           rememberMe: decoded.rememberMe === true,
+          authVersion: organization.auth_version ?? 0,
           accountType: "organization",
           orgCode: String(organization.org_code),
         };
@@ -93,7 +102,7 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
 
       const { data: user, error } = await supabase
         .from("users")
-        .select("id, email, isEmailVerified")
+        .select("id, email, isEmailVerified, auth_version")
         .eq("id", decoded.id)
         .maybeSingle();
 
@@ -110,10 +119,20 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
         });
       }
 
+      const tokenAuthVersion = Number.isInteger(decoded.authVersion)
+        ? Number(decoded.authVersion)
+        : 0;
+      if ((user.auth_version ?? 0) !== tokenAuthVersion) {
+        return res.status(401).json({
+          error: "This session was revoked. Please log in again.",
+        });
+      }
+
       req.user = {
         id: user.id,
         email: user.email,
         rememberMe: decoded.rememberMe === true,
+        authVersion: user.auth_version ?? 0,
         accountType: "user",
       };
       return next();
@@ -138,20 +157,29 @@ export async function optionalUserAuth(req: Request, _res: Response, next: NextF
   const token = bearerToken(req);
   if (!token) return next();
   try {
-    const decoded = jwt.verify(token, config.jwtSecret) as Partial<AuthenticatedIdentity>;
+    const decoded = verifyAccessToken(token);
     if (decoded.accountType === "organization" || !Number.isInteger(decoded.id)) {
       return next();
     }
     const { data: user, error } = await supabase
       .from("users")
-      .select("id, email, isEmailVerified")
+      .select("id, email, isEmailVerified, auth_version")
       .eq("id", decoded.id)
       .maybeSingle();
-    if (!error && user && user.isEmailVerified) {
+    const tokenAuthVersion = Number.isInteger(decoded.authVersion)
+      ? Number(decoded.authVersion)
+      : 0;
+    if (
+      !error &&
+      user &&
+      user.isEmailVerified &&
+      (user.auth_version ?? 0) === tokenAuthVersion
+    ) {
       req.user = {
         id: user.id,
         email: user.email,
         rememberMe: decoded.rememberMe === true,
+        authVersion: user.auth_version ?? 0,
         accountType: "user",
       };
     }

@@ -32,6 +32,12 @@ import {
   MAX_SNAPSHOTS,
 } from "../services/founderMemoryService.ts";
 import { computeDeliveryMetrics } from "../utils/deliveryMetrics.ts";
+import {
+  hashAuthToken,
+  isEmailCode,
+  isLongAuthToken,
+  safeEqualText,
+} from "../utils/authTokens.ts";
 
 function assert(condition: boolean, msg: string) {
   if (!condition) {
@@ -41,6 +47,13 @@ function assert(condition: boolean, msg: string) {
     console.log(`✅ Passed: ${msg}`);
   }
 }
+
+const rawCredential = "a".repeat(64);
+const storedCredential = hashAuthToken("password-reset", rawCredential);
+assert(storedCredential !== rawCredential && isLongAuthToken(storedCredential), "One-time credentials are stored as keyed digests");
+assert(hashAuthToken("email-link", rawCredential) !== storedCredential, "Credential digests are separated by purpose");
+assert(isEmailCode("012345") && !isEmailCode("12345") && !isEmailCode("12345x"), "Email verification codes are shape-validated");
+assert(safeEqualText("same", "same") && !safeEqualText("same", "different"), "Credential comparison is exact and timing-safe");
 
 console.log("\n🧪 Running PitchNest Memory, Reasoning & Intelligence Test Suite...\n");
 

@@ -2,6 +2,7 @@ import crypto from "crypto";
 import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
+import { hashAuthToken } from "./authTokens.ts";
 
 const resend =
   config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
@@ -19,6 +20,8 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   const token = crypto.randomBytes(32).toString("hex");
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+  const tokenDigest = hashAuthToken("email-link", token);
+  const codeDigest = hashAuthToken("email-code", code);
 
   // 2. Delete any old tokens for this user
   await supabase
@@ -29,7 +32,13 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   // 3. Save new token to Supabase
   let { error } = await supabase
     .from("email_verification_tokens")
-    .insert({ user_id: userId, token, code, expires_at: expiresAt, attempts: 0 });
+    .insert({
+      user_id: userId,
+      token: tokenDigest,
+      code: codeDigest,
+      expires_at: expiresAt,
+      attempts: 0,
+    });
 
   // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
   // fall back to storing just the high-entropy link token so signup and the
@@ -41,7 +50,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
     );
     ({ error } = await supabase
       .from("email_verification_tokens")
-      .insert({ user_id: userId, token, expires_at: expiresAt }));
+      .insert({ user_id: userId, token: tokenDigest, expires_at: expiresAt }));
   }
 
   if (error) throw new Error("Failed to save token");

@@ -1,4 +1,5 @@
 import { supabase } from "../config/supabase.ts";
+import { PLAN_AI_PROFILES, type PlanAiProfile } from "../config/aiModels.ts";
 
 /**
  * Plan entitlements — the single source of truth for "what may this user do".
@@ -41,6 +42,9 @@ export interface Entitlement {
   pdfDownload: boolean;
   /** May have the panel enriched with live market research. */
   liveResearch: boolean;
+  /** Which models coach this plan (config/aiModels.ts). Scoring is not here:
+   *  it uses the same judge model on every plan. */
+  ai: PlanAiProfile;
   /** True when user is in the 30-day full access trial period. */
   isTrial: boolean;
   /** Trial days remaining if active. */
@@ -53,6 +57,7 @@ export const FREE: Entitlement = {
   allowedDurations: [FREE_DURATION_MINUTES],
   pdfDownload: false,
   liveResearch: false,
+  ai: PLAN_AI_PROFILES.free,
   isTrial: false,
 };
 
@@ -62,6 +67,7 @@ const PREP: Entitlement = {
   allowedDurations: [...PREP_DURATIONS],
   pdfDownload: true,
   liveResearch: false,
+  ai: PLAN_AI_PROFILES.prep,
   isTrial: false,
 };
 
@@ -71,6 +77,7 @@ const PRO: Entitlement = {
   allowedDurations: [...PRO_DURATIONS],
   pdfDownload: true,
   liveResearch: true,
+  ai: PLAN_AI_PROFILES.pro,
   isTrial: false,
 };
 
@@ -82,6 +89,7 @@ export function getTrialEntitlement(daysRemaining: number = 30): Entitlement {
     allowedDurations: [...PRO_DURATIONS],
     pdfDownload: true,
     liveResearch: true,
+    ai: PLAN_AI_PROFILES.pro,
     isTrial: true,
     trialDaysRemaining: Math.max(0, Math.round(daysRemaining)),
   };

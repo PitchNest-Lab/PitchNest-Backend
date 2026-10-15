@@ -43,10 +43,12 @@ function pricingPayload() {
  * headline Pro monthly. Anything unrecognised falls back rather than 400-ing, so
  * a stale client can still buy the default plan.
  */
-function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } {
-  const plan: PaidPlan = isPaidPlan(body?.plan) ? body.plan : "pro";
-  const term: BillingTerm = isBillingTerm(body?.term) ? body.term : "monthly";
-  return { plan, term };
+function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } | null {
+  const rawPlan = body?.plan;
+  const rawTerm = body?.term;
+  if (rawPlan !== undefined && !isPaidPlan(rawPlan)) return null;
+  if (rawTerm !== undefined && !isBillingTerm(rawTerm)) return null;
+  return { plan: rawPlan ?? "pro", term: rawTerm ?? "monthly" };
 }
 
 /**
@@ -54,6 +56,7 @@ function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } {
  */
 export const getPrice = async (_req: Request, res: Response) => {
   try {
+    res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     res.json({
       billingEnabled: hasBillingConfig(),
       ...pricingPayload(),
@@ -74,11 +77,16 @@ export const getPlan = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: "Authentication required" });
 
-    let { data: user } = await supabase
+    let { data: user, error: userError } = await supabase
       .from("users")
       .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
       .eq("id", userId)
       .maybeSingle();
+    if (userError) {
+      console.error("Plan lookup failed:", userError.message);
+      return res.status(503).json({ error: "Plan status is temporarily unavailable." });
+    }
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     let expiry = (user as any)?.plan_expires_at
       ? new Date((user as any).plan_expires_at)
@@ -86,7 +94,8 @@ export const getPlan = async (req: Request, res: Response) => {
     // A paid level (prep or pro) counts as active until its period passes.
     // A null expiry means "never expires" (comped / grandfathered).
     const isPaidActive = (plan: unknown, e: Date | null) =>
-      (plan === "prep" || plan === "pro" || plan === "founder") && (!e || e.getTime() > Date.now());
+      (plan === "prep" || plan === "pro" || plan === "founder" || plan === "enterprise") &&
+      (!e || e.getTime() > Date.now());
     let active = isPaidActive((user as any)?.plan, expiry);
 
     // In local development, webhooks from the internet cannot reach localhost.
@@ -167,17 +176,24 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
-    const { data: user } = await supabase
+    const { data: user, error: userError } = await supabase
       .from("users")
       .select("id, email, name, plan, plan_expires_at")
       .eq("id", userId)
       .maybeSingle();
 
+    if (userError) {
+      console.error("Checkout user lookup failed:", userError.message);
+      return res.status(503).json({ error: "Checkout is temporarily unavailable." });
+    }
     if (!user) return res.status(404).json({ error: "User not found" });
 
     // Unlimited (comped) access has nothing to buy, and paying would replace it
     // with a dated period (see grant_pro_access downgrade guard).
-    if ((user as any).plan === "pro" && !(user as any).plan_expires_at) {
+    if (
+      ["prep", "pro", "founder", "enterprise"].includes(String((user as any).plan)) &&
+      !(user as any).plan_expires_at
+    ) {
       return res.status(409).json({
         error: "already_pro",
         message: "Your account already has full access.",
@@ -185,6 +201,9 @@ export const startCheckout = async (req: Request, res: Response) => {
     }
 
     const selection = parseSelection(req.body);
+    if (!selection) {
+      return res.status(400).json({ error: "Please choose a valid plan and billing term." });
+    }
 
     const session = await createCheckout(
       {
@@ -237,9 +256,9 @@ export const startCheckout = async (req: Request, res: Response) => {
  *  2. Re-query Flutterwave rather than trusting the posted body. A verified
  *     header proves the sender, not the contents.
  *
- * Always answers 200 once authenticated, even on internal failure: a non-2xx
- * makes Flutterwave retry, and retrying will not fix a bug on our side. Real
- * problems are logged loudly instead.
+ * The provider is acknowledged only after durable settlement. Transient
+ * provider/database failures return 503 so Flutterwave retries instead of a
+ * paid entitlement being lost after an early 200 response.
  */
 export const handleWebhook = async (req: Request, res: Response) => {
   if (!verifyWebhookSignature(req.headers["verif-hash"])) {
@@ -257,10 +276,6 @@ export const handleWebhook = async (req: Request, res: Response) => {
     return res.status(400).json({ error: "invalid payload" });
   }
 
-  // Acknowledge immediately — Flutterwave times out at 60s, and settling can
-  // involve two network round trips.
-  res.status(200).json({ received: true });
-
   try {
     const data = payload?.data ?? {};
     const claimedTxRef: string | undefined = data.tx_ref;
@@ -268,7 +283,7 @@ export const handleWebhook = async (req: Request, res: Response) => {
 
     if (!transactionId) {
       console.warn("⚠️ Billing webhook carried no transaction id; ignoring.");
-      return;
+      return res.status(200).json({ received: true, ignored: true });
     }
 
     // The authoritative check. Everything below acts on `verified`, never on the
@@ -282,34 +297,41 @@ export const handleWebhook = async (req: Request, res: Response) => {
       console.error(
         `❌ Could not verify transaction ${transactionId} (claimed ref ${claimedTxRef ?? "none"}); NOT granting.`,
       );
-      return;
+      return res.status(503).json({ error: "verification unavailable" });
     }
 
     if (verified.status !== "successful" && verified.status !== "succeeded") {
       console.log(`ℹ️ Transaction ${verified.txRef} verified as '${verified.status}'; not granting.`);
       await markPaymentFailed(verified.txRef);
-      return;
+      return res.status(200).json({ received: true });
     }
 
     // Guard against a mismatched or short payment: a webhook could reference a
     // real but cheaper transaction. Compare against what we recorded at
     // checkout, not against the payload.
-    const { data: expected } = await supabase
+    const { data: expected, error: expectedError } = await supabase
       .from("payments")
       .select("amount, currency")
       .eq("tx_ref", verified.txRef)
       .maybeSingle();
 
-    if (expected) {
-      const shortPaid = Number(verified.amount) < Number((expected as any).amount);
-      const wrongCurrency =
-        String((expected as any).currency).toUpperCase() !== verified.currency.toUpperCase();
-      if (shortPaid || wrongCurrency) {
-        console.error(
-          `❌ Payment mismatch for ${verified.txRef}: expected ${(expected as any).amount} ${(expected as any).currency}, got ${verified.amount} ${verified.currency}. NOT granting.`,
-        );
-        return;
-      }
+    if (expectedError) {
+      console.error(`❌ Payment lookup failed for ${verified.txRef}:`, expectedError.message);
+      return res.status(503).json({ error: "settlement unavailable" });
+    }
+    if (!expected) {
+      console.warn(`⚠️ Ignoring verified transaction with unknown reference ${verified.txRef}.`);
+      return res.status(200).json({ received: true, ignored: true });
+    }
+
+    const shortPaid = Number(verified.amount) < Number((expected as any).amount);
+    const wrongCurrency =
+      String((expected as any).currency).toUpperCase() !== verified.currency.toUpperCase();
+    if (shortPaid || wrongCurrency) {
+      console.error(
+        `❌ Payment mismatch for ${verified.txRef}: expected ${(expected as any).amount} ${(expected as any).currency}, got ${verified.amount} ${verified.currency}. NOT granting.`,
+      );
+      return res.status(200).json({ received: true, ignored: true });
     }
 
     const granted = await grantAccess(verified);
@@ -318,7 +340,9 @@ export const handleWebhook = async (req: Request, res: Response) => {
         ? `✅ Pro granted for ${verified.txRef} (${verified.amount} ${verified.currency})`
         : `↩️ Webhook replay for ${verified.txRef} — already settled, no change.`,
     );
+    return res.status(200).json({ received: true });
   } catch (err: any) {
     console.error("❌ Billing webhook processing failed:", err?.message || err);
+    return res.status(503).json({ error: "settlement unavailable" });
   }
 };

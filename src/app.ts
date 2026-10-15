@@ -65,12 +65,35 @@ app.use(cors({
 // Strict-Transport-Security, Referrer-Policy, X-DNS-Prefetch-Control, etc.
 app.use(
   helmet({
-    // CSP is relaxed because the backend may serve the frontend SPA.
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'self'"],
+        formAction: ["'self'"],
+        scriptSrc: ["'self'", "https://accounts.google.com"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "blob:", "https:"],
+        connectSrc: ["'self'", "https:", "wss:"],
+        frameSrc: ["'self'", "blob:", "https:"],
+        mediaSrc: ["'self'", "blob:", "https:"],
+        workerSrc: ["'self'", "blob:"],
+        manifestSrc: ["'self'"],
+        // Do not make local HTTP development unusable.
+        upgradeInsecureRequests: isProduction ? [] : null,
+      },
+    },
     // Allow framing from same origin (needed for embedded previews).
     frameguard: { action: "sameorigin" },
+    referrerPolicy: { policy: "no-referrer" },
   }),
 );
+app.use((_req, res, next) => {
+  res.set("Permissions-Policy", "camera=(self), microphone=(self), geolocation=(), payment=()");
+  next();
+});
 
 /**
  * ⚠️ MUST STAY ABOVE express.json — the payment webhook needs the raw bytes.
@@ -85,8 +108,15 @@ app.use(
  */
 app.use("/api/billing/webhook", express.raw({ type: "application/json", limit: "1mb" }));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ limit: "256kb", extended: true }));
+
+// Sensitive API payloads are private unless a public controller explicitly
+// replaces this with a cache policy after validating its publication state.
+app.use("/api", (_req, res, next) => {
+  res.set("Cache-Control", "private, no-store");
+  next();
+});
 
 // Local-fallback files are delivered ONLY via the token-gated /api/files route
 // (S7) — the previous unauthenticated static mount let anyone who knew a

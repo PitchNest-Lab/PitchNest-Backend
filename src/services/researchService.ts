@@ -1,5 +1,6 @@
 import { config, hasResearchConfig } from "../config/env.ts";
-import { getOpenAIClient } from "./aiService.ts";
+import { UTILITY_MODEL } from "../config/aiModels.ts";
+import { completeChat } from "./aiModelRouter.ts";
 
 /**
  * Background web research — builds a compact, dated "MARKET SNAPSHOT" the
@@ -128,9 +129,7 @@ export async function researchStartup(params: {
       .map((r) => `- ${r.title}: ${r.snippet.slice(0, 240)} (${r.url})`)
       .join("\n");
 
-    const client = getOpenAIClient();
-    const completion = await client.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
+    const content = await completeChat(UTILITY_MODEL, {
       messages: [
         {
           role: "system",
@@ -146,10 +145,10 @@ RULES:
           content: `BUSINESS: ${businessName}\nWHAT IT DOES: ${description || "(not stated)"}\nINDUSTRY: ${industry || "(not stated)"}\n\nSEARCH RESULTS:\n${sourceMaterial}`,
         },
       ],
-      max_completion_tokens: 300,
+      maxTokens: 300,
     });
 
-    const text = (completion.choices?.[0]?.message?.content || "").trim();
+    const text = content.trim();
     if (!text || text.includes("NOTHING_FOUND") || text.length < 40) {
       return null;
     }

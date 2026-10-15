@@ -927,38 +927,22 @@ ACCENT & ADAPTABILITY RULES:
 - Show active listening by occasionally referencing the user's previous answers (e.g. "You mentioned earlier that…").`;
 }
 
-import { OpenAI, AzureOpenAI } from "openai";
+import { DEFAULT_MODEL, JUDGE_MODEL, type ModelId } from "../config/aiModels.ts";
+import {
+  checkModels,
+  clientFor,
+  completeChat,
+  describeModels,
+  resolveModel,
+  streamChat,
+} from "./aiModelRouter.ts";
 
+/**
+ * The default model's client. Kept for callers that predate the model router;
+ * new code should call completeChat / streamChat with a model id instead.
+ */
 export function getOpenAIClient() {
-  if (config.azureOpenAiEndpoint && config.azureOpenAiApiKey) {
-    const rawEndpoint = config.azureOpenAiEndpoint.trim();
-
-    // Check if using Azure AI Foundry / Azure OpenAI v1 endpoint format
-    if (rawEndpoint.includes("/openai/v1")) {
-      const baseURL = rawEndpoint.replace(/\/responses$/, "").replace(/\/+$/, "");
-      return new OpenAI({
-        baseURL,
-        apiKey: config.azureOpenAiApiKey,
-        defaultHeaders: { "api-key": config.azureOpenAiApiKey },
-      });
-    }
-
-    // Classic Azure OpenAI client
-    let cleanedEndpoint = rawEndpoint;
-    try {
-      cleanedEndpoint = new URL(rawEndpoint).origin;
-    } catch {
-      cleanedEndpoint = rawEndpoint.replace(/\/+$/, "");
-    }
-
-    return new AzureOpenAI({
-      endpoint: cleanedEndpoint,
-      apiKey: config.azureOpenAiApiKey,
-      apiVersion: config.azureOpenAiApiVersion,
-      deployment: config.azureOpenAiDeployment,
-    });
-  }
-  return new OpenAI({ apiKey: config.openAiApiKey });
+  return clientFor(resolveModel(DEFAULT_MODEL));
 }
 
 export function hasSubstantivePitch(transcript: any[]): boolean {
@@ -1305,19 +1289,19 @@ Return this exact JSON structure:
 // One JSON-mode model call with a single fast retry. Before regenerating, we
 // try to repair the response (strip code fences / surrounding prose) so a minor
 // formatting hiccup doesn't cost a whole extra round-trip. Shared by the pitch
-// evaluation sections and the deck audit.
+// evaluation sections and the deck audit — both are scoring, so both always run
+// on JUDGE_MODEL whatever the founder's plan (see config/aiModels.ts).
 async function callJsonModel(prompt: string, maxTokens: number, label: string): Promise<any> {
-  const openai = getOpenAIClient();
   let lastErr: any;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const response = await openai.chat.completions.create({
-        model: config.azureOpenAiDeployment || "gpt-4o",
-        messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: maxTokens,
-        response_format: { type: "json_object" },
-      });
-      const rawText = response.choices[0]?.message?.content?.trim() || "";
+      const rawText = (
+        await completeChat(JUDGE_MODEL, {
+          messages: [{ role: "user", content: prompt }],
+          maxTokens,
+          json: true,
+        })
+      ).trim();
       if (!rawText) throw new Error("empty response");
       return parseJsonLoose(rawText);
     } catch (err: any) {
@@ -1353,15 +1337,15 @@ function parseJsonLoose(text: string): any {
 }
 
 /**
- * Calls OpenAI API to generate the next turn in the conversation.
+ * Generates the next turn in the conversation (non-streamed). `modelId` is the
+ * session's coach model from its plan's AI profile.
  */
 export async function generatePanelResponse(
   userInput: string,
   history: any[],
-  systemInstruction: string
+  systemInstruction: string,
+  modelId: ModelId = DEFAULT_MODEL,
 ): Promise<string> {
-  const openai = getOpenAIClient();
-  
   const messages: any[] = [
     { role: "system", content: systemInstruction },
     ...history.map(m => ({
@@ -1372,13 +1356,7 @@ export async function generatePanelResponse(
   ];
 
   try {
-    const response = await openai.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
-      messages: messages,
-      max_completion_tokens: 1000,
-    });
-
-    return response.choices[0]?.message?.content || "";
+    return await completeChat(modelId, { messages, maxTokens: 1000 });
   } catch (err: any) {
     console.error("❌ OpenAI Panel Response Error:", err.message);
     throw err;
@@ -1401,11 +1379,11 @@ export async function generatePanelResponse(
 export async function generateAnswerTip(
   question: string,
   businessName?: string,
+  modelId: ModelId = DEFAULT_MODEL,
 ): Promise<{ term: string; definition: string; tip: string } | null> {
   const q = (question || "").trim();
   if (q.length < 8) return null;
 
-  const openai = getOpenAIClient();
   const prompt = `A startup founder is in a live pitch practice. An investor just asked them this:
 
 "${q}"
@@ -1421,19 +1399,19 @@ RULES:
 - Africa-first framing where natural (agent networks, mobile money, telcos, distributors); keep money references neutral/per-customer.`;
 
   try {
-    const response = await openai.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
-      messages: [{ role: "user", content: prompt }],
-      // The card is three short strings — term ≤ 24 chars, definition ≤ 90, tip
-      // ≤ 120 — so the whole JSON object fits comfortably inside ~120 tokens.
-      // The old budget of 800 let the model keep generating long after the card
-      // was complete, and the hint is non-streaming: the founder waits for the
-      // LAST token before the card appears. 220 leaves generous headroom for
-      // JSON punctuation and a verbose model while cutting the tail latency.
-      max_completion_tokens: 220,
-      response_format: { type: "json_object" },
-    });
-    const raw = response.choices[0]?.message?.content?.trim() || "";
+    const raw = (
+      await completeChat(modelId, {
+        messages: [{ role: "user", content: prompt }],
+        // The card is three short strings — term ≤ 24 chars, definition ≤ 90, tip
+        // ≤ 120 — so the whole JSON object fits comfortably inside ~120 tokens.
+        // The old budget of 800 let the model keep generating long after the card
+        // was complete, and the hint is non-streaming: the founder waits for the
+        // LAST token before the card appears. 220 leaves generous headroom for
+        // JSON punctuation and a verbose model while cutting the tail latency.
+        maxTokens: 220,
+        json: true,
+      })
+    ).trim();
     if (!raw) return null;
     const parsed = parseJsonLoose(raw);
 
@@ -1451,16 +1429,16 @@ RULES:
 }
 
 /**
- * Calls OpenAI API to generate the next turn via a streaming generator.
+ * Generates the next turn via a streaming generator. `modelId` is the session's
+ * coach model from its plan's AI profile.
  */
 export async function* streamPanelResponse(
   userInput: string,
   history: any[],
   systemInstruction: string,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  modelId: ModelId = DEFAULT_MODEL,
 ): AsyncGenerator<string, void, unknown> {
-  const openai = getOpenAIClient();
-
   const messages: any[] = [
     { role: "system", content: systemInstruction },
     ...history.map(m => ({
@@ -1473,22 +1451,11 @@ export async function* streamPanelResponse(
   try {
     // Pass the abort signal so the LLM generation itself is cancelled on
     // barge-in — we stop paying for tokens we'll throw away.
-    const stream = await openai.chat.completions.create(
-      {
-        model: config.azureOpenAiDeployment || "gpt-4o",
-        messages: messages,
-        max_completion_tokens: 1000,
-        stream: true,
-      },
-      { signal }
-    );
+    const stream = await streamChat(modelId, { messages, maxTokens: 1000 }, { signal });
 
-    for await (const chunk of stream) {
+    for await (const text of stream) {
       if (signal?.aborted) break;
-      const text = chunk.choices[0]?.delta?.content || "";
-      if (text) {
-        yield text;
-      }
+      yield text;
     }
   } catch (err: any) {
     // Barge-in aborts surface as AbortError — that's expected, not a failure.
@@ -1513,17 +1480,8 @@ export async function checkApiKeyStatus(): Promise<void> {
     return;
   }
 
-  try {
-    const openai = getOpenAIClient();
-    await openai.chat.completions.create({
-      model: config.azureOpenAiDeployment || "gpt-4o",
-      messages: [{ role: "user", content: "ping" }],
-      max_completion_tokens: 5
-    });
-    console.log(`\n🟢 OpenAI API Status Check: Connection successful (${isAzure ? 'Azure' : 'Standard'} OpenAI)!\n`);
-  } catch (err: any) {
-    console.error("\n⚠️ Failed to connect to OpenAI API during startup check:", err.message, "\n");
-  }
+  console.log(`\n🧠 AI models (${isAzure ? "Azure" : "Standard"} OpenAI): ${describeModels().join(" · ")}`);
+  await checkModels();
 }
 
 // ── Deck Check: static deck-only audit (no live session) ─────────────────────

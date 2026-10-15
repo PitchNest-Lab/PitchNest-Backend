@@ -2,6 +2,7 @@ import { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { uploadDir, sanitizeUploadName } from "../services/storageService.ts";
+import { MediaError, reencodeImage } from "../services/businessMediaService.ts";
 import {
   recordingLocalName,
   recordingObjectPath,
@@ -132,6 +133,23 @@ export const uploadAvatar = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     if (!userId) return res.status(401).json({ error: "Authentication required" });
 
+    // Re-encode before storing: avatars are public (and shown on public business
+    // profiles for consenting members), and phone photos carry GPS metadata.
+    let image: Buffer;
+    try {
+      image = await reencodeImage(req.file.buffer, {
+        width: 512,
+        height: 512,
+        fit: "cover",
+        minWidth: 32,
+        minHeight: 32,
+        allowGif: true,
+      });
+    } catch (error) {
+      if (error instanceof MediaError) return res.status(error.status).json({ error: error.message });
+      throw error;
+    }
+
     const { data: previousUser } = await supabase
       .from("users")
       .select("avatar_url")
@@ -139,7 +157,7 @@ export const uploadAvatar = async (req: Request, res: Response) => {
       .maybeSingle();
     const previousPath = storagePathFromUrl(previousUser?.avatar_url, config.avatarBucket);
     // A stable key prevents profile-photo changes from creating public orphan
-    // objects. Storage serves the detected Content-Type; no suffix is needed.
+    // objects. Every avatar is stored as WebP; no suffix is needed.
     const filePath = `avatars/${userId}/profile`;
 
     // Item A: avatars live in a SEPARATE public bucket so the main media bucket
@@ -147,8 +165,8 @@ export const uploadAvatar = async (req: Request, res: Response) => {
     // unsigned via getPublicUrl.
     const { error } = await supabase.storage
       .from(config.avatarBucket)
-      .upload(filePath, req.file.buffer, {
-        contentType: detected.contentType,
+      .upload(filePath, image, {
+        contentType: "image/webp",
         upsert: true,
         duplex: "half",
       });

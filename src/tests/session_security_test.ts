@@ -6,6 +6,7 @@ import jwt from "jsonwebtoken";
 import type { Request, Response } from "express";
 import { WebSocket, WebSocketServer } from "ws";
 import { config } from "../config/env.ts";
+import { ACCESS_TOKEN_AUDIENCE, ACCESS_TOKEN_ISSUER, ACCESS_TOKEN_KIND } from "../utils/accessToken.ts";
 import { supabase } from "../config/supabase.ts";
 import {
   issueResumeGrant,
@@ -196,7 +197,10 @@ const { port } = server.address() as AddressInfo;
 
 async function closeCodeFor(token: string): Promise<number> {
   return new Promise((resolve, reject) => {
-    const client = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
+    const client = new WebSocket(`ws://127.0.0.1:${port}/`, [
+      "pitchnest-v1",
+      `pitchnest-auth.${token}`,
+    ]);
     const timer = setTimeout(() => reject(new Error("socket did not close")), 5000);
     client.on("close", (code) => {
       clearTimeout(timer);
@@ -207,7 +211,11 @@ async function closeCodeFor(token: string): Promise<number> {
 }
 
 try {
-  const orgToken = jwt.sign({ id: 7, email: "org@example.com", accountType: "organization" }, config.jwtSecret);
+  const orgToken = jwt.sign(
+    { kind: ACCESS_TOKEN_KIND, id: 7, accountType: "organization" },
+    config.jwtSecret,
+    { algorithm: "HS256", issuer: ACCESS_TOKEN_ISSUER, audience: ACCESS_TOKEN_AUDIENCE },
+  );
   assert.equal(await closeCodeFor(orgToken), 4001, "organization tokens cannot open pitch sessions");
   assert.equal(await closeCodeFor("not-a-jwt"), 4001);
 } finally {

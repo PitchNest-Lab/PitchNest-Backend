@@ -81,6 +81,73 @@ export function resolveSttLocale(
   return isSupportedSttLocale(fallback) ? fallback : DEFAULT_STT_LOCALE;
 }
 
+// ── Automatic locale ─────────────────────────────────────────────────────────
+//
+// Most founders never open Settings, so without inference every unset account
+// is recognised as Nigerian English. When the founder has not chosen, the
+// locale is inferred from what we already know, most reliable first:
+//   1. their business's region (free text, so matched on country and city names)
+//   2. a browser language naming a specific African or Indian English variant
+//   3. the configured default
+// Browser en-US and en-GB are ignored on purpose: they are the factory setting on
+// most phones and laptops sold in our markets, so they say nothing about how the
+// founder speaks. A founder in the US or UK picks their variant in Settings.
+
+const REGION_HINTS: ReadonlyArray<[RegExp, string]> = [
+  [/\b(nigeria|nigerian|lagos|abuja|ibadan|port harcourt|kano|enugu|kaduna)\b/i, "en-NG"],
+  [/\b(kenya|kenyan|nairobi|mombasa|kisumu|nakuru|eldoret)\b/i, "en-KE"],
+  [/\b(ghana|ghanaian|accra|kumasi|tamale|takoradi)\b/i, "en-GH"],
+  [/\b(south africa|south african|johannesburg|joburg|cape town|durban|pretoria|gauteng)\b/i, "en-ZA"],
+  [/\b(tanzania|tanzanian|dar es salaam|dodoma|arusha|zanzibar|mwanza)\b/i, "en-TZ"],
+  [/\b(united kingdom|england|scotland|wales|london|manchester|birmingham)\b/i, "en-GB"],
+  [/\b(india|indian|bengaluru|bangalore|mumbai|delhi|hyderabad|chennai|pune)\b/i, "en-IN"],
+  [/\b(united states|usa|new york|san francisco|california|texas)\b/i, "en-US"],
+];
+
+/** A locale for a free-text region, or null when it names none or several. */
+export function localeFromRegion(region: unknown): string | null {
+  if (typeof region !== "string" || !region.trim()) return null;
+  const text = region.slice(0, 200);
+  const matches = new Set(REGION_HINTS.filter(([pattern]) => pattern.test(text)).map(([, code]) => code));
+  return matches.size === 1 ? [...matches][0] : null;
+}
+
+const BROWSER_TRUSTED_LOCALES: ReadonlySet<string> = new Set(["en-NG", "en-KE", "en-GH", "en-ZA", "en-TZ", "en-IN"]);
+
+/** "en_ng" / "EN-ng" → "en-NG". Non-language-region tags return "". */
+function canonicalTag(raw: string): string {
+  const [lang, region] = raw.trim().split(/[-_]/);
+  return lang && region ? `${lang.toLowerCase()}-${region.toUpperCase()}` : "";
+}
+
+/** A trusted locale from navigator.languages, or null. Input is untrusted. */
+export function localeFromBrowser(languages: unknown): string | null {
+  if (!Array.isArray(languages)) return null;
+  for (const raw of languages.slice(0, 5)) {
+    if (typeof raw !== "string" || raw.length > 35) continue;
+    const tag = canonicalTag(raw);
+    if (BROWSER_TRUSTED_LOCALES.has(tag)) return tag;
+  }
+  return null;
+}
+
+export type SttLocaleSource = "setting" | "business_region" | "browser" | "default";
+
+export function inferSttLocale(input: {
+  /** The founder's saved setting, if any. */
+  chosen?: unknown;
+  region?: unknown;
+  browserLanguages?: unknown;
+  fallback?: string;
+}): { locale: string; source: SttLocaleSource } {
+  if (isSupportedSttLocale(input.chosen)) return { locale: input.chosen, source: "setting" };
+  const fromRegion = localeFromRegion(input.region);
+  if (fromRegion) return { locale: fromRegion, source: "business_region" };
+  const fromBrowser = localeFromBrowser(input.browserLanguages);
+  if (fromBrowser) return { locale: fromBrowser, source: "browser" };
+  return { locale: resolveSttLocale(input.fallback), source: "default" };
+}
+
 /** Where a locale appears in the picker, for logging. -1 when unknown. */
 export function sttLocaleLabel(code: string): string {
   return TRANSCRIPTION_LOCALES.find((l) => l.code === code)?.label ?? code;

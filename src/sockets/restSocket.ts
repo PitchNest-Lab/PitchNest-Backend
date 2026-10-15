@@ -1,8 +1,8 @@
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage } from "http";
-import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
+import { verifyAccessToken } from "../utils/accessToken.ts";
 import {
   evaluatePitch,
   hasSubstantivePitch,
@@ -24,7 +24,18 @@ import {
   hasAzureSttConfig,
   StreamingRecognizer,
 } from "../services/sttService.ts";
-import { resolveSttLocale } from "../utils/transcriptionLocales.ts";
+import {
+  inferSttLocale,
+  isSupportedSttLocale,
+  resolveSttLocale,
+} from "../utils/transcriptionLocales.ts";
+import {
+  buildSessionPhrases,
+  extractTermsFromText,
+  mergeSessionPhrases,
+} from "../utils/speechPhrases.ts";
+import { lookupBusinessRegion } from "../services/speechContextService.ts";
+import { JUDGE_MODEL } from "../config/aiModels.ts";
 import {
   buildFounderSessionSnapshot,
   foldFounderProfile,
@@ -582,6 +593,20 @@ const CLIENT_READY_TIMEOUT_MS = 15_000;
 const activeWsByUser = new Map<number, Set<WebSocket>>();
 const activeWsByIp = new Map<string, Set<WebSocket>>();
 
+/** Immediately ends every live pitch socket after logout, reset or erasure. */
+export function revokeUserSockets(userId: number, reason = "Session revoked") {
+  const sockets = activeWsByUser.get(userId);
+  if (!sockets) return;
+  for (const socket of [...sockets]) {
+    try {
+      socket.close(4001, reason.slice(0, 123));
+    } catch {
+      socket.terminate();
+    }
+  }
+  activeWsByUser.delete(userId);
+}
+
 function trackUserWs(userId: number, ws: WebSocket) {
   if (!activeWsByUser.has(userId)) activeWsByUser.set(userId, new Set());
   activeWsByUser.get(userId)!.add(ws);
@@ -616,22 +641,23 @@ export function initRestSocket(wss: WebSocketServer) {
     });
 
     // ── JWT Authentication ──────────────────────────────────────────────────
-    // Clients must pass ?token=<JWT> as a query param on the WS URL.
-    // Without a valid token the connection is closed immediately.
+    // Browser WebSockets cannot set Authorization. The client offers the token
+    // in Sec-WebSocket-Protocol while the server selects only `pitchnest-v1`,
+    // keeping credentials out of URLs and access logs.
     let authenticatedUserId: number | null = null;
+    let authenticatedAuthVersion = 0;
     try {
-      const url = new URL(req.url || "", `http://${req.headers.host}`);
-      const token = url.searchParams.get("token");
+      const offeredProtocols = String(req.headers["sec-websocket-protocol"] || "")
+        .split(",")
+        .map((value) => value.trim());
+      const authProtocol = offeredProtocols.find((value) => value.startsWith("pitchnest-auth."));
+      const token = authProtocol?.slice("pitchnest-auth.".length) || "";
       if (!token) {
         sendJson(ws, { type: "error", message: "Authentication required.", code: "AUTH_REQUIRED" });
         ws.close(4001, "Authentication required");
         return;
       }
-      const decoded = jwt.verify(token, config.jwtSecret) as {
-        id: number;
-        email: string;
-        accountType?: string;
-      };
+      const decoded = verifyAccessToken(token);
       // Organization tokens carry an Organizations.id in `id`, a different
       // number space from users.id. Accepting one here would let an org
       // credential run (and bill) sessions as whichever user shares its id.
@@ -645,6 +671,9 @@ export function initRestSocket(wss: WebSocketServer) {
         return;
       }
       authenticatedUserId = decoded.id;
+      authenticatedAuthVersion = Number.isInteger(decoded.authVersion)
+        ? Number(decoded.authVersion)
+        : 0;
 
       // Concurrency cap
       const existing = activeWsByUser.get(authenticatedUserId);
@@ -733,6 +762,12 @@ export function initRestSocket(wss: WebSocketServer) {
     // market rather than silently reverting to US English. Applied at the single
     // place the recognizer is constructed.
     let sessionSttLocale: string = config.sttDefaultLocale;
+    // True when the founder picked a locale in Settings. Otherwise the locale is
+    // inferred (business region, then browser) just before the recognizer starts.
+    let hasChosenSttLocale = false;
+    // This founder's own vocabulary for the recognizer: business name, industry,
+    // description terms, then deck terms once the deck resolves.
+    const sessionPhrases: string[] = [];
 
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
@@ -992,6 +1027,7 @@ export function initRestSocket(wss: WebSocketServer) {
               userInput,
               applyConversationWindow(conversationHistory),
               masterPrompt,
+              entitlement.ai.coachModel,
             )
           )
             .replace(/@@INTEREST[^\n]*/gi, "")
@@ -1177,6 +1213,7 @@ export function initRestSocket(wss: WebSocketServer) {
                   applyConversationWindow(conversationHistory),
                   promptToUse,
                   turnAbort.signal,
+                  entitlement.ai.coachModel,
                 );
 
         for await (const token of stream) {
@@ -1360,7 +1397,7 @@ export function initRestSocket(wss: WebSocketServer) {
         // (slow/failed), so the tip layer can't break.
         if (!turn.isGreeting && !turn.isNudge && !turn.isCanned && fullSpokenText.trim()) {
           const tipQuestion = fullSpokenText;
-          generateAnswerTip(tipQuestion, currentBusinessName)
+          generateAnswerTip(tipQuestion, currentBusinessName, entitlement.ai.tipModel)
             .then((tip) => {
               if (tip) sendJson(ws, { type: "answer_tip", ...tip });
             })
@@ -1765,7 +1802,7 @@ export function initRestSocket(wss: WebSocketServer) {
           if (currentUserId) {
             const { data: dbUser, error: userErr } = await supabase
               .from("users")
-              .select("id, isEmailVerified, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, settings")
+              .select("id, isEmailVerified, auth_version, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, settings")
               .eq("id", currentUserId)
               .maybeSingle();
 
@@ -1795,6 +1832,16 @@ export function initRestSocket(wss: WebSocketServer) {
               return;
             }
 
+            if (((dbUser as any).auth_version ?? 0) !== authenticatedAuthVersion) {
+              sendJson(ws, {
+                type: "error",
+                message: "This session was revoked. Please log in again.",
+                code: "AUTH_REVOKED",
+              });
+              ws.close(4001, "Session revoked");
+              return;
+            }
+
             entitlement = entitlementsForPlan(
               (dbUser as any).plan,
               (dbUser as any).plan_expires_at,
@@ -1811,6 +1858,10 @@ export function initRestSocket(wss: WebSocketServer) {
             sessionSttLocale = resolveSttLocale(
               (dbUser as any).settings?.sttLocale,
               config.sttDefaultLocale,
+            );
+            hasChosenSttLocale = isSupportedSttLocale((dbUser as any).settings?.sttLocale);
+            console.log(
+              `🧠 Session AI: coach ${entitlement.ai.coachModel}, tips ${entitlement.ai.tipModel}, judge ${JUDGE_MODEL} (plan ${entitlement.plan}).`,
             );
           }
 
@@ -1991,6 +2042,12 @@ export function initRestSocket(wss: WebSocketServer) {
             }
           }
 
+          // Started now, awaited just before the recognizer is built, so the
+          // lookup overlaps the setup work below instead of adding latency.
+          const businessRegionLookup: Promise<string | null> = hasChosenSttLocale
+            ? Promise.resolve(null)
+            : lookupBusinessRegion(currentUserId, practiceBusinessId);
+
           // Compact setup snapshot stored with the session row so a future
           // "Pitch Again" can prefill the setup form. Deliberately excludes
           // deck text — only ids/names, keeping the row small.
@@ -2142,9 +2199,25 @@ export function initRestSocket(wss: WebSocketServer) {
             rebuildMasterPrompt();
           };
 
+          // The founder's own words first, so deck terms can never crowd out
+          // the business name under the phrase cap.
+          mergeSessionPhrases(
+            sessionPhrases,
+            buildSessionPhrases({
+              businessName: currentBusinessName,
+              industry: clientConfig.industry,
+              description: clientConfig.description,
+            }),
+          );
+
           resolveDeckText(clientConfig, currentUserId)
             .then((text) => {
               resolvedDeckText = text;
+              // Names from the deck (company, product, partners, places). If
+              // the recognizer is already running it takes them incrementally;
+              // otherwise they are included when it is built.
+              const deckTerms = mergeSessionPhrases(sessionPhrases, extractTermsFromText(text));
+              if (deckTerms.length > 0) sttRecognizer?.addPhrases(deckTerms);
               if (resolvedDeckText) {
                 structuredDeck = parseDeckIntoSlides(
                   resolvedDeckText,
@@ -2193,6 +2266,17 @@ export function initRestSocket(wss: WebSocketServer) {
           }
 
           if (hasAzureSttConfig()) {
+            if (!hasChosenSttLocale) {
+              const inferred = inferSttLocale({
+                region: await businessRegionLookup,
+                browserLanguages: clientConfig.browserLanguages,
+                fallback: config.sttDefaultLocale,
+              });
+              sessionSttLocale = inferred.locale;
+              if (inferred.source !== "default") {
+                console.log(`[stt] ${inferred.locale} inferred from ${inferred.source.replace("_", " ")}.`);
+              }
+            }
             sttRecognizer = createStreamingRecognizer(
               (text, confidence) => {
                 if (sessionEnded) return;
@@ -2294,9 +2378,9 @@ export function initRestSocket(wss: WebSocketServer) {
                   sendJson(ws, { type: "stop_audio" });
                 }
               },
-              // The founder's recognition language, resolved from the same user
-              // row the paywall already read — no extra query.
+              // The founder's chosen recognition language, or the inferred one.
               sessionSttLocale,
+              sessionPhrases,
             );
           } else {
             console.warn(
@@ -2314,12 +2398,6 @@ export function initRestSocket(wss: WebSocketServer) {
           // On resume (reconnect after refresh) the client reports how much
           // time was actually left — otherwise the server clock would restart
           // at the full duration and time_sync would extend the session.
-          if (isResume && Number.isFinite(Number(data.timeLeftSeconds))) {
-            initialDurationSeconds = Math.min(
-              initialDurationSeconds,
-              Math.max(0, Math.floor(Number(data.timeLeftSeconds))),
-            );
-          }
           if (resumeGrant) {
             // Never past the original admission's deadline, whatever the
             // client claims about time left.
@@ -2331,6 +2409,7 @@ export function initRestSocket(wss: WebSocketServer) {
             issueResumeGrant(currentUserId, initialDurationSeconds, ws, Date.now(), {
               businessId: practiceBusinessId,
               practiceQuestion: practiceQuestionText,
+              transcript: fullTranscript,
             });
           }
           hasNudged = false;
@@ -2552,7 +2631,9 @@ export function initRestSocket(wss: WebSocketServer) {
           floorHeldByPanel = false;
           floorReSignaled = false;
 
-          const panelists = data.panelists || [
+          // Panel identity is server-owned prompt state. Arbitrary client roles
+          // would otherwise become instructions inside the verdict prompt.
+          const panelists = [
             { name: "Marcus", role: "Lead Investor" },
             { name: "Sarah", role: "Financial Analyst" },
             { name: "Chen", role: "Technical Partner" },
@@ -2637,16 +2718,16 @@ export function initRestSocket(wss: WebSocketServer) {
           // their pitch, so it runs in parallel with the verdict phase. By the
           // time the panel finishes speaking, the report is usually ready.
           if (!evaluationPromise && !sessionEnded) {
-            const t = sanitizeTranscriptForModel(
-              Array.isArray(data.transcript) ? data.transcript : fullTranscript,
-            );
+            const t = sanitizeTranscriptForModel(fullTranscript);
             // Duration-aware gate: skip the LLM pre-start when the session was
             // too short to score, so we don't spend tokens (or fabricate a
             // report) for an insufficient pitch. Uses the server's own elapsed
             // clock since the client's `duration` arrives later with end_session.
-            const elapsedSec = Math.floor(
-              (Date.now() - sessionStartTimestamp) / 1000,
+            const elapsedSec = Math.min(
+              initialDurationSeconds,
+              Math.max(0, Math.floor((Date.now() - sessionStartTimestamp) / 1000)),
             );
+            evaluationElapsedSeconds = elapsedSec;
             if (!isInsufficientPitch(t, elapsedSec)) {
               console.log(
                 "🧠 Pre-starting evaluation in background (parallel with verdicts)...",
@@ -2682,16 +2763,16 @@ export function initRestSocket(wss: WebSocketServer) {
             idleCheckInterval = null;
           }
           console.log("🏁 Session ended, starting evaluation...");
-          const frontendTranscript = sanitizeTranscriptForModel(
-            Array.isArray(data.transcript) ? data.transcript : fullTranscript,
-          );
+          const frontendTranscript = sanitizeTranscriptForModel(fullTranscript);
           // Elapsed pitch time drives the insufficiency gate. Prefer the client's
           // measured duration; fall back to the server's own clock so a missing
           // client value can never misclassify a real, long pitch as too short.
           const serverElapsedSec = Math.floor(
             (Date.now() - sessionStartTimestamp) / 1000,
           );
-          const durationSec = Number(data.duration) || serverElapsedSec;
+          const durationSec =
+            evaluationElapsedSeconds ??
+            Math.min(initialDurationSeconds, Math.max(0, serverElapsedSec));
 
           let reportData: any = {
             summary:

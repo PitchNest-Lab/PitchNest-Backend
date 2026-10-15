@@ -71,7 +71,8 @@ export function injectPublicBusinessMetadata(
     ? (business.tagline || business.description || `Explore ${business.name} on PitchNest.`).slice(0, 220)
     : "This PitchNest business profile is not publicly available.";
   const robots = business ? "index, follow" : "noindex, follow";
-  const image = `${origin}/og-image.png`;
+  // The business's own approved cover (best for wide previews), then its logo.
+  const image = business?.coverUrl || business?.logoUrl || `${origin}/og-image.png`;
 
   let html = template.replace(/<title>[\s\S]*?<\/title>/i, `<title>${escapeHtml(title)}</title>`);
   html = replaceMeta(html, "description", description);
@@ -81,7 +82,7 @@ export function injectPublicBusinessMetadata(
   html = replaceMeta(html, "og:description", description, true);
   html = replaceMeta(html, "og:url", canonical, true);
   html = replaceMeta(html, "og:image", image, true);
-  html = replaceMeta(html, "twitter:card", "summary_large_image");
+  html = replaceMeta(html, "twitter:card", business?.coverUrl || !business?.logoUrl ? "summary_large_image" : "summary");
   html = replaceMeta(html, "twitter:title", title);
   html = replaceMeta(html, "twitter:description", description);
   html = replaceMeta(html, "twitter:image", image);

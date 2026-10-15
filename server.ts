@@ -19,6 +19,10 @@ const wss = new WebSocketServer({
   // 100 MiB default from becoming a one-message heap exhaustion primitive.
   maxPayload: 1024 * 1024,
   perMessageDeflate: false,
+  // Keep the JWT out of the URL: the browser offers it as another protocol,
+  // while the server echoes only this fixed application protocol.
+  handleProtocols: (protocols) =>
+    protocols.has("pitchnest-v1") ? "pitchnest-v1" : false,
   verifyClient: ({ origin }, done) => {
     // Native/mobile and server clients may omit Origin. Browser clients always
     // send it and must match the same explicit allowlist as HTTP CORS.

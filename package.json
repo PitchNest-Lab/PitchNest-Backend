@@ -9,7 +9,7 @@
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch",
+    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch && npm run test:ai-models && npm run test:speech && npm run test:business-media && npm run test:founders",
     "test:core": "tsx src/tests/run_tests.ts",
     "test:organization-security": "tsx src/tests/organization_security_test.ts",
     "test:business-security": "tsx src/tests/business_security_test.ts",
@@ -21,7 +21,11 @@
     "test:community": "tsx src/tests/community_test.ts",
     "test:opportunities": "tsx src/tests/opportunities_test.ts",
     "test:analytics": "tsx src/tests/analytics_test.ts",
-    "test:pitch": "tsx src/tests/pitch_test.ts"
+    "test:pitch": "tsx src/tests/pitch_test.ts",
+    "test:ai-models": "tsx src/tests/ai_models_test.ts",
+    "test:speech": "tsx src/tests/speech_context_test.ts",
+    "test:business-media": "tsx src/tests/business_media_test.ts",
+    "test:founders": "tsx src/tests/founder_test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
@@ -40,6 +44,7 @@
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.19.1",
     "resend": "^6.16.0",
+    "sharp": "^0.35.5",
     "tsx": "^4.21.0",
     "ws": "^8.22.0"
   },

@@ -15,6 +15,23 @@ function normalizeSupabaseProjectUrl(value: string): string {
     .replace(/\/+$/, "");
 }
 
+function positiveMoneyEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 && value <= 1_000_000
+    ? Math.round(value * 100) / 100
+    : fallback;
+}
+
+function positiveDaysEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 && value <= 3_650 ? value : fallback;
+}
+
+function currencyEnv(name: string, fallback: string): string {
+  const value = String(process.env[name] || "").trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(value) ? value : fallback;
+}
+
 export const config = {
   supabaseUrl: normalizeSupabaseProjectUrl(process.env.SUPABASE_URL || ""),
   supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
@@ -66,6 +83,12 @@ export const config = {
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
   avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || "pitchnest-avatars",
+  // Approved business logos and covers (business-media/<id>/...). Defaults to
+  // the public avatar bucket; drafts never go here, only published images.
+  publicMediaBucket:
+    process.env.SUPABASE_PUBLIC_MEDIA_BUCKET ||
+    process.env.SUPABASE_AVATAR_BUCKET ||
+    "pitchnest-avatars",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
     .split(",")
     .map((o) => o.trim())
@@ -92,10 +115,10 @@ export const config = {
   flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
   // Price is config, not code, so a currency or amount change is a deploy env
   // change. Amount is MAJOR units (15 = $15.00 USD).
-  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 15.00,
-  proPlanCurrency: process.env.PRO_PLAN_CURRENCY || "USD",
+  proPlanAmount: positiveMoneyEnv("PRO_PLAN_AMOUNT", 15),
+  proPlanCurrency: currencyEnv("PRO_PLAN_CURRENCY", "USD"),
   /** Days of Pro granted per successful payment. */
-  proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
+  proPlanDays: positiveDaysEnv("PRO_PLAN_DAYS", 30),
   /** Where Flutterwave returns the user after checkout. */
   appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
   // ── Ecosystem feature flags ──────────────────────────────────────────────
@@ -138,14 +161,10 @@ export interface ResolvedPrice {
 }
 
 function envAmount(name: string, fallback: number): number {
-  const raw = process.env[name];
-  const n = raw ? Number(raw) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  return positiveMoneyEnv(name, fallback);
 }
 
-const ANNUAL_DAYS = process.env.PRO_ANNUAL_DAYS
-  ? Number(process.env.PRO_ANNUAL_DAYS)
-  : 365;
+const ANNUAL_DAYS = positiveDaysEnv("PRO_ANNUAL_DAYS", 365);
 
 // Amounts per (plan, term). Founder (Prep) = $9.99/mo, Pro Founder = $15.00/mo
 // (matches the published pricing deck). Annual defaults to 10x the monthly

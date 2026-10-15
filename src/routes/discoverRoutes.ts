@@ -8,6 +8,7 @@ import {
   requireDiscoverEngagement,
   setBusinessEngagement,
 } from "../controllers/discoverEngagementController.ts";
+import { setFounderFollowState } from "../controllers/founderController.ts";
 
 /**
  * Authenticated Discover engagement. Mounted at /api/discover.
@@ -53,6 +54,9 @@ router.put("/businesses/:slug/support", engagementLimiter, setBusinessEngagement
 router.delete("/businesses/:slug/support", engagementLimiter, setBusinessEngagement("support", false));
 router.put("/businesses/:slug/follow", engagementLimiter, setBusinessEngagement("follow", true));
 router.delete("/businesses/:slug/follow", engagementLimiter, setBusinessEngagement("follow", false));
+
+router.put("/founders/:handle/follow", engagementLimiter, setFounderFollowState(true));
+router.delete("/founders/:handle/follow", engagementLimiter, setFounderFollowState(false));
 
 router.post("/businesses/:slug/comments", commentLimiter, createBusinessComment);
 router.delete("/comments/:commentId", engagementLimiter, removeBusinessComment);

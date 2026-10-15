@@ -76,8 +76,11 @@ assert.deepEqual(Object.keys(summary), [
   "industry",
   "stage",
   "region",
+  "logoUrl",
+  "coverUrl",
   "publishedAt",
 ]);
+assert.equal(summary.logoUrl, null, "no approved logo, no URL");
 assert.equal("id" in summary, false);
 assert.equal("transcript" in summary, false);
 

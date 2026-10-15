@@ -21,6 +21,18 @@ import { supabase } from "../config/supabase.ts";
  */
 
 const FLW_API = "https://api.flutterwave.com/v3";
+const PROVIDER_TIMEOUT_MS = 15_000;
+
+async function providerFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface CheckoutSession {
   txRef: string;
@@ -107,7 +119,7 @@ export async function createCheckout(
 
   let res: Response;
   try {
-    res = await fetch(`${FLW_API}/payments`, {
+    res = await providerFetch(`${FLW_API}/payments`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.flutterwaveSecretKey}`,
@@ -148,7 +160,17 @@ export async function createCheckout(
     throw new CheckoutError("CHECKOUT_INIT_FAILED", providerMsg);
   }
 
-  return { txRef, paymentLink: body.data.link };
+  let paymentUrl: URL;
+  try {
+    paymentUrl = new URL(String(body.data.link));
+  } catch {
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an invalid payment link");
+  }
+  if (paymentUrl.protocol !== "https:" || paymentUrl.toString().length > 2_048) {
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an unsafe payment link");
+  }
+
+  return { txRef, paymentLink: paymentUrl.toString() };
 }
 
 export interface VerifiedTransaction {
@@ -178,13 +200,13 @@ export async function verifyTransaction(
   try {
     const isNumericId =
       typeof transactionIdOrRef === "number" ||
-      (/^\d+$/.test(String(transactionIdOrRef)) && Number(transactionIdOrRef) < 2000000000);
+      /^\d+$/.test(String(transactionIdOrRef));
 
     const url = isNumericId
       ? `${FLW_API}/transactions/${transactionIdOrRef}/verify`
       : `${FLW_API}/transactions/verify_by_reference?tx_ref=${encodeURIComponent(String(transactionIdOrRef))}`;
 
-    const res = await fetch(url, {
+    const res = await providerFetch(url, {
       headers: { Authorization: `Bearer ${config.flutterwaveSecretKey}` },
     });
     const body: any = await res.json().catch(() => null);
@@ -196,12 +218,26 @@ export async function verifyTransaction(
     const data = Array.isArray(body.data) ? body.data[0] : body.data;
     if (!data) return null;
 
+    const txRef = typeof data.tx_ref === "string" ? data.tx_ref.trim() : "";
+    const amount = Number(data.amount);
+    const currency = String(data.currency || "").trim().toUpperCase();
+    const providerRef = String(data.id ?? "").trim();
+    if (
+      !/^pn-\d+-\d{10,16}-[a-f0-9]{16}$/.test(txRef) ||
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      !/^[A-Z]{3}$/.test(currency) ||
+      !providerRef
+    ) {
+      console.error("Flutterwave verification returned an invalid transaction shape.");
+      return null;
+    }
     return {
       status: String(data.status || "").toLowerCase(),
-      txRef: data.tx_ref,
-      amount: Number(data.amount),
-      currency: String(data.currency || ""),
-      providerRef: String(data.id),
+      txRef,
+      amount,
+      currency,
+      providerRef,
     };
   } catch (err: any) {
     console.error("❌ verifyTransaction threw:", err?.message || err);
@@ -262,15 +298,12 @@ export async function grantAccess(tx: VerifiedTransaction): Promise<boolean> {
   return data === true;
 }
 
-/** Marks a checkout attempt failed. Best-effort — never throws. */
+/** Marks a checkout attempt failed so webhook acknowledgement is durable. */
 export async function markPaymentFailed(txRef: string): Promise<void> {
-  try {
-    await supabase
-      .from("payments")
-      .update({ status: "failed", completed_at: new Date().toISOString() })
-      .eq("tx_ref", txRef)
-      .eq("status", "pending");
-  } catch (err: any) {
-    console.warn("⚠️ markPaymentFailed:", err?.message || err);
-  }
+  const { error } = await supabase
+    .from("payments")
+    .update({ status: "failed", completed_at: new Date().toISOString() })
+    .eq("tx_ref", txRef)
+    .eq("status", "pending");
+  if (error) throw error;
 }

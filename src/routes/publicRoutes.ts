@@ -15,6 +15,7 @@ import {
 import { optionalUserAuth } from "../middleware/authMiddleware.ts";
 import { listPublicBusinessUpdates } from "../controllers/businessActivityController.ts";
 import { listPublicOpportunities } from "../controllers/opportunityController.ts";
+import { getPublicFounder } from "../controllers/founderController.ts";
 import { recordClientEvent } from "../services/eventService.ts";
 import {
   getPublicPitch as getPublicBusinessPitch,
@@ -99,6 +100,9 @@ router.get(
   optionalUserAuth,
   getBusinessEngagement,
 );
+// Founder pages (migration 0029): only founders who chose to appear on a
+// published business; everyone else is a 404.
+router.get("/founders/:handle", discoverReadLimiter, optionalUserAuth, getPublicFounder);
 // Pitch Arena (migration 0026): published pitches of published businesses only.
 router.get("/pitches", discoverReadLimiter, requirePitchArena, listPublicPitches);
 router.get("/businesses/:slug/pitch", discoverReadLimiter, requirePitchArena, getPublicBusinessPitch);

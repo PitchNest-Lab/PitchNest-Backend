@@ -11,6 +11,18 @@ import { storagePathFromUrl } from "../utils/storagePath.ts";
 import { uploadDir } from "../services/storageService.ts";
 import fs from "fs";
 import path from "path";
+import {
+  hashAuthToken,
+  isEmailCode,
+  isLongAuthToken,
+  safeEqualText,
+} from "../utils/authTokens.ts";
+import { revokeUserSockets } from "../sockets/restSocket.ts";
+import {
+  ACCESS_TOKEN_AUDIENCE,
+  ACCESS_TOKEN_ISSUER,
+  ACCESS_TOKEN_KIND,
+} from "../utils/accessToken.ts";
 
 const resend =
   config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
@@ -19,7 +31,32 @@ const resend =
 
 const BCRYPT_ROUNDS = 12;
 const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$.{53}$/;
+const DUMMY_PASSWORD_HASH = "$2b$12$kFlQPn/NVygvSVn3YgGLfOEaKPwEO0Ls5BRjKBpQIZqO7aCSazdia";
+const PASSWORD_MIN_LENGTH = 10;
+const PASSWORD_MAX_LENGTH = 72;
 const googleClient = new OAuth2Client(config.googleClientId);
+
+async function verifyGoogleCredential(credential: unknown): Promise<any | null> {
+  if (
+    !config.googleClientId ||
+    typeof credential !== "string" ||
+    !credential ||
+    credential.length > 16_384
+  ) {
+    return null;
+  }
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: config.googleClientId,
+    });
+    const payload = ticket.getPayload();
+    if (!payload?.email || payload.email_verified === false) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
 
 // The only roles a user record may hold. Kept in one place so signup, the PATCH
 // endpoint, and any future caller validate against the same source of truth.
@@ -39,11 +76,6 @@ const ALLOWED_SECTORS = [
 // An account belongs to the method that created it (users.auth_provider:
 // 'form' | 'google'). Rows created before the column exists hold NULL — the
 // first successful sign-in after this change records and locks their method.
-const GOOGLE_ONLY_ERROR =
-  "This email is registered with Google Sign-In. Please continue with Google instead.";
-const FORM_ONLY_ERROR =
-  "This email was registered with a password. Please log in with your email and password instead.";
-
 /** Best-effort: lock a legacy (NULL-provider) row to the method just used. */
 function lockAuthProvider(userId: number, provider: "form" | "google") {
   supabase
@@ -91,6 +123,7 @@ export function toPublicUser(u: any) {
     onboardingCompleted: u?.onboardingCompleted === true,
     orgCode: u?.orgCode ?? null,
     accountType: "user" as const,
+    authProvider: u?.auth_provider === "google" ? "google" : "form",
     plan: effectivePlan,
     planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
     isTrial: trial.active,
@@ -158,6 +191,10 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
       ...(typeof s.notifications.communityReplies === "boolean"
         ? { communityReplies: s.notifications.communityReplies }
         : {}),
+      // Founder follows (migration 0029).
+      ...(typeof s.notifications.followedFounders === "boolean"
+        ? { followedFounders: s.notifications.followedFounders }
+        : {}),
     };
   }
   if (s.aiToughness !== undefined) {
@@ -188,6 +225,11 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
   // stored preference can only ever be something we can actually honour.
   if (isSupportedSttLocale(s.sttLocale)) {
     out.sttLocale = s.sttLocale;
+  } else if (s.sttLocale === "auto") {
+    // Back to automatic: the session infers the locale (inferSttLocale). Saved
+    // as null because settings are merged, so omitting the key would keep the
+    // old choice.
+    out.sttLocale = null;
   }
   return out;
 }
@@ -203,19 +245,26 @@ function signToken(
     email: string;
     accountType?: "user" | "organization";
     orgCode?: string;
+    authVersion?: number;
   },
   rememberMe = false,
 ): string {
   return jwt.sign(
     {
+      kind: ACCESS_TOKEN_KIND,
       id: user.id,
-      email: user.email,
       rememberMe,
       accountType: user.accountType ?? "user",
+      authVersion: user.authVersion ?? 0,
       ...(user.orgCode ? { orgCode: user.orgCode } : {}),
     },
     config.jwtSecret,
-    { expiresIn: rememberMe ? "30d" : "24h" },
+    {
+      algorithm: "HS256",
+      audience: ACCESS_TOKEN_AUDIENCE,
+      issuer: ACCESS_TOKEN_ISSUER,
+      expiresIn: rememberMe ? "30d" : "24h",
+    },
   );
 }
 
@@ -232,38 +281,72 @@ export const refreshToken = (req: Request, res: Response) => {
         email: user.email,
         accountType: user.accountType,
         orgCode: user.orgCode,
+        authVersion: user.authVersion,
       },
       user.rememberMe === true,
     ),
   });
 };
 
+/** Invalidates every bearer token and live pitch connection for this user. */
+export const logout = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const isOrganization = req.user!.accountType === "organization";
+    const { error } = await supabase.rpc(
+      isOrganization ? "revoke_organization_sessions" : "revoke_user_sessions",
+      isOrganization ? { p_org_id: userId } : { p_user_id: userId },
+    );
+    if (error) throw error;
+    if (!isOrganization) revokeUserSockets(userId, "Logged out");
+    return res.status(204).send();
+  } catch (error) {
+    console.error("Logout failed:", error);
+    return res.status(500).json({ error: "Could not log out securely. Please retry." });
+  }
+};
+
 export const signup = async (req: Request, res: Response) => {
   try {
+    const genericSignup = {
+      requiresVerification: true,
+      message: "If this address can be registered, check your email for the verification link.",
+    };
     const { name, email, password, role, referralCode } = req.body;
-    if (!name || !email || !password) {
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !name.trim() ||
+      !email.trim()
+    ) {
       return res
         .status(400)
         .json({ error: "Name, email, and password are required." });
     }
 
-    if (name.trim().length < 2) {
+    if (name.trim().length < 2 || name.trim().length > 120) {
       return res
         .status(400)
-        .json({ error: "Name must be at least 2 characters." });
+        .json({ error: "Name must be 2-120 characters." });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    if (email.length > 254 || !emailRegex.test(email)) {
       return res
         .status(400)
         .json({ error: "Please enter a valid email address." });
     }
 
-    if (password.length < 6) {
+    if (
+      typeof password !== "string" ||
+      password.length < PASSWORD_MIN_LENGTH ||
+      password.length > PASSWORD_MAX_LENGTH ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
       return res
         .status(400)
-        .json({ error: "Password must be at least 6 characters." });
+        .json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
     }
     if (role !== undefined && !isValidRole(role)) {
       return res.status(400).json({ error: "Please select a valid role." });
@@ -290,20 +373,12 @@ export const signup = async (req: Request, res: Response) => {
             err,
           );
         });
-        return res.status(200).json({
-          requiresVerification: true,
-          email: cleanEmail,
-          message: "This email is registered but not verified yet. A new verification code has been sent to your email.",
-        });
+        return res.status(200).json(genericSignup);
       }
 
       // If the account is already verified, provide honest and actionable feedback:
       // do not redirect them to /verify waiting for a phantom email that was never sent.
-      return res.status(409).json({
-        error: "An account with this email already exists. Please log in.",
-        code: "ACCOUNT_EXISTS",
-        isEmailVerified: true,
-      });
+      return res.status(200).json(genericSignup);
     }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -371,11 +446,7 @@ export const signup = async (req: Request, res: Response) => {
     // 200 (not 201) to match the existing-account branch above: a different
     // status would let an attacker distinguish a new email from a registered
     // one, defeating the identical-body anti-enumeration measure.
-    res.status(200).json({
-      requiresVerification: true,
-      email: cleanEmail,
-      message: "Check your email to verify your account.",
-    });
+    res.status(200).json(genericSignup);
   } catch (error) {
     console.error("Signup error:", error);
     res.status(500).json({ error: "Signup failed" });
@@ -383,12 +454,18 @@ export const signup = async (req: Request, res: Response) => {
 };
 
 const MAX_FAILED_LOGINS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
 export const login = async (req: Request, res: Response) => {
   try {
     const { email, password, rememberMe } = req.body;
-    if (!email || !password) {
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password ||
+      email.length > 254 ||
+      password.length > PASSWORD_MAX_LENGTH
+    ) {
       return res
         .status(400)
         .json({ error: "Email and password are required." });
@@ -402,6 +479,7 @@ export const login = async (req: Request, res: Response) => {
       .maybeSingle();
 
     if (error || !user) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
@@ -418,33 +496,26 @@ export const login = async (req: Request, res: Response) => {
 
     // Method lock: Google-created accounts can't sign in with a password.
     if (user.auth_provider === "google") {
-      return res.status(401).json({ error: GOOGLE_ONLY_ERROR });
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(401).json({ error: "Invalid credentials." });
     }
 
     // Compare hashed password
-    const isValidPassword = await bcrypt.compare(password, user.password);
+    const isValidPassword =
+      typeof user.password === "string" && BCRYPT_HASH_PATTERN.test(user.password)
+        ? await bcrypt.compare(password, user.password)
+        : await bcrypt.compare(password, DUMMY_PASSWORD_HASH).then(() => false);
     if (!isValidPassword) {
-      // Increment failed attempts; lock after MAX_FAILED_LOGINS.
-      const attempts = (user.failed_login_attempts || 0) + 1;
-      const lockUpdate: Record<string, unknown> = {
-        failed_login_attempts: attempts,
-      };
-      if (attempts >= MAX_FAILED_LOGINS) {
-        lockUpdate.locked_until = new Date(
-          Date.now() + LOCKOUT_DURATION_MS,
-        ).toISOString();
+      const { data: failedState, error: failedError } = await supabase.rpc(
+        "record_failed_login",
+        { p_user_id: user.id },
+      );
+      if (failedError) {
+        console.error("Failed-login counter could not be updated:", failedError.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
       }
-      // Best-effort update — don't block the response on this.
-      supabase
-        .from("users")
-        .update(lockUpdate)
-        .eq("id", user.id)
-        .then(({ error: lockErr }) => {
-          if (lockErr)
-            console.warn("lockout update failed (non-fatal):", lockErr.message);
-        });
-
-      if (attempts >= MAX_FAILED_LOGINS) {
+      const state = Array.isArray(failedState) ? failedState[0] : failedState;
+      if ((state?.failed_attempts ?? 0) >= MAX_FAILED_LOGINS || state?.lock_expires_at) {
         return res.status(429).json({
           error: "Too many failed attempts. Account locked for 15 minutes.",
         });
@@ -458,21 +529,21 @@ export const login = async (req: Request, res: Response) => {
 
     // ── Successful login — reset lockout counters ───────────────────────────
     if (user.failed_login_attempts > 0 || user.locked_until) {
-      supabase
+      const { error: resetErr } = await supabase
         .from("users")
         .update({ failed_login_attempts: 0, locked_until: null })
-        .eq("id", user.id)
-        .then(({ error: resetErr }) => {
-          if (resetErr)
-            console.warn("lockout reset failed (non-fatal):", resetErr.message);
-        });
+        .eq("id", user.id);
+      if (resetErr) {
+        console.error("Lockout reset failed:", resetErr.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
     }
 
     // First successful password login on a legacy row locks it to 'form'.
     if (!user.auth_provider) lockAuthProvider(user.id, "form");
 
     const token = signToken(
-      { id: user.id, email: user.email },
+      { id: user.id, email: user.email, authVersion: user.auth_version ?? 0 },
       rememberMe === true,
     );
 
@@ -489,7 +560,14 @@ export const login = async (req: Request, res: Response) => {
 export const orgLogin = async (req: Request, res: Response) => {
   try {
     const { email, password, rememberMe } = req.body;
-    if (!email || !password) {
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password ||
+      email.length > 254 ||
+      password.length > PASSWORD_MAX_LENGTH
+    ) {
       return res
         .status(400)
         .json({ error: "Email and password are required." });
@@ -502,19 +580,48 @@ export const orgLogin = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
     if (error || !user) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      return res.status(429).json({ error: "Too many failed attempts. Try again later." });
     }
 
     if (
       typeof user.password !== "string" ||
       !BCRYPT_HASH_PATTERN.test(user.password)
     ) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
     const isValidPassword = await bcrypt.compare(password, user.password);
     if (!isValidPassword) {
+      const { data: failedState, error: failedError } = await supabase.rpc(
+        "record_failed_org_login",
+        { p_org_id: user.id },
+      );
+      if (failedError) {
+        console.error("Organization lockout update failed:", failedError.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
+      const state = Array.isArray(failedState) ? failedState[0] : failedState;
+      if ((state?.failed_attempts ?? 0) >= MAX_FAILED_LOGINS || state?.lock_expires_at) {
+        return res.status(429).json({ error: "Too many failed attempts. Try again later." });
+      }
       return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    if (user.failed_login_attempts > 0 || user.locked_until) {
+      const { error: resetErr } = await supabase
+        .from("Organizations")
+        .update({ failed_login_attempts: 0, locked_until: null })
+        .eq("id", user.id);
+      if (resetErr) {
+        console.error("Organization lockout reset failed:", resetErr.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
     }
 
     if (user.org_code == null) {
@@ -528,6 +635,7 @@ export const orgLogin = async (req: Request, res: Response) => {
         email: user.email,
         accountType: "organization",
         orgCode: String(user.org_code),
+        authVersion: user.auth_version ?? 0,
       },
       rememberMe === true,
     );
@@ -670,18 +778,12 @@ export const googleAuth = async (req: Request, res: Response) => {
     }
 
     const { credential, rememberMe } = req.body;
-    if (!credential || typeof credential !== "string") {
+    if (!credential || typeof credential !== "string" || credential.length > 16_384) {
       return res.status(400).json({ error: "Missing Google credential." });
     }
 
-    let payload;
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: config.googleClientId,
-      });
-      payload = ticket.getPayload();
-    } catch {
+    const payload = await verifyGoogleCredential(credential);
+    if (!payload) {
       return res.status(401).json({ error: "Invalid Google credential." });
     }
 
@@ -692,8 +794,9 @@ export const googleAuth = async (req: Request, res: Response) => {
     }
 
     const email = payload.email.toLowerCase().trim();
-    const name =
-      payload.name || payload.given_name || email.split("@")[0] || "Founder";
+    const name = String(
+      payload.name || payload.given_name || email.split("@")[0] || "Founder",
+    ).trim().slice(0, 120) || "Founder";
 
     let { data: user } = await supabase
       .from("users")
@@ -757,14 +860,14 @@ export const googleAuth = async (req: Request, res: Response) => {
       user = created;
     } else if (user.auth_provider === "form") {
       // Method lock: this email was registered with a password.
-      return res.status(401).json({ error: FORM_ONLY_ERROR });
+      return res.status(401).json({ error: "Google sign-in could not be completed." });
     } else if (!user.auth_provider) {
       // First Google sign-in on a legacy row locks it to 'google'.
       lockAuthProvider(user.id, "google");
     }
 
     const token = signToken(
-      { id: user.id, email: user.email },
+      { id: user.id, email: user.email, authVersion: user.auth_version ?? 0 },
       rememberMe === true,
     );
     res.status(200).json({
@@ -791,9 +894,14 @@ export const googleAuth = async (req: Request, res: Response) => {
 // );
 
 export const forgotPassword = async (req: Request, res: Response) => {
+  const generic = {
+    message: "If an account with that email exists, a reset link has been sent.",
+  };
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email is required." });
+    if (typeof email !== "string" || !email.trim() || email.length > 254) {
+      return res.status(400).json({ error: "A valid email is required." });
+    }
     const cleanEmail = email.toLowerCase().trim();
 
     const { data: user } = await supabase
@@ -803,48 +911,51 @@ export const forgotPassword = async (req: Request, res: Response) => {
       .maybeSingle();
 
     // Always return 200 with the SAME message to prevent email enumeration.
-    if (!user)
-      return res.status(200).json({
-        message:
-          "If an account with that email exists, a reset link has been sent.",
-      });
+    if (!user) return res.status(200).json(generic);
 
     // Google accounts have no usable password — a reset would set one that
     // still can't log in (method lock). Point the user at Google instead.
     if (user.auth_provider === "google") {
-      return res.status(400).json({ error: GOOGLE_ONLY_ERROR });
+      return res.status(200).json(generic);
     }
 
     // Generate a reset token and store it
     const resetToken = crypto.randomBytes(32).toString("hex");
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    await supabase.from("password_resets").insert([
+    const { error: clearError } = await supabase
+      .from("password_resets")
+      .delete()
+      .eq("user_id", user.id);
+    if (clearError) throw clearError;
+
+    const { error: resetInsertError } = await supabase.from("password_resets").insert([
       {
         user_id: user.id,
-        token: resetToken,
+        token: hashAuthToken("password-reset", resetToken),
         expires_at: expiresAt,
         used: false,
       },
     ]);
-    const baseUrl = (config.allowedOrigin || "http://localhost:5174").replace(
-      /\/+$/,
-      "",
-    );
+    if (resetInsertError) throw resetInsertError;
+    const baseUrl = config.clientUrl;
     const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
 
     if (!resend) {
       console.error(
         "❌ Password reset email not sent: RESEND_API_KEY is missing or still set to re_xxxxxxxxx.",
       );
-      return res.status(500).json({ error: "Failed to send email." });
+      await supabase.from("password_resets").delete().eq("user_id", user.id);
+      return res.status(200).json(generic);
     }
 
-    try {
-      const { data, error } = await resend.emails.send({
+    // The response does not wait on the mail provider. This keeps account
+    // existence from being observable through a several-second timing gap.
+    res.status(200).json(generic);
+    void resend.emails.send({
         from: config.emailFrom,
         replyTo: config.emailReplyTo,
-        to: email,
+        to: user.email,
         subject: "Reset your PitchNest password",
         html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px">
@@ -865,26 +976,20 @@ export const forgotPassword = async (req: Request, res: Response) => {
         </p>
       </div>
     `,
+      })
+      .then(async ({ error }) => {
+        if (!error) return;
+        console.error("❌ Password reset email send failed:", error.message);
+        await supabase.from("password_resets").delete().eq("user_id", user.id);
+      })
+      .catch(async (mailErr: any) => {
+        console.error("❌ Password reset email send failed:", mailErr?.message || mailErr);
+        await supabase.from("password_resets").delete().eq("user_id", user.id);
       });
-
-      if (error) {
-        throw new Error(error.message);
-      }
-    } catch (mailErr: any) {
-      console.error(
-        "❌ Password reset email send failed:",
-        mailErr?.message || mailErr,
-      );
-      return res.status(500).json({ error: "Failed to send email." });
-    }
-
-    res.status(200).json({
-      message:
-        "If an account with that email exists, a reset link has been sent.",
-    });
+    return;
   } catch (error) {
     console.error("Forgot password error:", error);
-    res.status(500).json({ error: "Failed to process request." });
+    res.status(200).json(generic);
   }
 };
 
@@ -892,14 +997,17 @@ export const verifyEmail = async (req: Request, res: Response) => {
   try {
     const { token } = req.query;
 
-    if (!token) return res.status(400).json({ message: "Token required" });
+    if (!isLongAuthToken(token)) {
+      return res.status(400).json({ message: "Invalid or expired link." });
+    }
+    const tokenDigest = hashAuthToken("email-link", token);
 
     // 1. Find token in Supabase
     const { data: record, error } = await supabase
       .from("email_verification_tokens")
       .select("*")
-      .eq("token", token)
-      .single();
+      .in("token", [tokenDigest, token])
+      .maybeSingle();
 
     if (error || !record) {
       // Token may have already been consumed (double-click). Check if the
@@ -919,7 +1027,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
     const { data: existingUser } = await supabase
       .from("users")
       .select(
-        "id, email, name, onboardingCompleted, role, bio, isEmailVerified",
+        "id, email, name, onboardingCompleted, role, bio, isEmailVerified, auth_version",
       )
       .eq("id", record.user_id)
       .single();
@@ -929,37 +1037,34 @@ export const verifyEmail = async (req: Request, res: Response) => {
       await supabase
         .from("email_verification_tokens")
         .delete()
-        .eq("token", token);
-
-      const JwtToken = signToken({
-        id: existingUser.id,
-        email: existingUser.email,
-      });
+        .eq("id", record.id);
       return res.json({
-        user: toPublicUser(existingUser),
-        token: JwtToken,
+        alreadyVerified: true,
         message: "Email already verified",
-        redirectTo: existingUser.onboardingCompleted
-          ? "/dashboard"
-          : "/onboarding",
       });
     }
 
     // 4. Mark user as verified
-    await supabase
+    const { data: consumed, error: consumeError } = await supabase
+      .from("email_verification_tokens")
+      .delete()
+      .eq("id", record.id)
+      .select("id")
+      .maybeSingle();
+    if (consumeError || !consumed) {
+      return res.status(400).json({ message: "Invalid or expired link." });
+    }
+
+    const { error: verifyError } = await supabase
       .from("users")
       .update({ isEmailVerified: true })
       .eq("id", record.user_id);
-
-    // 5. Delete token (one-time use)
-    await supabase
-      .from("email_verification_tokens")
-      .delete()
-      .eq("token", token);
+    if (verifyError) throw verifyError;
 
     const JwtToken = signToken({
       id: existingUser!.id,
       email: existingUser!.email,
+      authVersion: existingUser!.auth_version ?? 0,
     });
 
     res.json({
@@ -1002,10 +1107,13 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     const cleanEmail = String(email).toLowerCase().trim();
     const cleanCode = String(code).trim();
     const GENERIC = "Invalid or expired code.";
+    if (!isEmailCode(cleanCode) || cleanEmail.length > 254) {
+      return res.status(400).json({ message: GENERIC });
+    }
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, email, name, onboardingCompleted, isEmailVerified")
+      .select("id, email, name, onboardingCompleted, isEmailVerified, auth_version")
       .eq("email", cleanEmail)
       .maybeSingle();
 
@@ -1060,29 +1168,46 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     }
 
     // Constant-time compare so timing can't leak the code digit by digit.
-    const stored = Buffer.from(String(record.code));
-    const given = Buffer.from(cleanCode);
-    const match =
-      stored.length === given.length && crypto.timingSafeEqual(stored, given);
+    const stored = String(record.code);
+    const codeDigest = hashAuthToken("email-code", cleanCode);
+    const match = safeEqualText(stored, codeDigest) || safeEqualText(stored, cleanCode);
 
     if (!match) {
-      await supabase
+      const attempts = record.attempts ?? 0;
+      const { data: bumped, error: bumpError } = await supabase
         .from("email_verification_tokens")
-        .update({ attempts: (record.attempts ?? 0) + 1 })
-        .eq("user_id", user.id);
+        .update({ attempts: attempts + 1 })
+        .eq("id", record.id)
+        .eq("attempts", attempts)
+        .select("id")
+        .maybeSingle();
+      if (bumpError) throw bumpError;
+      if (!bumped) {
+        return res.status(429).json({ message: "Too many concurrent attempts. Please retry." });
+      }
       return res.status(400).json({ message: GENERIC });
     }
 
-    await supabase
+    const { data: consumed, error: consumeError } = await supabase
+      .from("email_verification_tokens")
+      .delete()
+      .eq("id", record.id)
+      .select("id")
+      .maybeSingle();
+    if (consumeError || !consumed) {
+      return res.status(400).json({ message: GENERIC });
+    }
+    const { error: verifyError } = await supabase
       .from("users")
       .update({ isEmailVerified: true })
       .eq("id", user.id);
-    await supabase
-      .from("email_verification_tokens")
-      .delete()
-      .eq("user_id", user.id);
+    if (verifyError) throw verifyError;
 
-    const token = signToken({ id: user.id, email: user.email });
+    const token = signToken({
+      id: user.id,
+      email: user.email,
+      authVersion: user.auth_version ?? 0,
+    });
     return res.json({
       user: toPublicUser(user),
       token,
@@ -1096,6 +1221,9 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
 };
 
 export const resendEmailVerification = async (req: Request, res: Response) => {
+  const generic = {
+    message: "If an unverified account exists for that email, a verification link has been sent.",
+  };
   try {
     const { email } = req.body;
     // Normalize exactly as signup does (it stores email.toLowerCase().trim()).
@@ -1113,19 +1241,11 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       .maybeSingle();
 
     // If no user exists, generic success to prevent enumeration
-    if (!user) {
-      return res.json({
-        message:
-          "If an unverified account exists for that email, a verification link has been sent.",
-      });
-    }
+    if (!user) return res.json(generic);
 
     // If the account is already verified, give explicit feedback so the user knows to log in
     if (user.isEmailVerified) {
-      return res.status(400).json({
-        error: "This account is already verified. Please log in.",
-        isEmailVerified: true,
-      });
+      return res.json(generic);
     }
 
     // Don't block the response on email delivery
@@ -1133,10 +1253,10 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       console.error("Failed to resend verification email:", err);
     });
 
-    res.json({ message: "Verification email resent" });
+    res.json(generic);
   } catch (error) {
     console.error("resend Email verification error:", error);
-    res.status(500).json({ error: "Failed to process request." });
+    res.json(generic);
   }
 };
 
@@ -1191,13 +1311,38 @@ async function purgeUserAccount(userId: number): Promise<void> {
     }
   }
 
+  // Recordings are uploaded before the final session row is updated. A tab
+  // closing in that small window leaves a legitimate but unreferenced object;
+  // enumerate the user's scoped prefix so erasure catches those too.
+  for (let offset = 0; offset < 10_000; offset += 100) {
+    const { data: objects, error: listError } = await supabase.storage
+      .from(config.storageBucket)
+      .list(`pitches/${userId}`, { limit: 100, offset });
+    if (listError) throw new Error(`ACCOUNT_DELETE_RECORDING_DISCOVERY_FAILED:${listError.message}`);
+    for (const object of objects ?? []) {
+      if (object.name) mediaPaths.add(`pitches/${userId}/${object.name}`);
+    }
+    if ((objects ?? []).length < 100) break;
+    if (offset === 9_900) throw new Error("ACCOUNT_DELETE_TOO_MANY_RECORDINGS");
+  }
+
+  try {
+    for (const name of await fs.promises.readdir(uploadDir)) {
+      if (name.startsWith(`rec_${userId}_`) && name === path.basename(name)) {
+        localPaths.add(path.join(uploadDir, name));
+      }
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
   // Avatars live in a SEPARATE public bucket — extract with that bucket's marker
   // and remove from THAT bucket, never from the private media bucket.
   const avatarPath = storagePathFromUrl(
     userRow?.avatar_url,
     config.avatarBucket,
   );
-  const avatarPaths = avatarPath ? [avatarPath] : [];
+  const avatarPaths = [...new Set([avatarPath, `avatars/${userId}/profile`].filter(Boolean) as string[])];
 
   if (mediaPaths.size > 0) {
     const { error: storageError } = await supabase.storage
@@ -1286,23 +1431,37 @@ async function purgeUserAccount(userId: number): Promise<void> {
   // so they go with the users row. Everything above does not.
   await purge("users", (q: any) => q.eq("id", userId));
 
-  if (failures.length) {
-    // Surfaced to the caller so the UI cannot claim a clean deletion. The user
-    // row may still exist, which means they can retry.
-    throw new Error(`ACCOUNT_DELETE_PARTIAL:${failures.join(",")}`);
+  const { data: remainingUser, error: verifyDeleteError } = await supabase
+    .from("users")
+    .select("id")
+    .eq("id", userId)
+    .maybeSingle();
+  if (verifyDeleteError || remainingUser) {
+    throw new Error(`ACCOUNT_DELETE_PARTIAL:${failures.join(",") || "users"}`);
   }
 }
 
-async function verifyUserPassword(
+async function verifyAccountDeletion(
   userId: number,
-  password: string,
+  password: unknown,
+  googleCredential: unknown,
 ): Promise<boolean> {
   const { data: user } = await supabase
     .from("users")
-    .select("password")
+    .select("email, password, auth_provider")
     .eq("id", userId)
     .maybeSingle();
-  if (!user?.password) return false;
+  if (!user) return false;
+  if (user.auth_provider === "google") {
+    const payload = await verifyGoogleCredential(googleCredential);
+    return payload?.email?.toLowerCase().trim() === user.email.toLowerCase().trim();
+  }
+  if (
+    typeof password !== "string" ||
+    !password ||
+    password.length > PASSWORD_MAX_LENGTH ||
+    !user.password
+  ) return false;
   return bcrypt.compare(password, user.password);
 }
 
@@ -1310,19 +1469,20 @@ async function verifyUserPassword(
 export const deleteAccount = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { password } = req.body;
-    if (!password) {
+    const { password, googleCredential } = req.body;
+    if (!password && !googleCredential) {
       return res
         .status(400)
-        .json({ error: "Password is required to delete your account." });
+        .json({ error: "Re-authentication is required to delete your account." });
     }
 
-    const valid = await verifyUserPassword(userId, password);
+    const valid = await verifyAccountDeletion(userId, password, googleCredential);
     if (!valid) {
-      return res.status(401).json({ error: "Incorrect password." });
+      return res.status(401).json({ error: "Account confirmation failed." });
     }
 
     await purgeUserAccount(userId);
+    revokeUserSockets(userId, "Account deleted");
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account error:", error);
@@ -1338,17 +1498,17 @@ export const deleteAccountByCredentials = async (
   res: Response,
 ) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password, googleCredential } = req.body;
+    if (typeof email !== "string" || !email.trim() || (!password && !googleCredential)) {
       return res
         .status(400)
-        .json({ error: "Email and password are required." });
+        .json({ error: "Email and account confirmation are required." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, password")
+      .select("id")
       .eq("email", cleanEmail)
       .maybeSingle();
 
@@ -1356,12 +1516,13 @@ export const deleteAccountByCredentials = async (
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await verifyAccountDeletion(user.id, password, googleCredential);
     if (!valid) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     await purgeUserAccount(user.id);
+    revokeUserSockets(user.id, "Account deleted");
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account (public) error:", error);
@@ -1374,19 +1535,23 @@ export const deleteAccountByCredentials = async (
 export const resetPassword = async (req: Request, res: Response) => {
   try {
     const { token, password } = req.body;
-    if (!token || !password)
+    if (!isLongAuthToken(token) || typeof password !== "string")
       return res
         .status(400)
         .json({ error: "Token and new password are required." });
-    if (password.length < 6)
+    if (
+      password.length < PASSWORD_MIN_LENGTH ||
+      password.length > PASSWORD_MAX_LENGTH ||
+      Buffer.byteLength(password, "utf8") > 72
+    )
       return res
         .status(400)
-        .json({ error: "Password must be at least 6 characters." });
+        .json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
 
     const { data: resetRecord } = await supabase
       .from("password_resets")
       .select("*")
-      .eq("token", token)
+      .in("token", [hashAuthToken("password-reset", token), token])
       .eq("used", false)
       .maybeSingle();
 
@@ -1395,16 +1560,30 @@ export const resetPassword = async (req: Request, res: Response) => {
     if (new Date(resetRecord.expires_at) < new Date())
       return res.status(400).json({ error: "Reset token has expired." });
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    await supabase
-      .from("users")
-      .update({ password: hashedPassword })
-      .eq("id", resetRecord.user_id);
-    await supabase
+    const { data: consumed, error: consumeError } = await supabase
       .from("password_resets")
       .update({ used: true })
-      .eq("id", resetRecord.id);
+      .eq("id", resetRecord.id)
+      .eq("used", false)
+      .select("id")
+      .maybeSingle();
+    if (consumeError) throw consumeError;
+    if (!consumed) {
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    }
+
+    const { error: passwordError } = await supabase.rpc("rotate_user_password", {
+      p_user_id: resetRecord.user_id,
+      p_password_hash: hashedPassword,
+    });
+    if (passwordError) throw passwordError;
+    revokeUserSockets(resetRecord.user_id, "Password changed");
+    await supabase
+      .from("password_resets")
+      .delete()
+      .eq("user_id", resetRecord.user_id);
 
     res.status(200).json({ message: "Password updated successfully." });
   } catch (error) {

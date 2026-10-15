@@ -12,7 +12,12 @@ const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const PAGE_SIZE = 20;
 
-export type NotificationType = "business_comment" | "business_update" | "community_reply";
+export type NotificationType =
+  | "business_comment"
+  | "business_update"
+  | "community_reply"
+  | "founder_update"
+  | "founder_business";
 
 export interface NotificationView {
   id: string;
@@ -37,6 +42,29 @@ export function toNotificationView(row: any): NotificationView | null {
       title: `New reply to “${threadTitle.length > 60 ? `${threadTitle.slice(0, 57)}...` : threadTitle}”`,
       excerpt: typeof row?.excerpt === "string" ? row.excerpt : "",
       link: `/community/${encodeURIComponent(threadId)}#replies`,
+      createdAt: Number.isNaN(created.getTime()) ? "" : created.toISOString(),
+      read: Boolean(row?.read_at),
+    };
+  }
+  if (type === "founder_update" || type === "founder_business") {
+    // Only rows whose founder is still public reach here (list_user_notifications).
+    const founder = typeof row?.founder_name === "string" && row.founder_name ? row.founder_name : "A founder you follow";
+    const business = typeof row?.business_name === "string" ? row.business_name : "a business";
+    const slug = typeof row?.business_slug === "string" ? row.business_slug : "";
+    if (!slug) return null;
+    const created = new Date(row?.created_at);
+    return {
+      id: String(row?.notification_id ?? ""),
+      type,
+      title:
+        type === "founder_update"
+          ? `${founder} posted an update on ${business}`
+          : `${founder} is now on ${business}`,
+      excerpt: typeof row?.excerpt === "string" ? row.excerpt : "",
+      link:
+        type === "founder_update"
+          ? `/businesses/${encodeURIComponent(slug)}#updates`
+          : `/businesses/${encodeURIComponent(slug)}`,
       createdAt: Number.isNaN(created.getTime()) ? "" : created.toISOString(),
       read: Boolean(row?.read_at),
     };

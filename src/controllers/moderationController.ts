@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
+import { removePublicMedia } from "../services/businessMediaService.ts";
 
 /**
  * Staff moderation queue for Discover. Mounted behind authMiddleware and
@@ -105,7 +106,32 @@ export async function resolveReport(req: Request, res: Response) {
   if (noteError) return res.status(400).json({ error: noteError });
 
   try {
-    const { error } = await supabase.rpc("staff_resolve_report", {
+    // Public storage URLs remain usable independently of the database row.
+    // Remove a business's public objects before the database hide, and fail
+    // closed if storage is unavailable so moderation cannot report a partial
+    // takedown as successful.
+    if (action === "hide") {
+      const { data: pendingReport, error: reportError } = await supabase
+        .from("content_reports")
+        .select("entity_type, entity_id, status")
+        .eq("id", reportId)
+        .maybeSingle();
+      if (reportError) {
+        console.error("Moderation report preflight failed:", reportError);
+        return res.status(503).json({ error: "Could not verify the report. Please retry." });
+      }
+      if (!pendingReport) return res.status(404).json({ error: "Report not found." });
+      if (pendingReport.status !== "open") {
+        return res.status(409).json({ error: "This report was already resolved." });
+      }
+      if (pendingReport.entity_type === "business" && typeof pendingReport.entity_id === "string") {
+        if (!(await removePublicMedia(pendingReport.entity_id))) {
+          return res.status(503).json({ error: "Could not remove public images. Please retry." });
+        }
+      }
+    }
+
+    const { data, error } = await supabase.rpc("staff_resolve_report", {
       p_report_id: reportId,
       p_actor_id: req.user!.id,
       p_action: action,

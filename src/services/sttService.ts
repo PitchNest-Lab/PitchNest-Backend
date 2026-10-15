@@ -12,6 +12,9 @@ export function hasAzureSttConfig(): boolean {
 
 export interface StreamingRecognizer {
   pushAudio: (pcm16: Buffer) => void;
+  /** Adds session vocabulary after start (e.g. once the deck text resolves).
+   *  Phrases added mid-session may only apply from a later utterance. */
+  addPhrases: (phrases: string[]) => void;
   stop: () => void;
 }
 
@@ -35,6 +38,9 @@ export function createStreamingRecognizer(
   onFinalText: (text: string, confidence: number) => void,
   onPartialText?: (text: string) => void,
   locale?: string,
+  /** This founder's own vocabulary (utils/speechPhrases.ts), added on top of
+   *  the shared pitch list. */
+  sessionPhrases: string[] = [],
 ): StreamingRecognizer | null {
   if (!hasAzureSttConfig()) {
     console.warn("[stt] Azure Speech not configured — server STT disabled");
@@ -71,10 +77,10 @@ export function createStreamingRecognizer(
   // tokens stop being mangled — and a mangled METRIC is not cosmetic, it is a
   // wrong number reaching the model that scores the answer. Wrapped because a
   // grammar failure must never cost the founder their session.
+  let phraseList: sdk.PhraseListGrammar | null = null;
   try {
-    sdk.PhraseListGrammar.fromRecognizer(recognizer).addPhrases([
-      ...PITCH_PHRASE_LIST,
-    ]);
+    phraseList = sdk.PhraseListGrammar.fromRecognizer(recognizer);
+    phraseList.addPhrases([...PITCH_PHRASE_LIST, ...sessionPhrases]);
   } catch (e) {
     console.warn("[stt] phrase list unavailable (non-fatal):", e);
   }
@@ -132,6 +138,14 @@ export function createStreamingRecognizer(
         pcm16.byteOffset + pcm16.byteLength,
       );
       pushStream.write(arrayBuf as ArrayBuffer);
+    },
+    addPhrases: (phrases: string[]) => {
+      if (!phraseList || phrases.length === 0) return;
+      try {
+        phraseList.addPhrases(phrases);
+      } catch (e) {
+        console.warn("[stt] could not extend phrase list (non-fatal):", e);
+      }
     },
     stop: () => {
       try {

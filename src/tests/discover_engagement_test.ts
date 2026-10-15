@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import jwt from "jsonwebtoken";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "../config/env.ts";
+import { ACCESS_TOKEN_AUDIENCE, ACCESS_TOKEN_ISSUER, ACCESS_TOKEN_KIND } from "../utils/accessToken.ts";
 import { supabase } from "../config/supabase.ts";
 import {
   createBusinessComment,
@@ -406,12 +407,13 @@ try {
   await optionalUserAuth(garbage, responseRecorder(), (() => { continued += 1; }) as NextFunction);
   assert.equal(garbage.user, undefined);
 
-  const orgToken = jwt.sign({ id: 7, email: "org@example.com", accountType: "organization" }, config.jwtSecret);
+  const tokenOptions = { algorithm: "HS256" as const, issuer: ACCESS_TOKEN_ISSUER, audience: ACCESS_TOKEN_AUDIENCE };
+  const orgToken = jwt.sign({ kind: ACCESS_TOKEN_KIND, id: 7, accountType: "organization" }, config.jwtSecret, tokenOptions);
   const org: any = { headers: { authorization: `Bearer ${orgToken}` } };
   await optionalUserAuth(org, responseRecorder(), (() => { continued += 1; }) as NextFunction);
   assert.equal(org.user, undefined);
 
-  const userToken = jwt.sign({ id: 7, email: USER.email }, config.jwtSecret);
+  const userToken = jwt.sign({ kind: ACCESS_TOKEN_KIND, id: 7, accountType: "user" }, config.jwtSecret, tokenOptions);
   const signedIn: any = { headers: { authorization: `Bearer ${userToken}` } };
   await optionalUserAuth(signedIn, responseRecorder(), (() => { continued += 1; }) as NextFunction);
   assert.equal(signedIn.user?.id, 7);

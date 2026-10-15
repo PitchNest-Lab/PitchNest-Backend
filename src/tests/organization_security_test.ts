@@ -4,6 +4,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import type { NextFunction, Request, Response } from "express";
 import { config } from "../config/env.ts";
+import { ACCESS_TOKEN_AUDIENCE, ACCESS_TOKEN_ISSUER, ACCESS_TOKEN_KIND } from "../utils/accessToken.ts";
 import { supabase } from "../config/supabase.ts";
 import {
   authMiddleware,
@@ -73,11 +74,12 @@ try {
   const forgedScopeToken = jwt.sign(
     {
       id: organizationRow.id,
-      email: organizationRow.email,
+      kind: ACCESS_TOKEN_KIND,
       accountType: "organization",
       orgCode: "99999",
     },
     config.jwtSecret,
+    { algorithm: "HS256", issuer: ACCESS_TOKEN_ISSUER, audience: ACCESS_TOKEN_AUDIENCE },
   );
   const organizationRequest = requestWithToken(forgedScopeToken);
   const organizationResponse = responseRecorder();
@@ -108,8 +110,9 @@ try {
   assert.equal(wrongSurfaceResponse.statusCode, 403);
 
   const userToken = jwt.sign(
-    { id: 9, email: "founder@example.com", accountType: "user" },
+    { kind: ACCESS_TOKEN_KIND, id: 9, accountType: "user" },
     config.jwtSecret,
+    { algorithm: "HS256", issuer: ACCESS_TOKEN_ISSUER, audience: ACCESS_TOKEN_AUDIENCE },
   );
   const userOnOrgResponse = responseRecorder();
   let userOnOrgNextCalled = false;

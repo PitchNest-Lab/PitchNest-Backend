@@ -90,6 +90,16 @@ export const avatarUpload = makeUpload(
   "avatar",
 );
 
+/**
+ * Business logos and covers. 6 MB is the cover limit; logos are held to 2 MB by
+ * businessMediaService, which also re-checks the real bytes and re-encodes.
+ */
+export const businessImageUpload = makeUpload(
+  ["image/png", "image/jpeg", "image/webp"],
+  6 * 1024 * 1024,
+  "image",
+);
+
 // Recordings are much larger than decks and avatars. Keeping up to 150 MB per
 // request in V8's heap makes a handful of concurrent uploads enough to crash
 // the process, so recordings spool to an OS temp directory and are streamed to
