@@ -1,6 +1,26 @@
 import { Router } from "express";
 import rateLimit from "express-rate-limit";
 import { getPublicPitch } from "../controllers/sessionController.ts";
+import {
+  getPublicBusiness,
+  getPublicBusinessShareHtml,
+  listPublicBusinesses,
+} from "../controllers/publicBusinessController.ts";
+import {
+  getBusinessEngagement,
+  getPublicFeatures,
+  listBusinessComments,
+  requireDiscoverEngagement,
+} from "../controllers/discoverEngagementController.ts";
+import { optionalUserAuth } from "../middleware/authMiddleware.ts";
+import { listPublicBusinessUpdates } from "../controllers/businessActivityController.ts";
+import { listPublicOpportunities } from "../controllers/opportunityController.ts";
+import { recordClientEvent } from "../services/eventService.ts";
+import {
+  getPublicPitch as getPublicBusinessPitch,
+  listPublicPitches,
+  requirePitchArena,
+} from "../controllers/pitchController.ts";
 
 /**
  * The unauthenticated half of the API.
@@ -12,8 +32,8 @@ import { getPublicPitch } from "../controllers/sessionController.ts";
  * gets its own file and its own rate limit rather than being one more line
  * tucked inside a router that is otherwise all authenticated.
  *
- * Currently one route. If it grows, whatever lands next must project its
- * response field by field the way getPublicPitch does — never spread a database
+ * Every route here must project its response field by field the way
+ * getPublicPitch and the Discover serializers do — never spread a database
  * row or a JSONB blob and delete the parts that look sensitive, because the
  * next field added to that blob then ships to the public by default.
  */
@@ -23,7 +43,7 @@ const router = Router();
 // v4 UUIDs, so this is not the security boundary — it is there so that a public
 // endpoint cannot be hammered for free. 120/hour is far above what a human
 // opening a shared link will ever need and far below what a scraper wants.
-const publicReadLimiter = rateLimit({
+export const publicReadLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 120,
   standardHeaders: true,
@@ -37,5 +57,63 @@ const publicReadLimiter = rateLimit({
  * sessions alike; see getPublicPitch for the projection and the reasoning.
  */
 router.get("/pitch/:shareId", publicReadLimiter, getPublicPitch);
+
+/**
+ * Discover reads. Browsing touches several endpoints per profile (profile,
+ * engagement, comments), and many users in the pilot region share carrier or
+ * campus NAT addresses, so these get a roomier per-IP budget than the share
+ * link above. Still IP-keyed: there is no account to key on.
+ */
+export const discoverReadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Try again later." },
+});
+
+router.get("/features", getPublicFeatures);
+
+// Page-view analytics from the browser. Only allowlisted view events and
+// properties are accepted (services/eventService.ts); nothing else is stored.
+const eventLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests." },
+});
+router.post("/events", eventLimiter, optionalUserAuth, recordClientEvent);
+// Staff-curated opportunities; read-only for everyone else.
+router.get("/opportunities", discoverReadLimiter, listPublicOpportunities);
+router.get("/businesses", discoverReadLimiter, listPublicBusinesses);
+router.get("/businesses/:slug", discoverReadLimiter, getPublicBusiness);
+// Link-preview HTML for social crawlers. Vercel rewrites crawler requests for
+// www.pitchnest.app/businesses/:slug here (see frontend/vercel.json), because
+// the static SPA shell cannot carry per-business Open Graph tags.
+router.get("/businesses/:slug/share-html", discoverReadLimiter, getPublicBusinessShareHtml);
+router.get(
+  "/businesses/:slug/engagement",
+  discoverReadLimiter,
+  requireDiscoverEngagement,
+  optionalUserAuth,
+  getBusinessEngagement,
+);
+// Pitch Arena (migration 0026): published pitches of published businesses only.
+router.get("/pitches", discoverReadLimiter, requirePitchArena, listPublicPitches);
+router.get("/businesses/:slug/pitch", discoverReadLimiter, requirePitchArena, getPublicBusinessPitch);
+router.get(
+  "/businesses/:slug/updates",
+  discoverReadLimiter,
+  requireDiscoverEngagement,
+  listPublicBusinessUpdates,
+);
+router.get(
+  "/businesses/:slug/comments",
+  discoverReadLimiter,
+  requireDiscoverEngagement,
+  optionalUserAuth,
+  listBusinessComments,
+);
 
 export default router;

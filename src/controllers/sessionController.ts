@@ -5,7 +5,7 @@ import { config } from "../config/env.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { getEntitlements } from "../services/entitlementService.ts";
 import { signLocalFileUrl } from "../services/storageService.ts";
-import { storagePathFromUrl } from "../utils/storagePath.ts";
+import { isRecordingObjectPath, storagePathFromUrl } from "../utils/storagePath.ts";
 import {
   computeAttemptStates,
   loadAttemptStates,
@@ -227,6 +227,13 @@ export const getSessionRecording = async (req: Request, res: Response) => {
     const objectPath = storagePathFromUrl(stored);
     if (!objectPath) {
       return res.json({ url: stored, available: true });
+    }
+    // Only ever sign recording keys. A row whose video_url was pointed at a
+    // deck or another file (set_video_url is client input; older rows predate
+    // the write-side check) must never get a service-role signed URL.
+    if (!isRecordingObjectPath(objectPath)) {
+      console.warn(`⚠️ Refusing to sign non-recording path for session ${session.id}`);
+      return res.json({ url: "", available: false });
     }
 
     const { data: signed, error: signErr } = await supabase.storage

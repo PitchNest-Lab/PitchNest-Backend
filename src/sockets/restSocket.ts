@@ -32,7 +32,12 @@ import {
   emptyFounderProfile,
   type FounderProfile,
 } from "../services/founderMemoryService.ts";
-import { detectSpeaker, sanitizeAiSpeech, sanitizeFounderInput } from "../utils/aiTextSanitizer.ts";
+import {
+  detectSpeaker,
+  sanitizeAiSpeech,
+  sanitizeFounderInput,
+  sanitizeStartupConfig,
+} from "../utils/aiTextSanitizer.ts";
 import {
   detectEndSessionIntent,
   classifyConfirmationReply,
@@ -73,6 +78,21 @@ import {
   MAX_PITCH_ATTEMPTS,
   type AttemptClaim,
 } from "../services/pitchAttemptService.ts";
+import {
+  issueResumeGrant,
+  normalizeSessionMode,
+  releaseResumeGrantHolder,
+  resumeSecondsRemaining,
+  revokeResumeGrant,
+  takeResumeGrant,
+  type ResumeGrant,
+} from "./resumeGrants.ts";
+import { isOwnRecordingReference } from "../utils/storagePath.ts";
+import {
+  cleanPracticeQuestion,
+  consumePracticeDraft,
+} from "../services/practiceDraftService.ts";
+import { logEvent } from "../services/eventService.ts";
 import crypto from "crypto";
 
 // Below this Azure STT confidence (0..1) we treat a recognition as likely
@@ -552,7 +572,15 @@ type QueuedTurn = {
 // ── Per-user concurrency cap ───────────────────────────────────────────────
 // Prevents a single user from running many concurrent sessions (billing abuse).
 const MAX_WS_PER_USER = 3;
+const MAX_WS_PER_IP = 50;
+const MAX_TOTAL_WS = 1_000;
+const MAX_BINARY_AUDIO_CHUNK_BYTES = 256 * 1024;
+const MAX_FOUNDER_MESSAGE_CHARS = 8_000;
+const MAX_TRANSCRIPT_ENTRIES = 1_000;
+const MAX_TRANSCRIPT_CHARS = 500_000;
+const CLIENT_READY_TIMEOUT_MS = 15_000;
 const activeWsByUser = new Map<number, Set<WebSocket>>();
+const activeWsByIp = new Map<string, Set<WebSocket>>();
 
 function trackUserWs(userId: number, ws: WebSocket) {
   if (!activeWsByUser.has(userId)) activeWsByUser.set(userId, new Set());
@@ -568,6 +596,25 @@ function untrackUserWs(userId: number, ws: WebSocket) {
 
 export function initRestSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws, req: IncomingMessage) => {
+    const remoteIp = req.socket.remoteAddress || "unknown";
+    const activeForIp = activeWsByIp.get(remoteIp) ?? new Set<WebSocket>();
+    if (wss.clients.size > MAX_TOTAL_WS || activeForIp.size >= MAX_WS_PER_IP) {
+      sendJson(ws, {
+        type: "error",
+        message: "Too many active connections. Try again shortly.",
+        code: "CONNECTION_LIMIT",
+      });
+      ws.close(1013, "Connection limit reached");
+      return;
+    }
+    activeForIp.add(ws);
+    activeWsByIp.set(remoteIp, activeForIp);
+    ws.once("close", () => {
+      const set = activeWsByIp.get(remoteIp);
+      set?.delete(ws);
+      if (set?.size === 0) activeWsByIp.delete(remoteIp);
+    });
+
     // ── JWT Authentication ──────────────────────────────────────────────────
     // Clients must pass ?token=<JWT> as a query param on the WS URL.
     // Without a valid token the connection is closed immediately.
@@ -580,7 +627,23 @@ export function initRestSocket(wss: WebSocketServer) {
         ws.close(4001, "Authentication required");
         return;
       }
-      const decoded = jwt.verify(token, config.jwtSecret) as { id: number; email: string };
+      const decoded = jwt.verify(token, config.jwtSecret) as {
+        id: number;
+        email: string;
+        accountType?: string;
+      };
+      // Organization tokens carry an Organizations.id in `id`, a different
+      // number space from users.id. Accepting one here would let an org
+      // credential run (and bill) sessions as whichever user shares its id.
+      if (decoded.accountType === "organization" || !Number.isInteger(decoded.id)) {
+        sendJson(ws, {
+          type: "error",
+          message: "Organization accounts cannot start pitch sessions.",
+          code: "AUTH_FAILED",
+        });
+        ws.close(4001, "Authentication failed");
+        return;
+      }
       authenticatedUserId = decoded.id;
 
       // Concurrency cap
@@ -598,9 +661,24 @@ export function initRestSocket(wss: WebSocketServer) {
     }
 
     let currentVideoUrl = "";
+    // Business practice bridge (practice drafts). Server-derived only: set
+    // from a consumed draft or a resume grant, never from raw client config.
+    let practiceBusinessId: string | null = null;
+    let practiceQuestionText: string | null = null;
     let currentBusinessName = "Unknown Pitch";
     let currentUserId: number | null = authenticatedUserId;
     let hasSentSetup = false;
+    const clientReadyTimer = setTimeout(() => {
+      if (!hasSentSetup && ws.readyState === WebSocket.OPEN) {
+        sendJson(ws, {
+          type: "error",
+          message: "Session setup timed out. Reconnect and try again.",
+          code: "CLIENT_READY_TIMEOUT",
+        });
+        ws.close(4008, "Session setup timeout");
+      }
+    }, CLIENT_READY_TIMEOUT_MS);
+    clientReadyTimer.unref?.();
     let sessionId = 0;
     let resolvedDeckText = "";
     let masterPrompt = "";
@@ -658,6 +736,29 @@ export function initRestSocket(wss: WebSocketServer) {
 
     const conversationHistory: any[] = [];
     const fullTranscript: any[] = [];
+    let transcriptChars = 0;
+    let transcriptLimitSignaled = false;
+
+    const appendTranscript = (entry: Record<string, any>): boolean => {
+      const text = typeof entry.text === "string" ? entry.text : "";
+      if (
+        fullTranscript.length >= MAX_TRANSCRIPT_ENTRIES ||
+        transcriptChars + text.length > MAX_TRANSCRIPT_CHARS
+      ) {
+        if (!transcriptLimitSignaled) {
+          transcriptLimitSignaled = true;
+          sendJson(ws, {
+            type: "error",
+            code: "TRANSCRIPT_LIMIT",
+            message: "This session reached its transcript limit. Please end it to save your report.",
+          });
+        }
+        return false;
+      }
+      fullTranscript.push(entry);
+      transcriptChars += text.length;
+      return true;
+    };
 
     const turnQueue: QueuedTurn[] = [];
     let processingQueue = false;
@@ -668,6 +769,7 @@ export function initRestSocket(wss: WebSocketServer) {
     let sessionStartTimestamp = Date.now();
     let initialDurationSeconds = 15 * 60;
     let sessionEnded = false;
+    let evaluationElapsedSeconds: number | null = null;
 
     // ── Voice-triggered end-of-session (additive; parallel to the manual End
     // Session button) ──────────────────────────────────────────────────────
@@ -836,7 +938,12 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("close", () => {
       console.log("🔌 Client disconnected.");
-      if (authenticatedUserId) untrackUserWs(authenticatedUserId, ws);
+      clearTimeout(clientReadyTimer);
+      if (authenticatedUserId) {
+        untrackUserWs(authenticatedUserId, ws);
+        // Keep the grant for a reconnect, but free it from this socket.
+        releaseResumeGrantHolder(authenticatedUserId, ws);
+      }
       if (idleCheckInterval) clearInterval(idleCheckInterval);
       if (sttRecognizer) sttRecognizer.stop();
       // Give back the in-flight attempt slot. The DURABLE count comes from the
@@ -1325,7 +1432,7 @@ export function initRestSocket(wss: WebSocketServer) {
           }
         }
         if (fullSpokenText.trim()) {
-          fullTranscript.push({
+          appendTranscript({
             type: "model",
             speaker: activeSpeaker,
             text: fullSpokenText,
@@ -1527,6 +1634,18 @@ export function initRestSocket(wss: WebSocketServer) {
 
     ws.on("message", async (message, isBinary) => {
       if (isBinary) {
+        const byteLength = Array.isArray(message)
+          ? message.reduce((total, chunk) => total + chunk.byteLength, 0)
+          : message.byteLength;
+        if (byteLength > MAX_BINARY_AUDIO_CHUNK_BYTES) {
+          sendJson(ws, {
+            type: "error",
+            message: "Audio frame is too large.",
+            code: "PAYLOAD_TOO_LARGE",
+          });
+          ws.close(1009, "Audio frame too large");
+          return;
+        }
         if (sttRecognizer && !sessionEnded) {
           sttRecognizer.pushAudio(message as Buffer);
         }
@@ -1534,6 +1653,18 @@ export function initRestSocket(wss: WebSocketServer) {
       }
       try {
         const data = JSON.parse(message.toString());
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          sendJson(ws, { type: "error", message: "Invalid message.", code: "INVALID_MESSAGE" });
+          return;
+        }
+        if (typeof data.text === "string" && data.text.length > MAX_FOUNDER_MESSAGE_CHARS) {
+          sendJson(ws, {
+            type: "error",
+            message: "Message is too long.",
+            code: "PAYLOAD_TOO_LARGE",
+          });
+          return;
+        }
 
         if (sessionEnded && data.type !== "set_video_url") {
           return;
@@ -1574,13 +1705,22 @@ export function initRestSocket(wss: WebSocketServer) {
         }
 
         if (data.type === "set_video_url") {
+          // Accepted after end_session on purpose: the client uploads the
+          // recording once the session has finished. But the value is client
+          // input, so it must be a recording key this user's own upload could
+          // have produced — never a deck or another user's file.
+          if (!currentUserId || !isOwnRecordingReference(data.url, currentUserId)) {
+            console.warn(`⚠️ Rejected set_video_url for user ${currentUserId}: not an own recording key`);
+            return;
+          }
           currentVideoUrl = data.url;
           if (sessionId && config.supabaseUrl && config.supabaseAnonKey) {
             try {
               await supabase
                 .from("sessions")
                 .update({ video_url: currentVideoUrl })
-                .eq("id", sessionId);
+                .eq("id", sessionId)
+                .eq("user_id", currentUserId);
             } catch (e) {
               console.error("Failed to async update video URL:", e);
             }
@@ -1590,17 +1730,32 @@ export function initRestSocket(wss: WebSocketServer) {
 
         if (data.type === "client_ready" && !hasSentSetup) {
           hasSentSetup = true;
-          const clientConfig = data.config || {};
+          clearTimeout(clientReadyTimer);
+          // Startup fields (name, description, industry, stage) feed every
+          // prompt builder downstream. Clean them once, here at the boundary.
+          const clientConfig = sanitizeStartupConfig(data.config);
           currentBusinessName = clientConfig.businessName || "Unknown Pitch";
           // SECURITY: the session owner is the JWT-authenticated user established
           // at connection time — NEVER the client-supplied config.userId, which a
           // caller could set to another user's id to write sessions into their
           // account. The client value is ignored here.
           currentUserId = authenticatedUserId;
-          sessionMode = clientConfig.mode || "panel";
+          // Allowlisted: an unknown mode string must not reach prompt
+          // selection or the stored session row.
+          sessionMode = normalizeSessionMode(clientConfig.mode);
           isCoachMode = sessionMode === "coach";
           isSoloMode = sessionMode === "solo";
-          const isResume = !!data.resume;
+          // A resume skips the attempt and quota gates, so it must be backed
+          // by a server-issued grant from the original admission (see
+          // resumeGrants.ts). Without one it is admitted as a new session.
+          const resumeGrant: ResumeGrant | null =
+            data.resume && currentUserId ? takeResumeGrant(currentUserId, ws) : null;
+          const isResume = resumeGrant !== null;
+          if (data.resume && !isResume) {
+            console.warn(
+              `⚠️ Resume requested by user ${currentUserId} without a live grant — admitting as a new session.`,
+            );
+          }
 
           // Verify that the user still exists in the database (prevents deleted users
           // from pitching via WebSocket since WS bypasses Express auth middleware).
@@ -1804,10 +1959,43 @@ export function initRestSocket(wss: WebSocketServer) {
             );
           }
 
+          // ── Business practice bridge ────────────────────────────────────
+          // Runs after the gates so a refused session never burns a draft.
+          // A resume reuses the context recorded on its grant (the draft was
+          // already consumed by the original connection). A draft that is
+          // missing, expired, used, or whose business the founder has lost
+          // access to simply yields an ordinary, unlinked private session.
+          if (resumeGrant) {
+            practiceBusinessId = resumeGrant.context?.businessId ?? null;
+            practiceQuestionText = resumeGrant.context?.practiceQuestion ?? null;
+          } else if (currentUserId && clientConfig.practiceDraftId) {
+            const bridge = await consumePracticeDraft(currentUserId, clientConfig.practiceDraftId);
+            if (bridge) {
+              practiceBusinessId = bridge.businessId;
+              // The founder may edit or discard the question in setup; either
+              // way it is founder-supplied text and is cleaned the same way.
+              practiceQuestionText =
+                typeof clientConfig.practiceQuestion === "string"
+                  ? cleanPracticeQuestion(clientConfig.practiceQuestion)
+                  : bridge.question;
+              console.log(`🏢 Practice session linked to business ${practiceBusinessId}.`);
+              logEvent("practice_started_from_business", {
+                userId: currentUserId,
+                businessId: practiceBusinessId,
+                properties: { mode: sessionMode, withQuestion: Boolean(practiceQuestionText) },
+              });
+            } else {
+              console.warn(
+                `⚠️ Practice draft not usable for user ${currentUserId} — continuing as an unlinked private session.`,
+              );
+            }
+          }
+
           // Compact setup snapshot stored with the session row so a future
           // "Pitch Again" can prefill the setup form. Deliberately excludes
           // deck text — only ids/names, keeping the row small.
           pitchConfigSnapshot = {
+            businessId: practiceBusinessId,
             mode: sessionMode,
             businessName: currentBusinessName,
             description: clientConfig.description || "",
@@ -1827,28 +2015,34 @@ export function initRestSocket(wss: WebSocketServer) {
           // self-records and the session is reviewed only afterward. Skip the
           // greeting entirely so the room opens silently (no pickGreeting, no
           // greeting audio). Coach and Panel still greet as Riley / Marcus.
-          // On resume (client reconnected after a refresh) the client is the
-          // source of truth for the transcript. Rebuild the panel's conversation
-          // memory from it so the AI keeps context, and skip the greeting so the
-          // room reopens mid-session instead of re-introducing the panel.
-          if (isResume && Array.isArray(data.transcript)) {
-            // The client transcript is untrusted: sanitize every founder turn
-            // before it re-enters the model context or the memory extractors, so
-            // a resumed turn can't smuggle a "[SYSTEM: ...]" directive that the
-            // live path already neutralizes (S6).
+          // On resume, rebuild context only from the transcript retained in the
+          // server-issued grant. A browser-provided transcript can fabricate
+          // founder claims, panel answers and ultimately the evaluation.
+          if (isResume) {
+            const trustedTranscript = Array.isArray(resumeGrant?.context?.transcript)
+              ? resumeGrant.context.transcript
+              : [];
             const resumed: Array<{ type: string; role: string; text: string; speaker?: string }> = [];
-            for (const m of data.transcript) {
+            for (const m of trustedTranscript) {
               const raw = String(m?.text || "").trim();
               if (!raw) continue;
               if (m.type === "user") {
                 const clean = sanitizeFounderInput(raw);
+                appendTranscript({ ...m, type: "user", text: clean });
                 conversationHistory.push({ role: "user", text: clean });
                 resumed.push({ type: "user", role: "user", text: clean });
-              } else if (m.type === "ai") {
+              } else if (m.type === "model") {
+                appendTranscript({ ...m, type: "model", text: raw });
                 conversationHistory.push({ role: "assistant", text: raw });
-                resumed.push({ type: "model", role: "assistant", text: raw, speaker: m?.speaker });
+                resumed.push({
+                  type: "model",
+                  role: "assistant",
+                  text: raw,
+                  speaker: typeof m?.speaker === "string" ? m.speaker : undefined,
+                });
               }
             }
+            if (resumeGrant?.context) resumeGrant.context.transcript = fullTranscript;
             // Reconstruct structured pitch memory by replaying the transcript —
             // the per-connection state was lost on the reconnect, so without this
             // the panel would forget every number/date/question stated before it.
@@ -1933,6 +2127,8 @@ export function initRestSocket(wss: WebSocketServer) {
             if (isSoloMode) return;
             liveConfig = {
               ...clientConfig,
+              // Always overwrites any client-sent key of the same name.
+              practiceQuestion: practiceQuestionText,
               resolvedDeckText: deckText,
               structuredDeck,
               previousSession: previousSessionCtx,
@@ -2019,9 +2215,12 @@ export function initRestSocket(wss: WebSocketServer) {
                 // Only truly garbled noise (< 0.2) is skipped.
                 if (confidence < LOW_STT_CONFIDENCE) {
                   console.log(
-                    `[stt] very low confidence (${confidence.toFixed(2)}), skipping likely noise:`,
-                    text,
+                    `[stt] very low confidence (${confidence.toFixed(2)}), skipping likely noise`,
                   );
+                  return;
+                }
+
+                if (!appendTranscript({ type: "user", text, inputMethod: "voice" })) {
                   return;
                 }
 
@@ -2058,11 +2257,6 @@ export function initRestSocket(wss: WebSocketServer) {
                 // Raw STT words, shown instantly — no LLM summarization pass.
                 // The prompts tell the AI this is speech-recognition output and
                 // to read mis-transcribed words from context.
-                fullTranscript.push({
-                  type: "user",
-                  text,
-                  inputMethod: "voice",
-                });
                 sendJson(ws, {
                   type: "chat_message",
                   role: "user",
@@ -2125,6 +2319,19 @@ export function initRestSocket(wss: WebSocketServer) {
               initialDurationSeconds,
               Math.max(0, Math.floor(Number(data.timeLeftSeconds))),
             );
+          }
+          if (resumeGrant) {
+            // Never past the original admission's deadline, whatever the
+            // client claims about time left.
+            initialDurationSeconds = Math.min(
+              initialDurationSeconds,
+              resumeSecondsRemaining(resumeGrant),
+            );
+          } else if (currentUserId) {
+            issueResumeGrant(currentUserId, initialDurationSeconds, ws, Date.now(), {
+              businessId: practiceBusinessId,
+              practiceQuestion: practiceQuestionText,
+            });
           }
           hasNudged = false;
 
@@ -2246,9 +2453,16 @@ export function initRestSocket(wss: WebSocketServer) {
           // the text is used for anything downstream (floor/end-session
           // detection, the LLM turn, the saved transcript) so a typed
           // "[SYSTEM: ...]" can never impersonate a server control turn.
-          if (typeof data.text === "string") {
-            data.text = sanitizeFounderInput(data.text);
+          if (typeof data.text !== "string" || !data.text.trim()) {
+            sendJson(ws, {
+              type: "error",
+              message: "Message text is required.",
+              code: "INVALID_MESSAGE",
+            });
+            return;
           }
+          data.text = sanitizeFounderInput(data.text);
+          if (!data.text) return;
 
           // Two-step interruption: while the panel holds the floor, this message
           // is routed to the hand-back logic and is NOT pitch content (still
@@ -2278,14 +2492,19 @@ export function initRestSocket(wss: WebSocketServer) {
           // chat_message turn as a backstop regardless of the claimed method.
           if (!consumedByFloor && !consumedByEndFlow && typeof data.text === "string") {
             const overQueueCap = turnQueue.length >= MAX_PENDING_FOUNDER_TURNS;
-            const throttled =
-              inputMethod === "chat" ? !allowFounderChatTurn() : overQueueCap;
+            // A caller can label a frame "voice". Only the server STT callback
+            // is trusted as voice-paced, so every client frame is bucketed.
+            const throttled = !allowFounderChatTurn() || overQueueCap;
             if (throttled) {
               console.warn(
                 "[rate-limit] chat_message burst dropped (token bucket empty / queue deep)",
               );
               return;
             }
+          }
+
+          if (!appendTranscript({ type: "user", text: data.text, inputMethod })) {
+            return;
           }
 
           if (!consumedByFloor && !consumedByEndFlow) {
@@ -2298,8 +2517,7 @@ export function initRestSocket(wss: WebSocketServer) {
               noteFounderTurnForRoomRead();
               enqueueTurn({
                 text: data.text,
-                timeLeft:
-                  typeof data.timeLeft === "number" ? data.timeLeft : undefined,
+                timeLeft: getTimeLeftSeconds(),
                 inputMethod,
               });
             }
@@ -2307,20 +2525,9 @@ export function initRestSocket(wss: WebSocketServer) {
 
           if (inputMethod === "voice") {
             // Raw voice text, echoed back instantly — no summarization pass.
-            fullTranscript.push({
-              type: "user",
-              text: data.text,
-              inputMethod,
-            });
             sendJson(ws, {
               type: "chat_message",
               role: "user",
-              text: data.text,
-              inputMethod,
-            });
-          } else {
-            fullTranscript.push({
-              type: "user",
               text: data.text,
               inputMethod,
             });
@@ -2465,6 +2672,7 @@ export function initRestSocket(wss: WebSocketServer) {
         if (data.type === "end_session") {
           if (sessionEnded) return;
           sessionEnded = true;
+          if (currentUserId) revokeResumeGrant(currentUserId, ws);
           if (sttRecognizer) {
             sttRecognizer.stop();
             sttRecognizer = null;
@@ -2574,6 +2782,9 @@ export function initRestSocket(wss: WebSocketServer) {
               attempt_number: attemptStamp.attempt_number,
             };
             if (currentUserId) insertPayload.user_id = currentUserId;
+            // Only set when a verified practice draft linked this session, so
+            // ordinary sessions never depend on migration 0019's column.
+            if (practiceBusinessId) insertPayload.business_id = practiceBusinessId;
 
             let { data: dbData, error: dbError } = await supabase
               .from("sessions")
@@ -2598,6 +2809,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 parent_session_id,
                 pitch_root_id,
                 attempt_number,
+                business_id,
                 ...legacyPayload
               } = insertPayload;
               ({ data: dbData, error: dbError } = await supabase
@@ -2740,8 +2952,13 @@ export function initRestSocket(wss: WebSocketServer) {
             shareId,
           });
         }
-      } catch {
-        // Ignore non-JSON messages (legacy raw audio payloads)
+      } catch (error) {
+        console.error("WebSocket message handler failed:", error);
+        sendJson(ws, {
+          type: "error",
+          message: "The session could not process that message.",
+          code: "MESSAGE_PROCESSING_FAILED",
+        });
       }
     });
   });

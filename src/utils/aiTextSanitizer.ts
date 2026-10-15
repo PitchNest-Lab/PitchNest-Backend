@@ -143,6 +143,36 @@ export function inlinePromptFragment(text: unknown, max: number): string {
 }
 
 /**
+ * Caps for the founder-typed startup fields that reach every prompt builder:
+ * the live master prompt, the traction directive, evaluation, answer tips and
+ * the structured pitch memory.
+ */
+export const STARTUP_FIELD_LIMITS = {
+  businessName: 120,
+  description: 1500,
+  industry: 100,
+  fundingStage: 80,
+} as const;
+
+/**
+ * Returns a shallow copy of a session's client config with every startup text
+ * field passed through inlinePromptFragment. Applied once, where the config
+ * enters the server (WebSocket client_ready), so no downstream prompt builder
+ * can receive these fields raw. Non-string values become "" so callers'
+ * `|| default` fallbacks still apply. Other keys are passed through untouched.
+ */
+export function sanitizeStartupConfig(raw: unknown): Record<string, any> {
+  const config: Record<string, any> =
+    raw && typeof raw === "object" && !Array.isArray(raw) ? { ...(raw as Record<string, any>) } : {};
+  for (const [key, max] of Object.entries(STARTUP_FIELD_LIMITS)) {
+    if (key in config) {
+      config[key] = typeof config[key] === "string" ? inlinePromptFragment(config[key], max) : "";
+    }
+  }
+  return config;
+}
+
+/**
  * Sanitizes untrusted deck text to prevent prompt injection and delimiter breakout.
  * Strips boundary markers (===, ---), machine control markers ([SYSTEM:, [PANEL STATE:, etc.),
  * machine tags (@@INTEREST, @@FLOOR), and normalizes text.

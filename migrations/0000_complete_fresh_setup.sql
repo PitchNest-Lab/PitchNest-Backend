@@ -198,6 +198,7 @@ CREATE OR REPLACE FUNCTION grant_pro_access(
 RETURNS BOOLEAN
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 DECLARE
   v_payment        payments;
@@ -255,6 +256,14 @@ BEGIN
   RETURN TRUE;
 END;
 $$;
+
+-- SECURITY DEFINER functions are executable by PUBLIC unless explicitly
+-- revoked. Billing settlement is backend-only: only the service-role caller
+-- may mark a payment successful and extend a plan.
+REVOKE ALL ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT)
+  TO service_role;
 
 -- 15. STORAGE BUCKETS (Public avatar, private media)
 INSERT INTO storage.buckets (id, name, public)

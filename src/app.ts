@@ -4,15 +4,29 @@ import helmet from "helmet";
 import path from "path";
 import fs from "fs";
 import { config } from "./config/env.ts";
+import { isAllowedBrowserOrigin } from "./config/origins.ts";
 import authRoutes from "./routes/authRoutes.ts";
 import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import fileRoutes from "./routes/fileRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
 import publicRoutes from "./routes/publicRoutes.ts";
+import { publicReadLimiter } from "./routes/publicRoutes.ts";
+import {
+  getPublicBusinessSitemap,
+  publicSiteOrigin,
+  readPublicBusinessProfile,
+} from "./controllers/publicBusinessController.ts";
+import { injectPublicBusinessMetadata } from "./utils/publicBusinessMetadata.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
 import billingRoutes from "./routes/billingRoutes.ts";
+import businessRoutes from "./routes/businessRoutes.ts";
+import discoverRoutes from "./routes/discoverRoutes.ts";
+import staffRoutes from "./routes/staffRoutes.ts";
+import practiceRoutes from "./routes/practiceRoutes.ts";
+import notificationRoutes from "./routes/notificationRoutes.ts";
+import communityRoutes from "./routes/communityRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 import router from "./routes/organization/organizationRoutes.ts";
 
@@ -25,36 +39,12 @@ app.set("trust proxy", 1);
 // Global Middlewares — CORS restricted to allowed origins
 const isProduction = config.nodeEnv === "production";
 
-// In production, only the real frontend domain(s) are allowed. Localhost dev
-// origins are permitted only outside production.
-const allowedOrigins = [
-  config.allowedOrigin,
-  'https://pitchnestapp.vercel.app',
-  'https://www.pitchnest.app',
-  'https://pitchnest.app',
-  ...config.corsExtraOrigins,
-  ...(isProduction
-    ? []
-    : [
-        'http://localhost:5173',
-        'https://localhost:5173',
-        'http://localhost:5174',
-        'https://localhost:5174',
-        'http://localhost:3000',
-      ]),
-].filter(Boolean);
-
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (curl, server-to-server, native clients),
-    // configured origins, wildcard '*', or Cloudflare / Vercel preview domains.
-    const isAllowed =
-      !origin ||
-      allowedOrigins.includes(origin) ||
-      allowedOrigins.includes('*') ||
-      origin.endsWith('.pages.dev') ||
-      origin.endsWith('.workers.dev') ||
-      origin.endsWith('.vercel.app');
+    // Requests without Origin are non-browser/native/server clients. Browser
+    // origins must be explicitly configured; preview domains are no longer
+    // trusted by suffix alone.
+    const isAllowed = !origin || isAllowedBrowserOrigin(origin);
 
     if (isAllowed) {
       callback(null, true);
@@ -106,6 +96,12 @@ app.use("/api/files", fileRoutes);
 // API Routers
 app.use("/api/auth", authRoutes);
 app.use("/api/organization", router);
+app.use("/api/businesses", businessRoutes);
+app.use("/api/discover", discoverRoutes);
+app.use("/api/staff", staffRoutes);
+app.use("/api/practice", practiceRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/community", communityRoutes);
 app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
@@ -113,12 +109,13 @@ app.use("/api/sessions", sessionRoutes);
 // the app a stranger can reach without a token. See routes/publicRoutes.ts.
 app.use("/api/public", publicRoutes);
 app.use("/api/profile", profileRoutes);
-// Internal admin surface (Item C) — gated by ADMIN_API_KEY, 404 when unset.
+// Internal transcript review surface — authenticated and staff-role gated.
 app.use("/api/admin", adminRoutes);
 // Billing: checkout + the webhook that grants paid access.
 app.use("/api/billing", billingRoutes);
 app.post("/api/waitlist", handleWaitlist);
 app.post("/api/survey", handleSurvey);
+app.get("/sitemap.xml", publicReadLimiter, getPublicBusinessSitemap);
 
 // Health check endpoints — kept dependency-free so they return instantly and can
 // be used to pre-warm the Render service (which spins down on the free tier).
@@ -136,6 +133,29 @@ const hasFrontendBuild = fs.existsSync(path.join(distPath, "index.html"));
 
 if (hasFrontendBuild) {
   console.log(`🟢 Frontend static assets found at: ${distPath}. Serving single-page application.`);
+  const indexTemplate = fs.readFileSync(path.join(distPath, "index.html"), "utf8");
+
+  // Social crawlers generally do not execute the React bundle. Render profile
+  // metadata into the initial HTML, and emit a noindex shell for every slug that
+  // does not currently resolve to an active approved publication.
+  app.get("/businesses/:slug", async (req, res) => {
+    const requestedSlug = String(req.params.slug || "").trim().toLowerCase().slice(0, 80);
+    let business: Awaited<ReturnType<typeof readPublicBusinessProfile>> = null;
+    try {
+      business = await readPublicBusinessProfile(requestedSlug);
+    } catch (error) {
+      console.error("Business profile metadata lookup failed:", error);
+    }
+    const html = injectPublicBusinessMetadata(
+      indexTemplate,
+      business,
+      publicSiteOrigin(),
+      requestedSlug,
+    );
+    res.set("Cache-Control", "public, max-age=0, must-revalidate");
+    res.status(200).type("html").send(html);
+  });
+
   app.use(express.static(distPath));
   app.get("*", (req, res) => {
     res.sendFile(path.join(distPath, "index.html"));

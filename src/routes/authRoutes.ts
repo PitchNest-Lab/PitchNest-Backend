@@ -8,6 +8,7 @@ import {
   updateMe,
   updateSettings,
   toPublicUser,
+  toPublicOrganization,
   forgotPassword,
   resetPassword,
   deleteAccount,
@@ -19,7 +20,10 @@ import {
 } from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
-import { authMiddleware } from "../middleware/authMiddleware.ts";
+import {
+  accountAuthMiddleware,
+  authMiddleware,
+} from "../middleware/authMiddleware.ts";
 
 const router = Router();
 
@@ -45,11 +49,25 @@ router.get("/verify-email", authLimiter, verifyEmail);
 router.post("/verify-email-otp", authLimiter, verifyEmailOtp);
 router.post("/resend-verification", authLimiter, resendEmailVerification);
 
-router.get("/me", authMiddleware, async (req, res) => {
+router.get("/me", accountAuthMiddleware, async (req, res) => {
   // Fetch the live row so a refetch keeps role (and name/email) fresh. If the
   // lookup fails transiently, fall back to the JWT identity so a healthy token
   // is never treated as logged-out — same liveness semantics as before.
   try {
+    if (req.user!.accountType === "organization") {
+      const { data: organization } = await supabase
+        .from("Organizations")
+        .select("*")
+        .eq("id", req.user!.id)
+        .maybeSingle();
+
+      if (organization) {
+        return res.json(toPublicOrganization(organization));
+      }
+
+      return res.status(503).json({ error: "Unable to load organization account." });
+    }
+
     const { data: user } = await supabase
       .from("users")
       .select("*")
@@ -65,12 +83,18 @@ router.get("/me", authMiddleware, async (req, res) => {
   } catch (err) {
     console.warn("GET /me lookup failed, falling back to token identity:", err);
   }
-  res.json({ id: req.user!.id, email: req.user!.email, isEmailVerified: false });
+  res.json({
+    id: req.user!.id,
+    email: req.user!.email,
+    accountType: req.user!.accountType,
+    orgCode: req.user!.orgCode,
+    isEmailVerified: false,
+  });
 });
 
 // Deliberately not behind authLimiter — it fires on a timer for every active
 // user, and the shared 20-per-15-min cap would starve real logins.
-router.post("/refresh", authMiddleware, refreshToken);
+router.post("/refresh", accountAuthMiddleware, refreshToken);
 
 router.patch("/me", authMiddleware, updateMe);
 router.patch("/settings", authMiddleware, updateSettings);

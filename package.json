@@ -9,7 +9,19 @@
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "tsx src/tests/run_tests.ts"
+    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch",
+    "test:core": "tsx src/tests/run_tests.ts",
+    "test:organization-security": "tsx src/tests/organization_security_test.ts",
+    "test:business-security": "tsx src/tests/business_security_test.ts",
+    "test:public-business": "tsx src/tests/public_business_test.ts",
+    "test:discover-engagement": "tsx src/tests/discover_engagement_test.ts",
+    "test:session-security": "tsx src/tests/session_security_test.ts",
+    "test:practice-bridge": "tsx src/tests/practice_bridge_test.ts",
+    "test:activity": "tsx src/tests/activity_notifications_test.ts",
+    "test:community": "tsx src/tests/community_test.ts",
+    "test:opportunities": "tsx src/tests/opportunities_test.ts",
+    "test:analytics": "tsx src/tests/analytics_test.ts",
+    "test:pitch": "tsx src/tests/pitch_test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
@@ -17,19 +29,19 @@
     "bcrypt": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
-    "express": "^4.21.2",
+    "express": "^4.22.1",
     "express-rate-limit": "^8.5.2",
     "google-auth-library": "^10.6.1",
     "helmet": "^8.3.0",
     "jsonwebtoken": "^9.0.3",
-    "microsoft-cognitiveservices-speech-sdk": "^1.50.0",
-    "multer": "^2.1.1",
+    "microsoft-cognitiveservices-speech-sdk": "^1.52.0",
+    "multer": "^2.4.0",
     "openai": "^6.42.0",
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.19.1",
     "resend": "^6.16.0",
     "tsx": "^4.21.0",
-    "ws": "^8.19.0"
+    "ws": "^8.22.0"
   },
   "devDependencies": {
     "@types/bcrypt": "^6.0.0",
@@ -39,5 +51,8 @@
     "@types/multer": "^2.1.0",
     "@types/node": "^22.14.0",
     "typescript": "~5.8.2"
+  },
+  "overrides": {
+    "qs": "6.16.1"
   }
 }

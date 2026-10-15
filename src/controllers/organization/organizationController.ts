@@ -13,12 +13,14 @@ const getOrgUsers = async (orgId: string) => {
   return users ?? [];
 };
 
-const getOrgSessions = async (userIds: (string | number)[]) => {
+const getOrgSessions = async (orgId: string, userIds: (string | number)[]) => {
   if (!userIds.length) return [];
   const { data: sessions } = await supabase
     .from("sessions")
     .select("*")
     .in("user_id", userIds)
+    .eq("org_id", orgId)
+    .eq("visibility", "organization")
     .order("created_at", { ascending: false });
   return sessions ?? [];
 };
@@ -37,7 +39,7 @@ const getOrg = async (orgId: string) => {
 /* ---------------- ORGANIZATION DETAILS (full profile + QR link) ---------------- */
 export const orgDetails = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
 
     if (!org) {
@@ -76,11 +78,11 @@ export const orgDetails = async (req: Request, res: Response) => {
 /* ---------------- OVERVIEW ---------------- */
 export const overview = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
 
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const totalPitches = sessions.length;
     const scored = sessions
@@ -144,7 +146,7 @@ export const overview = async (req: Request, res: Response) => {
 /* ---------------- SEATS ---------------- */
 export const seats = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
     const users = await getOrgUsers(orgId);
 
@@ -184,9 +186,9 @@ export const seats = async (req: Request, res: Response) => {
 /* ---------------- ACTIVITY ---------------- */
 export const activity = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const now = new Date();
     const days = Array.from({ length: 7 }).map((_, i) => {
@@ -236,9 +238,9 @@ export const activity = async (req: Request, res: Response) => {
 /* ---------------- FOUNDER DRILL-DOWN ---------------- */
 export const founderDrill = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const founders = users
       .filter((u) => (u.role ?? "Founder") === "Founder")
@@ -321,9 +323,9 @@ export const founderDrill = async (req: Request, res: Response) => {
 /* ---------------- MEMBER LIST ---------------- */
 export const memberList = async (req: Request, res: Response) => {
   try {
-    const { orgId } = req.body;
+    const orgId = req.organization!.orgCode;
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const byUser: Record<string, any[]> = {};
     sessions.forEach((s) => {
@@ -406,9 +408,10 @@ const buildReport = (sessions: any[], users: any[], rangeStart: Date, rangeEnd: 
 // weekly: pass any date inside the target week (defaults to current week)
 export const weeklyReport = async (req: Request, res: Response) => {
   try {
-    const { orgId, date } = req.body;
+    const orgId = req.organization!.orgCode;
+    const { date } = req.body;
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const anchor = date ? new Date(date) : new Date();
     const start = new Date(anchor);
@@ -436,9 +439,10 @@ export const weeklyReport = async (req: Request, res: Response) => {
 // monthly: pass month (0-11) + year, defaults to current month
 export const monthlyReport = async (req: Request, res: Response) => {
   try {
-    const { orgId, month, year } = req.body;
+    const orgId = req.organization!.orgCode;
+    const { month, year } = req.body;
     const users = await getOrgUsers(orgId);
-    const sessions = await getOrgSessions(users.map((u) => u.id));
+    const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const now = new Date();
     const y = year ?? now.getFullYear();

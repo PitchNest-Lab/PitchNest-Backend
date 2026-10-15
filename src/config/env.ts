@@ -66,10 +66,6 @@ export const config = {
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
   avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || "pitchnest-avatars",
-  // Internal-only admin key for the transcript-review endpoint (Item C). Not a
-  // user role — a single shared secret sent as the x-admin-key header. Empty
-  // disables the admin routes entirely (they 404).
-  adminApiKey: process.env.ADMIN_API_KEY || "",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
     .split(",")
     .map((o) => o.trim())
@@ -102,6 +98,25 @@ export const config = {
   proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
   /** Where Flutterwave returns the user after checkout. */
   appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
+  // ── Ecosystem feature flags ──────────────────────────────────────────────
+  // Public mutation surfaces ship dark. Discover engagement (support, follow,
+  // comments, reports) is on in development and OFF in production until
+  // FEATURE_DISCOVER_ENGAGEMENT=true is set — after migration 0021 is applied
+  // and a moderator has been granted users.is_staff.
+  discoverEngagementEnabled: process.env.FEATURE_DISCOVER_ENGAGEMENT
+    ? process.env.FEATURE_DISCOVER_ENGAGEMENT.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
+  // Community discussions (/community). Separate from Discover engagement so
+  // it can launch on its own once moderation capacity exists. Same default:
+  // on in development, OFF in production until FEATURE_COMMUNITY=true.
+  communityEnabled: process.env.FEATURE_COMMUNITY
+    ? process.env.FEATURE_COMMUNITY.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
+  // Pitch Arena (public text pitches and structured feedback). Same default:
+  // on in development, OFF in production until FEATURE_PITCH_ARENA=true.
+  pitchArenaEnabled: process.env.FEATURE_PITCH_ARENA
+    ? process.env.FEATURE_PITCH_ARENA.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
 };
 
 // ── Billing catalog: purchasable SKUs (level × term) ─────────────────────────

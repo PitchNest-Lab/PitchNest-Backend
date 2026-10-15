@@ -105,7 +105,8 @@ export function createStreamingRecognizer(
         } catch {
           /* keep default confidence */
         }
-        console.log(`[stt] recognized (conf ${confidence.toFixed(2)}):`, text);
+        // Never log recognized speech. Founder pitches routinely contain
+        // confidential company, customer, revenue and fundraising information.
         onFinalText(text, confidence);
       }
     }

@@ -47,23 +47,52 @@ export const getLocalFile = async (req: Request, res: Response) => {
   // 404, exactly as before.
   const storedPath = `/uploads/${name}`;
 
-  const { data: deck } = await supabase
+  const { data: deck, error: deckError } = await supabase
     .from("decks")
     .select("id")
     .eq("file_url", storedPath)
     .eq("user_id", uid)
     .maybeSingle();
 
+  if (deckError) {
+    console.error("Local file ownership check failed:", deckError.message);
+    return res.status(503).json({ error: "File access could not be verified" });
+  }
+
   let owned = !!deck;
+  let ownedKind: "deck" | "recording" | null = deck ? "deck" : null;
 
   if (!owned) {
-    const { data: session } = await supabase
+    const { data: session, error: sessionError } = await supabase
       .from("sessions")
       .select("id")
       .eq("video_url", storedPath)
       .eq("user_id", uid)
       .maybeSingle();
+    if (sessionError) {
+      console.error("Local recording ownership check failed:", sessionError.message);
+      return res.status(503).json({ error: "File access could not be verified" });
+    }
     owned = !!session;
+    if (session) ownedKind = "recording";
+
+    // sessions.video_url was historically client-settable, so a session row
+    // pointing at a file is not proof the file is a recording. If ANY deck row
+    // owns this path, it is someone's deck: only the deck branch above may
+    // serve it.
+    if (owned) {
+      const { data: deckOwner, error: deckOwnerError } = await supabase
+        .from("decks")
+        .select("id")
+        .eq("file_url", storedPath)
+        .limit(1)
+        .maybeSingle();
+      if (deckOwnerError) {
+        console.error("Local file collision check failed:", deckOwnerError.message);
+        return res.status(503).json({ error: "File access could not be verified" });
+      }
+      if (deckOwner) owned = false;
+    }
   }
 
   if (!owned) {
@@ -78,5 +107,20 @@ export const getLocalFile = async (req: Request, res: Response) => {
   // Token is in the URL (logs, history, referrers) — never cache it. sendFile
   // sets Content-Type from the extension and supports Range requests.
   res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  const ext = path.extname(name).toLowerCase();
+  if (ownedKind === "deck") {
+    res.type(ext === ".pdf" ? "application/pdf" : "text/plain; charset=utf-8");
+  } else {
+    const audioTypes: Record<string, string> = {
+      ".webm": "audio/webm",
+      ".ogg": "audio/ogg",
+      ".mp3": "audio/mpeg",
+      ".mp4": "audio/mp4",
+      ".m4a": "audio/mp4",
+    };
+    res.type(audioTypes[ext] || "application/octet-stream");
+  }
   res.sendFile(absPath);
 };

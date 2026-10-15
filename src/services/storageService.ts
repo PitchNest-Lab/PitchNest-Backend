@@ -1,6 +1,8 @@
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import os from "os";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { config } from "../config/env.ts";
 
@@ -34,12 +36,6 @@ export function sanitizeUploadName(original: string | undefined | null): string 
     .slice(0, 100);
   return cleaned || "file";
 }
-
-// Configured multer instance with 500MB size limit (perfect for long webm uploads)
-export const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 500 * 1024 * 1024 }
-});
 
 /**
  * Per-kind upload guards.
@@ -94,6 +90,19 @@ export const avatarUpload = makeUpload(
   "avatar",
 );
 
+// Recordings are much larger than decks and avatars. Keeping up to 150 MB per
+// request in V8's heap makes a handful of concurrent uploads enough to crash
+// the process, so recordings spool to an OS temp directory and are streamed to
+// object storage by the controller. Random server-side names also ensure that
+// no client filename can influence a temporary filesystem path.
+export const recordingTempDir = path.join(os.tmpdir(), "pitchnest-recordings");
+fs.mkdirSync(recordingTempDir, { recursive: true });
+
+const recordingDiskStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, recordingTempDir),
+  filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+});
+
 /**
  * Session recordings — AUDIO only in practice.
  *
@@ -103,11 +112,23 @@ export const avatarUpload = makeUpload(
  * depending on the mimeType the recorder negotiated, and rejecting that would
  * silently lose the founder's recording (and with it, replay).
  */
-export const videoUpload = makeUpload(
-  ["video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4"],
-  150 * 1024 * 1024,
-  "recording",
-);
+const recordingMimeTypes = new Set([
+  "video/webm",
+  "video/mp4",
+  "audio/webm",
+  "audio/ogg",
+  "audio/mpeg",
+  "audio/mp4",
+]);
+
+export const videoUpload = multer({
+  storage: recordingDiskStorage,
+  limits: { fileSize: 150 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (recordingMimeTypes.has(file.mimetype)) return cb(null, true);
+    cb(new Error(`UNSUPPORTED_FILE_TYPE:recording:${file.mimetype}`));
+  },
+});
 
 // ── Signed local-file delivery (S7) ─────────────────────────────────────────
 // Local-fallback files (written to disk when Supabase Storage errors) used to

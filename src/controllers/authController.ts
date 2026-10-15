@@ -8,6 +8,9 @@ import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { storagePathFromUrl } from "../utils/storagePath.ts";
+import { uploadDir } from "../services/storageService.ts";
+import fs from "fs";
+import path from "path";
 
 const resend =
   config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
@@ -15,6 +18,7 @@ const resend =
     : null;
 
 const BCRYPT_ROUNDS = 12;
+const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$.{53}$/;
 const googleClient = new OAuth2Client(config.googleClientId);
 
 // The only roles a user record may hold. Kept in one place so signup, the PATCH
@@ -60,9 +64,9 @@ import {
 import { isSupportedSttLocale } from "../utils/transcriptionLocales.ts";
 
 export function toPublicUser(u: any) {
-  const expiry = u?.validity ? new Date(u.validity) : null;
+  const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
   const isPaidActive =
-    (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") &&
+    ["pro", "prep", "founder", "enterprise"].includes(u?.plan) &&
     (!expiry || expiry > new Date());
   const trial = isTrialActive(
     u?.trial_expires_at,
@@ -79,15 +83,21 @@ export function toPublicUser(u: any) {
 
   return {
     id: u?.id,
-    name: u?.org_name,
+    name: u?.name,
     email: u?.email,
+    role: u?.role,
+    bio: u?.bio ?? "",
+    avatarUrl: u?.avatar_url ?? null,
+    onboardingCompleted: u?.onboardingCompleted === true,
+    orgCode: u?.orgCode ?? null,
+    accountType: "user" as const,
     plan: effectivePlan,
     planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
     isTrial: trial.active,
     trialDaysRemaining: trial.daysRemaining,
     trialExpiresAt: u?.trial_expires_at
       ? new Date(u.trial_expires_at).toISOString()
-      : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
+      : null,
     // The app-preferences bag (notification toggles, AI toughness, sector, the
     // chosen recognition locale). This was previously omitted from the payload
     // entirely, so every client silently reverted to hardcoded defaults on a
@@ -95,6 +105,34 @@ export function toPublicUser(u: any) {
     // browser's localStorage survived. Always the owner's own bag: sanitizeSettings
     // is the sole writer, so the shape is bounded and nothing raw lands here.
     settings: u?.settings && typeof u.settings === "object" ? u.settings : {},
+  };
+}
+
+/** Public login/session contract for the temporary organization credential. */
+export function toPublicOrganization(org: any) {
+  const expiry = org?.validity ? new Date(org.validity) : null;
+  const isPaidActive =
+    ["pro", "prep", "founder", "enterprise"].includes(org?.plan) &&
+    (!expiry || expiry > new Date());
+  const trial = isTrialActive(
+    org?.trial_expires_at,
+    org?.trial_status,
+    org?.trial_started_at,
+  );
+
+  return {
+    id: org?.id,
+    name: org?.org_name ?? "Organization",
+    email: org?.email,
+    orgCode: org?.org_code != null ? String(org.org_code) : null,
+    accountType: "organization" as const,
+    plan: isPaidActive ? org.plan : trial.active ? "pro" : "free",
+    planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
+    isTrial: trial.active,
+    trialDaysRemaining: trial.daysRemaining,
+    trialExpiresAt: org?.trial_expires_at
+      ? new Date(org.trial_expires_at).toISOString()
+      : null,
   };
 }
 
@@ -108,6 +146,18 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
       pitchAlerts: !!s.notifications.pitchAlerts,
       weeklyReport: !!s.notifications.weeklyReport,
       investorInquiries: !!s.notifications.investorInquiries,
+      // Ecosystem in-app notifications (migration 0022 triggers read these).
+      // Kept only when the client sends a boolean: a missing key means "on",
+      // so an older client saving the other switches never silently opts out.
+      ...(typeof s.notifications.businessActivity === "boolean"
+        ? { businessActivity: s.notifications.businessActivity }
+        : {}),
+      ...(typeof s.notifications.followedUpdates === "boolean"
+        ? { followedUpdates: s.notifications.followedUpdates }
+        : {}),
+      ...(typeof s.notifications.communityReplies === "boolean"
+        ? { communityReplies: s.notifications.communityReplies }
+        : {}),
     };
   }
   if (s.aiToughness !== undefined) {
@@ -148,11 +198,22 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
  * is active); "Keep me logged in" extends the lifetime to 30 days.
  */
 function signToken(
-  user: { id: number; email: string },
+  user: {
+    id: number;
+    email: string;
+    accountType?: "user" | "organization";
+    orgCode?: string;
+  },
   rememberMe = false,
 ): string {
   return jwt.sign(
-    { id: user.id, email: user.email, rememberMe },
+    {
+      id: user.id,
+      email: user.email,
+      rememberMe,
+      accountType: user.accountType ?? "user",
+      ...(user.orgCode ? { orgCode: user.orgCode } : {}),
+    },
     config.jwtSecret,
     { expiresIn: rememberMe ? "30d" : "24h" },
   );
@@ -166,7 +227,12 @@ export const refreshToken = (req: Request, res: Response) => {
   const user = req.user!;
   res.status(200).json({
     token: signToken(
-      { id: user.id, email: user.email },
+      {
+        id: user.id,
+        email: user.email,
+        accountType: user.accountType,
+        orgCode: user.orgCode,
+      },
       user.rememberMe === true,
     ),
   });
@@ -435,24 +501,39 @@ export const orgLogin = async (req: Request, res: Response) => {
       .select("*")
       .eq("email", cleanEmail)
       .maybeSingle();
-    console.log(user);
     if (error || !user) {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    // Compare hashed password
-    // const isValidPassword = await bcrypt.compare(password, user.password);
-    // if (!isValidPassword) {
-    //   return res.status(401).json({ error: "Invalid credentials." });
-    // }
+    if (
+      typeof user.password !== "string" ||
+      !BCRYPT_HASH_PATTERN.test(user.password)
+    ) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
+
+    if (user.org_code == null) {
+      console.error(`Organization ${user.id} has no org_code and cannot sign in.`);
+      return res.status(503).json({ error: "Organization account is not configured." });
+    }
 
     const token = signToken(
-      { id: user.id, email: user.email },
+      {
+        id: user.id,
+        email: user.email,
+        accountType: "organization",
+        orgCode: String(user.org_code),
+      },
       rememberMe === true,
     );
 
     res.status(200).json({
-      user: toPublicUser(user),
+      user: toPublicOrganization(user),
       token,
     });
   } catch (error) {
@@ -1063,29 +1144,51 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
  * Permanently delete a user and associated data (App Store 5.1.1(v) / Google Play).
  */
 async function purgeUserAccount(userId: number): Promise<void> {
-  const { data: decks } = await supabase
+  const { data: decks, error: decksReadError } = await supabase
     .from("decks")
     .select("file_url")
     .eq("user_id", userId);
-  const { data: sessions } = await supabase
+  const { data: sessions, error: sessionsReadError } = await supabase
     .from("sessions")
     .select("video_url")
     .eq("user_id", userId);
 
-  const { data: userRow } = await supabase
+  const { data: userRow, error: userReadError } = await supabase
     .from("users")
     .select("avatar_url")
     .eq("id", userId)
     .maybeSingle();
 
+  if (decksReadError || sessionsReadError || userReadError || !userRow) {
+    throw new Error("ACCOUNT_DELETE_DISCOVERY_FAILED");
+  }
+
   const mediaPaths = new Set<string>();
+  const localPaths = new Set<string>();
   for (const deck of decks || []) {
-    const path = storagePathFromUrl(deck.file_url); // main media bucket
-    if (path) mediaPaths.add(path);
+    if (typeof deck.file_url === "string" && deck.file_url.startsWith("/uploads/")) {
+      const name = deck.file_url.slice("/uploads/".length);
+      if (name && name === path.basename(name)) localPaths.add(path.join(uploadDir, name));
+      continue;
+    }
+    const objectPath = storagePathFromUrl(deck.file_url);
+    if (objectPath?.startsWith("decks/") && !objectPath.includes("..")) {
+      mediaPaths.add(objectPath);
+    }
   }
   for (const session of sessions || []) {
-    const path = storagePathFromUrl(session.video_url); // main media bucket
-    if (path) mediaPaths.add(path);
+    if (typeof session.video_url === "string" && session.video_url.startsWith("/uploads/")) {
+      const name = session.video_url.slice("/uploads/".length);
+      if (
+        name.startsWith(`rec_${userId}_`) &&
+        name === path.basename(name)
+      ) localPaths.add(path.join(uploadDir, name));
+      continue;
+    }
+    const objectPath = storagePathFromUrl(session.video_url);
+    if (objectPath?.startsWith("pitches/") && !objectPath.includes("..")) {
+      mediaPaths.add(objectPath);
+    }
   }
 
   // Avatars live in a SEPARATE public bucket — extract with that bucket's marker
@@ -1101,10 +1204,7 @@ async function purgeUserAccount(userId: number): Promise<void> {
       .from(config.storageBucket)
       .remove([...mediaPaths]);
     if (storageError) {
-      console.warn(
-        "⚠️ Media storage cleanup partial failure:",
-        storageError.message,
-      );
+      throw new Error(`ACCOUNT_DELETE_MEDIA_FAILED:${storageError.message}`);
     }
   }
   if (avatarPaths.length > 0) {
@@ -1112,10 +1212,15 @@ async function purgeUserAccount(userId: number): Promise<void> {
       .from(config.avatarBucket)
       .remove(avatarPaths);
     if (avatarError) {
-      console.warn(
-        "⚠️ Avatar storage cleanup partial failure:",
-        avatarError.message,
-      );
+      throw new Error(`ACCOUNT_DELETE_AVATAR_FAILED:${avatarError.message}`);
+    }
+  }
+
+  for (const localPath of localPaths) {
+    try {
+      await fs.promises.rm(localPath, { force: true });
+    } catch (error) {
+      throw new Error(`ACCOUNT_DELETE_LOCAL_MEDIA_FAILED:${String(error)}`);
     }
   }
 

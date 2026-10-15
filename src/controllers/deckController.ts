@@ -30,9 +30,6 @@ const MIN_AUDITABLE_TEXT_CHARS = 200;
  *   • anything else (e.g. a renamed .pptx = `PK…`)  → null → 415
  */
 export function resolveDeckType(buffer: Buffer, mimetype: string | undefined): string | null {
-  if (mimetype === "application/pdf" || mimetype === "text/plain" || mimetype === "text/markdown") {
-    return mimetype;
-  }
   const head = buffer.subarray(0, Math.min(buffer.length, 1024));
   // Known NON-deck binary containers, rejected before any text heuristic can
   // misfire on them: PK = zip (pptx/docx/xlsx), the OLE compound header = legacy
@@ -49,10 +46,18 @@ export function resolveDeckType(buffer: Buffer, mimetype: string | undefined): s
   if (head.length >= 5 && head.subarray(0, 5).toString("latin1") === "%PDF-") {
     return "application/pdf";
   }
-  if (head.length > 0 && !head.includes(0)) {
-    const decoded = head.toString("utf-8");
-    // � appears when Buffer.toString hits invalid UTF-8 — binary content.
-    if (!decoded.includes("�")) return "text/plain";
+  if (buffer.length > 0 && !head.includes(0)) {
+    try {
+      // Fatal decoding rejects invalid byte sequences instead of silently
+      // replacing them. Reject control-heavy data that only looks textual.
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      const controls = decoded.match(/[\u0001-\u0008\u000B\u000C\u000E-\u001F]/g)?.length ?? 0;
+      if (controls <= Math.max(4, decoded.length * 0.001)) {
+        return mimetype === "text/markdown" ? "text/markdown" : "text/plain";
+      }
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -159,6 +164,16 @@ export const uploadDeck = async (req: Request, res: Response) => {
 
     if (dbError) {
       console.error("❌ Supabase insertion failed in uploadDeck:", dbError);
+      // The object was created before its owning row. Roll it back so a DB
+      // outage cannot accumulate private, untracked files.
+      if (publicUrl.startsWith("/uploads/")) {
+        const localName = publicUrl.slice("/uploads/".length);
+        if (localName === path.basename(localName)) {
+          await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+        }
+      } else {
+        await supabase.storage.from(config.storageBucket).remove([filePath]);
+      }
       return res.status(500).json({ error: "Failed to save deck to database" });
     }
 
@@ -490,6 +505,47 @@ export const deleteDeck = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     if (!userId) {
       return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: deck, error: readError } = await supabase
+      .from("decks")
+      .select("id, file_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (readError) {
+      console.error("❌ Supabase query error in deleteDeck:", readError);
+      return res.status(500).json({ error: "Failed to delete deck" });
+    }
+    if (!deck) return res.status(404).json({ error: "Deck not found" });
+
+    const stored = typeof deck.file_url === "string" ? deck.file_url : "";
+    if (stored.startsWith("/uploads/")) {
+      const localName = stored.slice("/uploads/".length);
+      if (!localName || localName !== path.basename(localName)) {
+        return res.status(500).json({ error: "Deck has an invalid storage reference" });
+      }
+      try {
+        await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+      } catch (storageError) {
+        console.error("❌ Local deck cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the deck file. Please retry." });
+      }
+    } else {
+      const objectPath = storagePathFromUrl(stored);
+      if (objectPath) {
+        if (!objectPath.startsWith("decks/") || objectPath.includes("..")) {
+          return res.status(500).json({ error: "Deck has an invalid storage reference" });
+        }
+        const { error: storageError } = await supabase.storage
+          .from(config.storageBucket)
+          .remove([objectPath]);
+        if (storageError) {
+          console.error("❌ Deck object cleanup failed:", storageError);
+          return res.status(503).json({ error: "Could not remove the deck file. Please retry." });
+        }
+      }
     }
 
     const { error } = await supabase

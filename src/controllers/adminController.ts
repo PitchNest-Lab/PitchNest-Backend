@@ -12,12 +12,12 @@ const safeParseReport = (val: any) => {
 };
 
 /**
- * Item C — internal transcript review (admin-only, gated by adminMiddleware).
+ * Internal transcript review for an authenticated, revocable staff account.
  *
  * Returns full session transcripts ACROSS ALL USERS so the team can study how the
  * AI converses across pitch industries. This is intentionally unscoped (no
  * user_id filter) — that is the whole point of the endpoint, and it is why it
- * sits behind the shared admin key, never the normal auth path.
+ * sits behind authMiddleware + requireStaff.
  *
  * Founder users have no route to this; regular session endpoints stay owner-
  * scoped. The response is deliberately minimal: transcript text + the metadata
@@ -62,6 +62,15 @@ export const listAllTranscripts = async (req: Request, res: Response) => {
         evaluationStatus: report.evaluationStatus || null,
         transcript: Array.isArray(report.transcript) ? report.transcript : [],
       };
+    });
+
+    // Keep an access record without copying confidential transcript content
+    // into application logs.
+    console.info("Staff transcript review", {
+      staffUserId: req.user?.id,
+      resultCount: rows.length,
+      offset,
+      mode: mode || null,
     });
 
     res.json({ count: rows.length, limit, offset, transcripts: rows });

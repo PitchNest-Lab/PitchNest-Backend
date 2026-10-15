@@ -42,3 +42,15 @@ CREATE TABLE IF NOT EXISTS trial_email_log (
 -- for the job itself.
 CREATE INDEX IF NOT EXISTS idx_trial_email_log_sent_at
   ON trial_email_log (sent_at DESC);
+
+-- Raw-SQL tables in Supabase do not automatically inherit a deny policy.
+-- Reminder state contains user ids and can suppress lifecycle email, so it is
+-- service-role-only just like the other backend-owned ledgers.
+ALTER TABLE trial_email_log ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "trial_email_log_deny_direct" ON trial_email_log;
+CREATE POLICY "trial_email_log_deny_direct" ON trial_email_log
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+
+REVOKE ALL ON TABLE trial_email_log FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE trial_email_log TO service_role;

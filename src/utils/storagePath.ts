@@ -43,3 +43,42 @@ export function storagePathFromUrl(
   // Otherwise treat it as an already-bare object path (e.g. "decks/123_x.pdf").
   return trimmed.split("?")[0] || null;
 }
+
+/** Storage key for a new session recording, scoped to its owner. */
+export function recordingObjectPath(userId: number, safeName: string): string {
+  return `pitches/${userId}/${Date.now()}_${safeName}`;
+}
+
+/** Local-fallback file name for a new session recording, scoped to its owner. */
+export function recordingLocalName(userId: number, safeName: string): string {
+  return `rec_${userId}_${Date.now()}_${safeName}`;
+}
+
+// Matches sanitizeUploadName output: no slashes, so no path traversal; ".."
+// is additionally refused below.
+const SAFE_NAME = "[A-Za-z0-9._-]{1,200}";
+
+/**
+ * True only for a recording reference this user's own upload could have
+ * produced: "pitches/<userId>/<ts>_<name>" in storage, or
+ * "/uploads/rec_<userId>_<ts>_<name>" on local fallback.
+ *
+ * The WebSocket's set_video_url message is client input. Without this check a
+ * founder could point their own session at another user's deck or recording
+ * ("decks/…", "/uploads/<someone else's file>") and have the recording
+ * endpoint sign it for them with the service role.
+ */
+export function isOwnRecordingReference(value: unknown, userId: number): boolean {
+  if (typeof value !== "string" || !Number.isInteger(userId) || userId <= 0) return false;
+  const storage = new RegExp(`^pitches/${userId}/\\d{10,16}_${SAFE_NAME}$`);
+  const local = new RegExp(`^/uploads/rec_${userId}_\\d{10,16}_${SAFE_NAME}$`);
+  return (storage.test(value) || local.test(value)) && !value.includes("..");
+}
+
+/**
+ * True for any value the recording endpoint may sign: a recording object path
+ * ("pitches/…", including legacy unscoped keys). Never a deck or avatar path.
+ */
+export function isRecordingObjectPath(objectPath: string | null): boolean {
+  return typeof objectPath === "string" && objectPath.startsWith("pitches/") && !objectPath.includes("..");
+}

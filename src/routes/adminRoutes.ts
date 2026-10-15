@@ -1,12 +1,26 @@
 import { Router } from "express";
-import { adminMiddleware } from "../middleware/adminMiddleware.ts";
+import rateLimit from "express-rate-limit";
+import { authMiddleware, requireStaff } from "../middleware/authMiddleware.ts";
 import { listAllTranscripts } from "../controllers/adminController.ts";
 
-// Internal admin routes (Item C). Gated by the shared ADMIN_API_KEY via
-// adminMiddleware — NOT the normal user auth. Disabled (404) when the key is
-// unset. Keep this surface minimal: read-only transcript review only.
+// Keep this sensitive surface minimal. Access requires a verified user whose
+// staff flag is re-read from the database on every request, so it is revocable.
 const router = Router();
 
-router.get("/transcripts", adminMiddleware, listAllTranscripts);
+const transcriptReadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many transcript requests. Please try again later." },
+});
+
+router.get(
+  "/transcripts",
+  authMiddleware,
+  requireStaff,
+  transcriptReadLimiter,
+  listAllTranscripts,
+);
 
 export default router;
