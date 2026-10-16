@@ -12,11 +12,26 @@ import {
 import { supabase } from "../config/supabase.ts";
 import {
   createCheckout,
+  isCheckoutTxRef,
   verifyTransaction,
+  verifyTransactionDetails,
   verifyWebhookSignature,
   grantAccess,
   markPaymentFailed,
 } from "../services/flutterwaveService.ts";
+import {
+  cancelUserSubscription,
+  ensureProviderPlan,
+  getActiveSubscription,
+  handleProviderCancellation,
+  initialGrantDays,
+  offerFor,
+  retryPendingProviderCancels,
+  settleRenewal,
+  startSubscriptionAfterPayment,
+  subscriptionViewFor,
+  SubscriptionError,
+} from "../services/subscriptionService.ts";
 
 /**
  * The featured price (Pro, monthly) plus the full purchasable catalog.
@@ -24,7 +39,8 @@ import {
  * `price` is kept for backward-compatibility with surfaces that render a single
  * headline number; `catalog` lists every (plan, term) SKU the checkout will
  * honour. Both come from the same server-side resolver, so display can never
- * drift from what is charged.
+ * drift from what is charged. `offer.freeMonths` is what a first subscription
+ * adds on top, so the pricing page can only promise what checkout records.
  */
 function pricingPayload() {
   const featured = resolvePlanPrice("pro", "monthly");
@@ -35,13 +51,16 @@ function pricingPayload() {
       days: featured.days,
     },
     catalog: listBillingCatalog(),
+    offer: { freeMonths: config.firstSubscriptionFreeMonths },
   };
 }
 
+const PLAN_RANK: Record<string, number> = { prep: 1, pro: 2, founder: 3, enterprise: 4 };
+
 /**
- * Parses the requested SKU from a checkout request body, defaulting to the
- * headline Pro monthly. Anything unrecognised falls back rather than 400-ing, so
- * a stale client can still buy the default plan.
+ * Parses the requested SKU from a checkout request body. Omitted fields default
+ * to Pro monthly; explicit unknown values are rejected rather than silently
+ * charging the caller for a different product.
  */
 function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } | null {
   const rawPlan = body?.plan;
@@ -104,7 +123,7 @@ export const getPlan = async (req: Request, res: Response) => {
       try {
         const { data: pendingPayments } = await supabase
           .from("payments")
-          .select("tx_ref")
+          .select("tx_ref, kind")
           .eq("user_id", userId)
           .eq("status", "pending")
           .order("created_at", { ascending: false })
@@ -115,6 +134,9 @@ export const getPlan = async (req: Request, res: Response) => {
             const verified = await verifyTransaction(pay.tx_ref);
             if (verified && (verified.status === "successful" || verified.status === "succeeded")) {
               await grantAccess(verified);
+              if ((pay as any).kind === "subscription_initial") {
+                await startSubscriptionAfterPayment(pay.tx_ref, userId, null);
+              }
               console.log(`✅ [Dev Auto-Sync] Verified local test transaction ${pay.tx_ref} — granted Pro access!`);
 
               // Refresh user status
@@ -140,6 +162,20 @@ export const getPlan = async (req: Request, res: Response) => {
 
     const trial = isTrialActive((user as any)?.trial_expires_at, (user as any)?.trial_status, (user as any)?.trial_started_at);
     const effectivePlan = active ? ((user as any).plan as string) : (trial.active ? "pro" : "free");
+    const unlimited = active && !expiry;
+
+    // A plan switch or an earlier failed cancel can leave a retired renewal
+    // still live at Flutterwave; every plan read is a chance to finish it.
+    if (hasBillingConfig()) await retryPendingProviderCancels(userId);
+
+    let subscription = null;
+    let offer = { freeMonths: config.firstSubscriptionFreeMonths, eligible: false };
+    try {
+      [subscription, offer] = await Promise.all([subscriptionViewFor(userId), offerFor(userId, unlimited)]);
+    } catch (lookupError: any) {
+      // Plan status still answers; the extras are simply not offered.
+      console.error("Subscription lookup failed:", lookupError?.message || lookupError);
+    }
 
     res.json({
       plan: effectivePlan,
@@ -148,7 +184,9 @@ export const getPlan = async (req: Request, res: Response) => {
       trialDaysRemaining: trial.daysRemaining,
       trialExpiresAt: (user as any)?.trial_expires_at ? new Date((user as any).trial_expires_at).toISOString() : null,
       billingEnabled: hasBillingConfig(),
+      subscription,
       ...pricingPayload(),
+      offer,
     });
   } catch (err: any) {
     console.error("❌ getPlan:", err?.message || err);
@@ -160,8 +198,7 @@ export const getPlan = async (req: Request, res: Response) => {
  * POST /api/billing/checkout — start a purchase of a specific SKU.
  *
  * The body may name `plan` ("prep" | "pro") and `term` ("monthly" | "annual");
- * both default to the headline Pro monthly and unrecognised values fall back
- * rather than erroring, so a stale client still works. The PRICE for the SKU is
+ * both default to the headline Pro monthly when omitted. The PRICE for the SKU is
  * resolved server-side inside createCheckout — the body never carries an amount.
  */
 export const startCheckout = async (req: Request, res: Response) => {
@@ -205,6 +242,40 @@ export const startCheckout = async (req: Request, res: Response) => {
       return res.status(400).json({ error: "Please choose a valid plan and billing term." });
     }
 
+    let current: Awaited<ReturnType<typeof getActiveSubscription>>;
+    let offer: Awaited<ReturnType<typeof offerFor>>;
+    try {
+      [current, offer] = await Promise.all([getActiveSubscription(userId), offerFor(userId, false)]);
+    } catch (lookupError: any) {
+      console.error("Checkout subscription lookup failed:", lookupError?.message || lookupError);
+      return res.status(503).json({ error: "Checkout is temporarily unavailable." });
+    }
+
+    if (current && current.plan === selection.plan && current.term === selection.term) {
+      return res.status(409).json({
+        error: "already_subscribed",
+        message: "You're already subscribed to this plan.",
+      });
+    }
+
+    // Paid access stacks by rank (grant_pro_access keeps the higher plan), so a
+    // cheaper plan bought now would renew at the lower price while the higher
+    // one keeps applying. Moving down waits until the current period ends.
+    const expiry = (user as any).plan_expires_at ? new Date((user as any).plan_expires_at) : null;
+    const currentRank = expiry && expiry.getTime() > Date.now() ? PLAN_RANK[String((user as any).plan)] ?? 0 : 0;
+    if (currentRank > (PLAN_RANK[selection.plan] ?? 0)) {
+      return res.status(409).json({
+        error: "downgrade_unavailable",
+        message: "Cancel your current plan first. You can switch once its paid period ends.",
+      });
+    }
+
+    const paymentPlanId = await ensureProviderPlan(selection.plan, selection.term);
+    const freeMonths = offer.eligible ? offer.freeMonths : 0;
+    const now = new Date();
+    const grantedDays = initialGrantDays(selection.term, freeMonths, now);
+    const bonusDays = grantedDays - initialGrantDays(selection.term, 0, now);
+
     const session = await createCheckout(
       {
         id: (user as any).id,
@@ -212,6 +283,7 @@ export const startCheckout = async (req: Request, res: Response) => {
         name: (user as any).name,
       },
       selection,
+      { paymentPlanId, grantedDays, bonusDays },
     );
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
@@ -277,11 +349,20 @@ export const handleWebhook = async (req: Request, res: Response) => {
   }
 
   try {
+    const event = String(payload?.event ?? payload?.["event.type"] ?? "").toLowerCase();
     const data = payload?.data ?? {};
-    const claimedTxRef: string | undefined = data.tx_ref;
-    const transactionId = data.id;
 
-    if (!transactionId) {
+    // Flutterwave stopped renewals (cancelled from its reminder email, or after
+    // failed charges). Re-checked against the API before anything changes.
+    if (event === "subscription.cancelled") {
+      const outcome = await handleProviderCancellation(data);
+      return res.status(200).json({ received: true, outcome });
+    }
+
+    const claimedTxRef: string | undefined = data.tx_ref;
+    const transactionId = Number(data.id);
+
+    if (!Number.isSafeInteger(transactionId) || transactionId <= 0) {
       console.warn("⚠️ Billing webhook carried no transaction id; ignoring.");
       return res.status(200).json({ received: true, ignored: true });
     }
@@ -292,7 +373,7 @@ export const handleWebhook = async (req: Request, res: Response) => {
     // failed straight from the payload, which let anyone holding the shared hash
     // (e.g. another integration on the same Flutterwave account) flip arbitrary
     // pending rows to failed by naming their tx_ref.
-    const verified = await verifyTransaction(transactionId);
+    const verified = await verifyTransactionDetails(transactionId);
     if (!verified) {
       console.error(
         `❌ Could not verify transaction ${transactionId} (claimed ref ${claimedTxRef ?? "none"}); NOT granting.`,
@@ -300,28 +381,38 @@ export const handleWebhook = async (req: Request, res: Response) => {
       return res.status(503).json({ error: "verification unavailable" });
     }
 
+    const ours = isCheckoutTxRef(verified.txRef);
     if (verified.status !== "successful" && verified.status !== "succeeded") {
       console.log(`ℹ️ Transaction ${verified.txRef} verified as '${verified.status}'; not granting.`);
-      await markPaymentFailed(verified.txRef);
+      if (ours) await markPaymentFailed(verified.txRef);
       return res.status(200).json({ received: true });
     }
 
     // Guard against a mismatched or short payment: a webhook could reference a
     // real but cheaper transaction. Compare against what we recorded at
     // checkout, not against the payload.
-    const { data: expected, error: expectedError } = await supabase
-      .from("payments")
-      .select("amount, currency")
-      .eq("tx_ref", verified.txRef)
-      .maybeSingle();
+    const { data: expected, error: expectedError } = ours
+      ? await supabase
+          .from("payments")
+          .select("user_id, amount, currency, status, provider_ref, kind")
+          .eq("tx_ref", verified.txRef)
+          .maybeSingle()
+      : { data: null, error: null };
 
     if (expectedError) {
       console.error(`❌ Payment lookup failed for ${verified.txRef}:`, expectedError.message);
       return res.status(503).json({ error: "settlement unavailable" });
     }
-    if (!expected) {
-      console.warn(`⚠️ Ignoring verified transaction with unknown reference ${verified.txRef}.`);
-      return res.status(200).json({ received: true, ignored: true });
+
+    // Not a checkout we started, or a second charge on one we already settled:
+    // a renewal Flutterwave raised for a subscription.
+    const settledEarlier =
+      expected && (expected as any).status === "successful" &&
+      String((expected as any).provider_ref ?? "") !== verified.providerRef;
+    if (!expected || settledEarlier) {
+      const outcome = await settleRenewal(verified, expected ? Number((expected as any).user_id) : null);
+      console.log(`↻ Renewal ${verified.providerRef}: ${outcome}`);
+      return res.status(200).json({ received: true, outcome });
     }
 
     const shortPaid = Number(verified.amount) < Number((expected as any).amount);
@@ -331,10 +422,16 @@ export const handleWebhook = async (req: Request, res: Response) => {
       console.error(
         `❌ Payment mismatch for ${verified.txRef}: expected ${(expected as any).amount} ${(expected as any).currency}, got ${verified.amount} ${verified.currency}. NOT granting.`,
       );
-      return res.status(200).json({ received: true, ignored: true });
+      await markPaymentFailed(verified.txRef);
+      return res.status(200).json({ received: true, rejected: true });
     }
 
     const granted = await grantAccess(verified);
+    // Also on a replay: recording the subscription is idempotent, and this
+    // finishes the job if the first delivery failed after granting.
+    if ((expected as any).kind === "subscription_initial") {
+      await startSubscriptionAfterPayment(verified.txRef, Number((expected as any).user_id), verified.customerEmail);
+    }
     console.log(
       granted
         ? `✅ Pro granted for ${verified.txRef} (${verified.amount} ${verified.currency})`
@@ -344,5 +441,33 @@ export const handleWebhook = async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error("❌ Billing webhook processing failed:", err?.message || err);
     return res.status(503).json({ error: "settlement unavailable" });
+  }
+};
+
+/**
+ * POST /api/billing/subscription/cancel — turn off auto-renew.
+ *
+ * Only future charges stop. What the user has already paid for runs to the end
+ * of its period, so this never touches users.plan_expires_at.
+ */
+export const cancelSubscription = async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: "Authentication required" });
+  if (!hasBillingConfig()) {
+    return res.status(503).json({ error: "Billing is unavailable right now. Please contact support." });
+  }
+
+  try {
+    const subscription = await cancelUserSubscription(userId);
+    return res.json({ subscription });
+  } catch (err: any) {
+    if (err instanceof SubscriptionError && err.code === "NO_SUBSCRIPTION") {
+      return res.status(404).json({ error: "You don't have a plan that renews." });
+    }
+    if (err instanceof SubscriptionError) {
+      return res.status(502).json({ error: "Couldn't reach the payment provider. Please try again in a moment." });
+    }
+    console.error("❌ cancelSubscription:", err?.message || err);
+    return res.status(500).json({ error: "Couldn't cancel right now. Please try again." });
   }
 };

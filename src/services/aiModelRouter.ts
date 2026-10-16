@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { OpenAI, AzureOpenAI } from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { config } from "../config/env.ts";
@@ -139,7 +140,13 @@ let clientFactory: (model: ResolvedModel) => OpenAI = buildClient;
 const clients = new Map<string, OpenAI>();
 
 function clientKey(model: ResolvedModel): string {
-  return `${model.endpoint}|${model.deployment}|${model.apiKey}`;
+  // Never duplicate a provider credential into a long-lived Map key. The
+  // fingerprint keeps clients with rotated keys distinct without retaining the
+  // plaintext secret anywhere beyond the SDK client that actually needs it.
+  const credentialFingerprint = createHash("sha256")
+    .update(model.apiKey || config.openAiApiKey || "")
+    .digest("hex");
+  return `${model.endpoint}|${model.deployment}|${credentialFingerprint}`;
 }
 
 export function clientFor(model: ResolvedModel): OpenAI {

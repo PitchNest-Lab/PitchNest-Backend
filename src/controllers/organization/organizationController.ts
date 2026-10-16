@@ -1,5 +1,7 @@
 import { Request, Response } from "express";
 import { supabase } from "../../config/supabase.ts";
+import { config } from "../../config/env.ts";
+import { safeAvatarUrl } from "../../utils/storagePath.ts";
 import {
   pitchScoreFromReport,
   isCompletePitch,
@@ -8,31 +10,83 @@ import {
   pitchStatusFromSession,
 } from "../../utils/scoring.ts";
 
-const getOrgUsers = async (orgId: string) => {
-  const { data: users } = await supabase.from("users").select("*").eq("orgCode", orgId);
-  return users ?? [];
-};
+const ANALYTICS_CACHE_MS = 20_000;
+const MAX_ANALYTICS_CACHE_ENTRIES = 25;
+const DATABASE_PAGE_SIZE = 1_000;
+const MAX_ANALYTICS_ROWS = 25_000;
+const analyticsCache = new Map<string, { expiresAt: number; value: Promise<any[]> }>();
+
+async function cachedRows(key: string, load: () => Promise<any[]>): Promise<any[]> {
+  const now = Date.now();
+  const existing = analyticsCache.get(key);
+  if (existing && existing.expiresAt > now) return existing.value;
+  if (analyticsCache.size >= MAX_ANALYTICS_CACHE_ENTRIES) {
+    const oldest = analyticsCache.keys().next().value;
+    if (oldest) analyticsCache.delete(oldest);
+  }
+  const value = load().catch((error) => {
+    analyticsCache.delete(key);
+    throw error;
+  });
+  analyticsCache.set(key, { expiresAt: now + ANALYTICS_CACHE_MS, value });
+  return value;
+}
+
+async function loadAllPages(
+  makeQuery: (from: number, to: number) => PromiseLike<{ data: any[] | null; error: any }>,
+): Promise<any[]> {
+  const rows: any[] = [];
+  for (let from = 0; from < MAX_ANALYTICS_ROWS; from += DATABASE_PAGE_SIZE) {
+    const { data, error } = await makeQuery(from, from + DATABASE_PAGE_SIZE - 1);
+    if (error) throw error;
+    const page = data ?? [];
+    rows.push(...page);
+    if (page.length < DATABASE_PAGE_SIZE) return rows;
+  }
+  throw new Error(`Organization analytics exceeded the ${MAX_ANALYTICS_ROWS}-row safety limit.`);
+}
+
+const getOrgUsers = async (orgId: string) => cachedRows(`users:${orgId}`, async () => {
+  return loadAllPages((from, to) => supabase
+      .from("users")
+      .select("id, name, email, avatar_url, role, cohort, enrolled_at, created_at, last_active")
+      .eq("orgCode", orgId)
+      .order("id", { ascending: true })
+      .range(from, to));
+});
 
 const getOrgSessions = async (orgId: string, userIds: (string | number)[]) => {
   if (!userIds.length) return [];
-  const { data: sessions } = await supabase
-    .from("sessions")
-    .select("*")
-    .in("user_id", userIds)
-    .eq("org_id", orgId)
-    .eq("visibility", "organization")
-    .order("created_at", { ascending: false });
-  return sessions ?? [];
+  return cachedRows(`sessions:${orgId}`, async () => {
+    const memberIds = new Set(userIds.map(String));
+    const sessions = await loadAllPages((from, to) => supabase
+        // The view removes evaluation_report.transcript inside PostgreSQL, so
+        // organization analytics never transfer or cache founder transcripts.
+        .from("session_list_safe")
+        .select("id, user_id, created_at, timestamp, evaluation_report, business_name, mode, pitch_config, summary")
+        .eq("org_id", orgId)
+        .eq("visibility", "organization")
+        .order("created_at", { ascending: false })
+        .order("id", { ascending: false })
+        .range(from, to));
+    return sessions.filter((session: any) => memberIds.has(String(session.user_id))).map((session: any) => {
+      const report = session.evaluation_report && typeof session.evaluation_report === "object"
+        ? session.evaluation_report
+        : {};
+      return { ...session, evaluation_report: report };
+    });
+  });
 };
 
 // Your real org table is "Organizations" (plural), keyed by org_code, with a
 // "plan" column (not "plan_name") and no renewal_date — "validity" instead.
 const getOrg = async (orgId: string) => {
-  const { data: org } = await supabase
+  const { data: org, error } = await supabase
     .from("Organizations")
-    .select("*")
+    .select("id, created_at, org_code, org_name, org_users_capacity, org_users_enrolled, validity, plan, email, country, website_url, trial_started_at, trial_expires_at, trial_status")
     .eq("org_code", Number(orgId))
     .maybeSingle();
+  if (error) throw error;
   return org;
 };
 
@@ -46,7 +100,7 @@ export const orgDetails = async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Organization not found" });
     }
 
-    const baseUrl = process.env.APP_BASE_URL ?? "";
+    const baseUrl = config.appBaseUrl.replace(/\/+$/, "");
 
     res.status(200).json({
       data: {
@@ -65,7 +119,7 @@ export const orgDetails = async (req: Request, res: Response) => {
         trialStatus: org.trial_status ?? "Active",
         createdAt: org.created_at,
         // The link the QR code encodes and the text shown underneath it.
-        enrollLink: `${baseUrl}/signup/?referralCode=${org.org_code}`,
+        enrollLink: `${baseUrl}/signup?referralCode=${encodeURIComponent(String(org.org_code))}`,
       },
       message: "Organization details fetched successfully",
     });
@@ -297,7 +351,7 @@ export const founderDrill = async (req: Request, res: Response) => {
           memberId: String(u.id),
           name: u.name,
           email: u.email,
-          avatarUrl: u.avatar_url ?? null,
+          avatarUrl: safeAvatarUrl(u.avatar_url),
           cohort: u.cohort ?? "Unassigned",
           industry: latestConfig.industry ?? "SaaS",
           fundingStage: latestConfig.fundingStage ?? "Pre-seed",
@@ -344,7 +398,7 @@ export const memberList = async (req: Request, res: Response) => {
         id: String(u.id),
         name: u.name,
         email: u.email,
-        avatarUrl: u.avatar_url ?? null,
+        avatarUrl: safeAvatarUrl(u.avatar_url),
         role: u.role ?? "Founder",
         status: !u.enrolled_at ? "invited" : "active",
         seatAssigned: !!u.enrolled_at,
@@ -413,7 +467,13 @@ export const weeklyReport = async (req: Request, res: Response) => {
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
+    if (date !== undefined && (typeof date !== "string" || date.length > 32)) {
+      return res.status(400).json({ error: "date must be a valid date." });
+    }
     const anchor = date ? new Date(date) : new Date();
+    if (!Number.isFinite(anchor.getTime())) {
+      return res.status(400).json({ error: "date must be a valid date." });
+    }
     const start = new Date(anchor);
     start.setDate(anchor.getDate() - anchor.getDay());
     start.setHours(0, 0, 0, 0);
@@ -447,6 +507,9 @@ export const monthlyReport = async (req: Request, res: Response) => {
     const now = new Date();
     const y = year ?? now.getFullYear();
     const m = month ?? now.getMonth();
+    if (!Number.isInteger(y) || y < 2000 || y > 2100 || !Number.isInteger(m) || m < 0 || m > 11) {
+      return res.status(400).json({ error: "month and year are invalid." });
+    }
     const start = new Date(y, m, 1);
     const end = new Date(y, m + 1, 1);
 

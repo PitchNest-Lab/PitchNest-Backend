@@ -69,3 +69,21 @@ server.listen(config.port, "0.0.0.0", async () => {
   await checkApiKeyStatus();
   await checkTtsStatus();
 });
+
+let shuttingDown = false;
+function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n${signal} received; draining HTTP and WebSocket connections.`);
+  for (const socket of wss.clients) socket.close(1012, "Service restarting");
+  wss.close();
+  server.close((error) => {
+    if (error) console.error("Server shutdown error:", error);
+    process.exit(error ? 1 : 0);
+  });
+  const forcedExit = setTimeout(() => process.exit(1), 25_000);
+  forcedExit.unref?.();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));

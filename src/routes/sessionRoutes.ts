@@ -10,6 +10,7 @@ import {
   getPitchAttempts,
   enableSessionShare,
   disableSessionShare,
+  attachSessionRecording,
 } from "../controllers/sessionController.ts";
 
 const router = Router();
@@ -37,6 +38,7 @@ router.get("/:id/pdf", authMiddleware, pdfLimiter, generateSessionPDF);
 // to. Both are owner-only and must stay ABOVE the bare "/:id" route so Express
 // doesn't match them as a session id.
 router.get("/:id/recording", authMiddleware, getSessionRecording);
+router.put("/:id/recording", authMiddleware, attachSessionRecording);
 router.get("/:id/attempts", authMiddleware, getPitchAttempts);
 // Public sharing is opt-in and one boolean write either way; no limiter beyond
 // the global one, since only the owner can call these.

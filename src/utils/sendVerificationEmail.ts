@@ -3,6 +3,7 @@ import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
 import { hashAuthToken } from "./authTokens.ts";
+import { withTimeout } from "./withTimeout.ts";
 
 const resend =
   config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
@@ -30,7 +31,7 @@ export async function sendVerificationEmail(userId: string | number, email: stri
     .eq("user_id", userId);
 
   // 3. Save new token to Supabase
-  let { error } = await supabase
+  const { error } = await supabase
     .from("email_verification_tokens")
     .insert({
       user_id: userId,
@@ -39,19 +40,6 @@ export async function sendVerificationEmail(userId: string | number, email: stri
       expires_at: expiresAt,
       attempts: 0,
     });
-
-  // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
-  // fall back to storing just the high-entropy link token so signup and the
-  // emailed LINK keep working. Manual 6-digit entry needs the migration.
-  if (error && /column|schema/i.test(error.message || "")) {
-    console.warn(
-      "⚠️ email_verification_tokens is missing the code/attempts columns — run migration 0012. " +
-        "Falling back to link-only verification until then.",
-    );
-    ({ error } = await supabase
-      .from("email_verification_tokens")
-      .insert({ user_id: userId, token: tokenDigest, expires_at: expiresAt }));
-  }
 
   if (error) throw new Error("Failed to save token");
 
@@ -63,9 +51,10 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   // Log OTP in development so local testing never gets blocked by email deliverability / DNS
   if (config.nodeEnv !== "production") {
     console.log(`\n======================================================`);
-    console.log(`✉️  [LOCAL DEV OTP] Email: ${email}`);
-    console.log(`🔑 Verification Code: ${code}`);
-    console.log(`🔗 Direct Verify URL: ${verifyUrl}`);
+    // Never print the address or high-entropy link token. The browser already
+    // retains the address on the verification screen; only the local test code
+    // is needed to unblock development.
+    console.log(`🔑 [LOCAL DEV OTP] Verification Code: ${code}`);
     console.log(`======================================================\n`);
   }
 
@@ -77,12 +66,13 @@ export async function sendVerificationEmail(userId: string | number, email: stri
   }
 
   try {
-    const { data, error } = await resend.emails.send({
-      from: config.emailFrom,
-      replyTo: config.emailReplyTo,
-      to: email,
-      subject: "Verify your PitchNest account",
-      html: `
+    const { error } = await withTimeout(
+      resend.emails.send({
+        from: config.emailFrom,
+        replyTo: config.emailReplyTo,
+        to: email,
+        subject: "Verify your PitchNest account",
+        html: `
         <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:16px;background:#fff">
           <h2 style="color:#111827;font-size:24px;margin-bottom:8px">Verify your email</h2>
           <p style="color:#4b5563;font-size:16px;line-height:24px;margin-bottom:24px">
@@ -107,8 +97,13 @@ export async function sendVerificationEmail(userId: string | number, email: stri
             Link and code expire in 24 hours. If you didn't sign up, ignore this.
           </p>
         </div>
-      `,
-    });
+        `,
+      }, {
+        idempotencyKey: `verification/${userId}/${tokenDigest.slice(0, 32)}`,
+      }),
+      15_000,
+      "Verification email request",
+    );
 
     if (error) {
       throw new Error(error.message);

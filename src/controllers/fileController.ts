@@ -3,6 +3,21 @@ import path from "path";
 import fs from "fs";
 import { supabase } from "../config/supabase.ts";
 import { uploadDir, verifyLocalFileToken } from "../services/storageService.ts";
+import { config } from "../config/env.ts";
+import { allowedBrowserOrigins } from "../config/origins.ts";
+
+function allowedFrameAncestors(): string {
+  const values = new Set(["'self'"]);
+  for (const candidate of [config.clientUrl, ...allowedBrowserOrigins()]) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === "https:" || url.protocol === "http:") values.add(url.origin);
+    } catch {
+      // Invalid deployment values are ignored rather than injected into CSP.
+    }
+  }
+  return [...values].join(" ");
+}
 
 /**
  * S7: token-gated delivery for LOCAL-FALLBACK files.
@@ -107,12 +122,20 @@ export const getLocalFile = async (req: Request, res: Response) => {
   // Token is in the URL (logs, history, referrers) — never cache it. sendFile
   // sets Content-Type from the extension and supports Range requests.
   res.setHeader("Cache-Control", "private, no-store");
-  res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'");
   res.setHeader("X-Content-Type-Options", "nosniff");
   const ext = path.extname(name).toLowerCase();
   if (ownedKind === "deck") {
+    // Helmet's global SAMEORIGIN would block a PDF served by the API from the
+    // separately hosted frontend. The capability token and DB ownership check
+    // provide access control; CSP limits embedding to configured app origins.
+    res.removeHeader("X-Frame-Options");
+    res.setHeader(
+      "Content-Security-Policy",
+      `sandbox; default-src 'none'; frame-ancestors ${allowedFrameAncestors()}`,
+    );
     res.type(ext === ".pdf" ? "application/pdf" : "text/plain; charset=utf-8");
   } else {
+    res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'");
     const audioTypes: Record<string, string> = {
       ".webm": "audio/webm",
       ".ogg": "audio/ogg",

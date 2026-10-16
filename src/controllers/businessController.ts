@@ -16,6 +16,7 @@ import {
   storeDraftMedia,
 } from "../services/businessMediaService.ts";
 import { ensureFounderHandle, handlesForUsers } from "../services/founderService.ts";
+import { safeAvatarUrl } from "../utils/storagePath.ts";
 
 export const BUSINESS_TYPES = [
   "software",
@@ -177,7 +178,11 @@ export function validateBusinessInput(
   if (typeof values.website_url === "string") {
     try {
       const parsed = new URL(values.website_url);
-      if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+      if (
+        (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+        parsed.username ||
+        parsed.password
+      ) {
         errors.push("websiteUrl must use http or https.");
       }
     } catch {
@@ -776,7 +781,7 @@ export async function listBusinessMembers(req: Request, res: Response) {
       return {
         userId: membership.user_id,
         name: user?.name ?? "Member",
-        avatarUrl: user?.avatar_url ?? null,
+        avatarUrl: safeAvatarUrl(user?.avatar_url),
         ...(maySeeEmail ? { email: user?.email ?? null } : {}),
         role: membership.role,
         status: membership.status,

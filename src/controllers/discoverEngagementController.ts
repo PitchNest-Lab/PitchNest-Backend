@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
+import { safeAvatarUrl } from "../utils/storagePath.ts";
 import { cleanPublicText, stripInvisible, validatePublicText } from "../utils/publicText.ts";
 import { logEvent } from "../services/eventService.ts";
 
@@ -59,16 +60,6 @@ export function normalizeReportDetails(raw: unknown): { details: string | null; 
 export function normalizeSlug(value: unknown): string | null {
   const slug = typeof value === "string" ? value.trim().toLowerCase().slice(0, 80) : "";
   return SLUG_PATTERN.test(slug) ? slug : null;
-}
-
-function safeAvatarUrl(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
 }
 
 function count(value: unknown): number {

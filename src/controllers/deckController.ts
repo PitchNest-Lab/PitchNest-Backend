@@ -78,8 +78,13 @@ export const uploadDeck = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     const originalName = sanitizeUploadName(req.file.originalname);
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
-    const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
-    const filePath = `decks/${Date.now()}_${originalName}`;
+    const deckName = path
+      .basename(req.file.originalname.replace(/\\/g, "/"))
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, 120) || "Pitch deck";
+    const filePath = `decks/${userId}/${Date.now()}_${originalName}`;
 
     let extractedText = "";
     let pageCount = 0;
@@ -118,8 +123,13 @@ export const uploadDeck = async (req: Request, res: Response) => {
 
     let publicUrl = "";
     if (error) {
-      console.warn("⚠️ Supabase storage upload failed, using local fallback. Storage Error:", error);
-      // Local fallback
+      console.error("❌ Supabase deck storage upload failed:", error.message);
+      if (config.nodeEnv === "production") {
+        return res.status(503).json({
+          error: "Deck storage is temporarily unavailable. Please retry.",
+        });
+      }
+      console.warn("⚠️ Development-only local deck fallback is in use.");
       const localFileName = `${Date.now()}_${originalName}`;
       fs.writeFileSync(path.join(uploadDir, localFileName), req.file.buffer);
       publicUrl = `/uploads/${localFileName}`;
@@ -140,27 +150,11 @@ export const uploadDeck = async (req: Request, res: Response) => {
       user_id: userId
     };
 
-    let { data: dbData, error: dbError } = await supabase
+    const { data: dbData, error: dbError } = await supabase
       .from("decks")
       .insert([insertData])
       .select()
       .single();
-
-    // Rollout safety: page_count arrives with migration 0014. If it isn't there
-    // yet, save the deck without it rather than failing the upload — the read
-    // path treats a missing count as "not measured yet".
-    if (dbError && /column|schema/i.test(dbError.message || "")) {
-      console.warn(
-        "⚠️ Deck insert failed (possibly missing page_count column) — retrying without it:",
-        dbError.message,
-      );
-      const { page_count, ...legacyInsert } = insertData;
-      ({ data: dbData, error: dbError } = await supabase
-        .from("decks")
-        .insert([legacyInsert])
-        .select()
-        .single());
-    }
 
     if (dbError) {
       console.error("❌ Supabase insertion failed in uploadDeck:", dbError);
@@ -184,7 +178,6 @@ export const uploadDeck = async (req: Request, res: Response) => {
       size: dbData.size,
       status: dbData.status,
       page_count: dbData.page_count ?? pageCount ?? null,
-      extracted_text: extractedText
     });
   } catch (error) { 
     console.error("❌ Fatal error in uploadDeck controller:", error);
@@ -201,7 +194,7 @@ export const listDecks = async (req: Request, res: Response) => {
 
     const { data: decks, error } = await supabase
       .from("decks")
-      .select("*")
+      .select("id, name, file_url, size, status, page_count, created_at")
       .eq("user_id", userId)
       .order("created_at", { ascending: false });
 
@@ -222,8 +215,7 @@ export const listDecks = async (req: Request, res: Response) => {
 // Ownership is enforced by the user_id match — a signed URL is never issued for
 // a deck the caller does not own. Local-fallback decks ("/uploads/..") are
 // served through the token-gated /api/files route (S7) — the raw path itself is
-// no longer publicly reachable. Any other non-storage value is returned as-is
-// so dev and legacy rows still render.
+// no longer publicly reachable. Unrecognized legacy references are rejected.
 const SIGNED_URL_TTL_SECONDS = 300; // 5 min — long enough for a pitch to load it
 
 /**
@@ -311,23 +303,12 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    // page_count arrives with migration 0014 — degrade to the legacy column set
-    // if it isn't deployed yet rather than failing the deck open.
-    let { data: deck, error } = await supabase
+    const { data: deck, error } = await supabase
       .from("decks")
       .select("file_url, page_count, extracted_text")
       .eq("id", req.params.id)
       .eq("user_id", userId)
       .maybeSingle();
-
-    if (error && /column|schema/i.test(error.message || "")) {
-      ({ data: deck, error } = await supabase
-        .from("decks")
-        .select("file_url, extracted_text")
-        .eq("id", req.params.id)
-        .eq("user_id", userId)
-        .maybeSingle());
-    }
 
     if (error) {
       console.error("❌ Supabase query error in getDeckSignedUrl:", error);
@@ -358,9 +339,8 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
 
     const objectPath = storagePathFromUrl(stored);
     if (!objectPath) {
-      // Unrecognized (e.g. an external URL we didn't store) — return as-is
-      // rather than 500, so an odd legacy row still renders.
-      return res.json({ url: stored, pageCount });
+      console.error(`Deck ${req.params.id} has an untrusted storage reference.`);
+      return res.status(500).json({ error: "Deck has an invalid storage reference" });
     }
 
     const { data: signed, error: signErr } = await supabase.storage

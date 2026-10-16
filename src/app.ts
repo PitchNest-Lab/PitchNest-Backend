@@ -1,4 +1,5 @@
 import express from "express";
+import rateLimit from "express-rate-limit";
 import cors from "cors";
 import helmet from "helmet";
 import path from "path";
@@ -91,7 +92,7 @@ app.use(
   }),
 );
 app.use((_req, res, next) => {
-  res.set("Permissions-Policy", "camera=(self), microphone=(self), geolocation=(), payment=()");
+  res.set("Permissions-Policy", "camera=(), microphone=(self), geolocation=(), payment=()");
   next();
 });
 
@@ -143,8 +144,15 @@ app.use("/api/profile", profileRoutes);
 app.use("/api/admin", adminRoutes);
 // Billing: checkout + the webhook that grants paid access.
 app.use("/api/billing", billingRoutes);
-app.post("/api/waitlist", handleWaitlist);
-app.post("/api/survey", handleSurvey);
+const publicSubmissionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many submissions. Try again later." },
+});
+app.post("/api/waitlist", publicSubmissionLimiter, handleWaitlist);
+app.post("/api/survey", publicSubmissionLimiter, handleSurvey);
 app.get("/sitemap.xml", publicReadLimiter, getPublicBusinessSitemap);
 
 // Health check endpoints — kept dependency-free so they return instantly and can

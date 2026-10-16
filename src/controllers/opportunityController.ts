@@ -62,7 +62,10 @@ function safeUrl(value: unknown): string {
   if (typeof value !== "string") return "";
   try {
     const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : "";
+    return (url.protocol === "https:" || url.protocol === "http:") &&
+      !url.username && !url.password
+      ? url.toString()
+      : "";
   } catch {
     return "";
   }
@@ -151,7 +154,12 @@ export function validateOpportunityInput(
     let ok = false;
     try {
       const parsed = new URL(url);
-      ok = (parsed.protocol === "https:" || parsed.protocol === "http:") && url.length <= 500 && !/\s/.test(url);
+      ok =
+        (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+        !parsed.username &&
+        !parsed.password &&
+        url.length <= 500 &&
+        !/\s/.test(url);
     } catch {
       ok = false;
     }

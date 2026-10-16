@@ -1,24 +1,23 @@
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { sendTrialEmail, type TrialMilestone } from "../utils/sendTrialEmails.ts";
+import { randomUUID } from "node:crypto";
 
 /**
  * The trial lifecycle sweep — decides who gets a reminder email, claims the
  * milestone in trial_email_log, and sends.
  *
- * There is no job runner in this codebase and this is not a reason to add one.
- * All session state is already in-process (see sockets/restSocket.ts), the
- * backend is a single long-lived service, and the work here is one small query
- * every six hours. An in-process interval is the honest size of the problem.
+ * The web service runs this periodically, and runTrialLifecycle.ts exposes the
+ * same idempotent sweep as a one-shot command for a managed scheduler. That
+ * matters on hosts that suspend idle web instances between requests.
  *
  * WHAT MAKES IT SAFE TO RUN TWICE, OR ON TWO SERVERS AT ONCE
  *
- * The claim is the primary key of trial_email_log. A sweep inserts
- * (user_id, milestone); if a Postgres unique violation comes back, another sweep
- * already owns that milestone and this one moves on. So the guarantee is
- * at-most-once per milestone per user, with no lock, no leader election and no
- * coordination — and a send that throws releases the claim so the next sweep
- * retries rather than losing the email forever.
+ * The primary key still prevents two active owners, but a claim is now a
+ * database lease instead of a permanent pre-send marker. A failed send releases
+ * its own lease; an unfinished lease becomes recoverable after 30 minutes. The
+ * provider also receives a stable idempotency key, covering the narrow crash
+ * window between provider acceptance and the delivered_at database update.
  */
 
 /** Plans that mean "this person has already paid" — never remind them. */
@@ -95,6 +94,7 @@ export function reminderSlot(daysRemaining: number, expired: boolean): TrialMile
  */
 async function sessionFactsFor(
   userId: number,
+  trialStartedAt: Date,
   trialExpiresAt: Date,
 ): Promise<{
   sessionCount: number;
@@ -102,21 +102,27 @@ async function sessionFactsFor(
   lastSessionName: string | null;
 }> {
   const cutoff = trialExpiresAt.toISOString();
+  const start = trialStartedAt.toISOString();
   const [countResult, latestResult] = await Promise.all([
     supabase
       .from("sessions")
       .select("id", { count: "exact", head: true })
       .eq("user_id", userId)
+      .gte("created_at", start)
       .lte("created_at", cutoff),
     supabase
       .from("sessions")
       .select("business_name, evaluation_report, created_at")
       .eq("user_id", userId)
+      .gte("created_at", start)
       .lte("created_at", cutoff)
       .order("created_at", { ascending: false })
       .limit(1)
       .maybeSingle(),
   ]);
+
+  if (countResult.error) throw countResult.error;
+  if (latestResult.error) throw latestResult.error;
 
   const sessionCount = countResult.count ?? 0;
   const latest = latestResult.data as any;
@@ -139,6 +145,33 @@ async function sessionFactsFor(
   };
 }
 
+async function loadTrialCandidates(now: number): Promise<{ users: any[] | null; error: any }> {
+  const users: any[] = [];
+  const pageSize = 500;
+  const earliest = new Date(now - LOOKBEHIND_DAYS * DAY_MS).toISOString();
+  const latest = new Date(now + LOOKAHEAD_DAYS * DAY_MS).toISOString();
+  for (let from = 0; from < 10_000; from += pageSize) {
+    const result = await supabase
+      .from("users")
+      .select("id, email, name, plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, settings")
+      .eq("trial_status", "active")
+      .eq("isEmailVerified", true)
+      .not("trial_expires_at", "is", null)
+      .gte("trial_expires_at", earliest)
+      .lte("trial_expires_at", latest)
+      .order("id", { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (result.error) return { users: null, error: result.error };
+    const page = result.data || [];
+    users.push(...page);
+    if (page.length < pageSize) return { users, error: null };
+  }
+  return {
+    users: null,
+    error: new Error("Trial lifecycle exceeded the 10,000-candidate safety limit."),
+  };
+}
+
 /**
  * One pass. Exported so it can be run by hand (or by an admin route) — the
  * scheduler below is the only thing that calls it on a timer.
@@ -147,16 +180,7 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
   const result: TrialSweepResult = { candidates: 0, sent: 0, skipped: 0, failed: 0 };
   const now = Date.now();
 
-  const { data: users, error } = await supabase
-    .from("users")
-    .select("id, email, name, plan, plan_expires_at, trial_expires_at, trial_status")
-    .eq("trial_status", "active")
-    // Emailing an address nobody has proved they own is how a sending domain
-    // ends up in a spam trap. Unverified founders get nothing.
-    .eq("isEmailVerified", true)
-    .not("trial_expires_at", "is", null)
-    .gte("trial_expires_at", new Date(now - LOOKBEHIND_DAYS * DAY_MS).toISOString())
-    .lte("trial_expires_at", new Date(now + LOOKAHEAD_DAYS * DAY_MS).toISOString());
+  const { users, error } = await loadTrialCandidates(now);
 
   if (error) {
     // A missing table means migration 0016 has not been run. Say so once, in
@@ -184,6 +208,14 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
       continue;
     }
 
+    // Account holders can opt out of lifecycle/upgrade mail in Settings. A
+    // missing key preserves the existing default for accounts created before
+    // this preference was introduced.
+    if (user.settings?.notifications?.trialLifecycle === false) {
+      result.skipped++;
+      continue;
+    }
+
     // Already paying. A "your trial is ending" mail to someone who has just
     // upgraded is the single most annoying thing this job could do.
     const planExpiry = user.plan_expires_at ? new Date(user.plan_expires_at).getTime() : null;
@@ -194,7 +226,8 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
     }
 
     const expiry = new Date(user.trial_expires_at).getTime();
-    if (!Number.isFinite(expiry)) {
+    const trialStart = new Date(user.trial_started_at).getTime();
+    if (!Number.isFinite(expiry) || !Number.isFinite(trialStart) || trialStart > expiry) {
       result.skipped++;
       continue;
     }
@@ -207,21 +240,20 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
       continue;
     }
 
-    // Claim first. The insert IS the mutual exclusion — see the file header.
-    const claim = await supabase
-      .from("trial_email_log")
-      .insert({ user_id: id, milestone });
+    // Claim first. The RPC inserts a lease or takes over an abandoned unfinished
+    // lease older than 30 minutes. A completed row is never reclaimed.
+    const leaseId = randomUUID();
+    const claim = await supabase.rpc("claim_trial_email", {
+      p_user_id: id,
+      p_milestone: milestone,
+      p_lease_id: leaseId,
+    });
 
     if (claim.error) {
-      const code = (claim.error as any)?.code;
-      if (code === "23505") {
-        result.skipped++; // another run got there first
-        continue;
-      }
       if (/relation|does not exist|schema cache/i.test(claim.error.message || "")) {
         console.warn(
-          "⚠️ Trial lifecycle sweep stopped: trial_email_log is missing. " +
-            "Run backend/migrations/0016_trial_email_log.sql.",
+          "⚠️ Trial lifecycle sweep stopped: its lease function is missing. " +
+            "Run backend/migrations/0030_auth_and_erasure_hardening.sql.",
         );
         return result;
       }
@@ -229,10 +261,15 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
       result.failed++;
       continue;
     }
+    if (claim.data !== true) {
+      result.skipped++;
+      continue;
+    }
 
     try {
-      const facts = await sessionFactsFor(id, new Date(expiry));
+      const facts = await sessionFactsFor(id, new Date(trialStart), new Date(expiry));
       await sendTrialEmail({
+        userId: id,
         to: email,
         name: user.name || "",
         milestone,
@@ -241,20 +278,39 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
         lastScore: facts.lastScore,
         lastSessionName: facts.lastSessionName,
       });
+      const delivered = await supabase
+        .from("trial_email_log")
+        .update({ delivered_at: new Date().toISOString() })
+        .eq("user_id", id)
+        .eq("milestone", milestone)
+        .eq("lease_id", leaseId)
+        .is("delivered_at", null);
+      if (delivered.error) throw delivered.error;
       result.sent++;
 
-      // Recorded only after the mail actually went out, so a failed send leaves
-      // the row claimable and gets another chance.
+      // delivered_at is written only after provider acceptance. Failed sends
+      // release their lease; a process crash leaves a lease another run can recover.
       if (expired) {
-        await supabase.from("users").update({ trial_status: "expired" }).eq("id", id);
+        const { error: expiryError } = await supabase
+          .from("users")
+          .update({ trial_status: "expired" })
+          .eq("id", id);
+        if (expiryError) {
+          console.error(`❌ Trial status update failed for user ${id}:`, expiryError.message);
+        }
       }
     } catch (err: any) {
       console.error(`❌ Trial ${milestone} email failed for user ${id}:`, err?.message || err);
-      await supabase
+      const { error: releaseError } = await supabase
         .from("trial_email_log")
         .delete()
         .eq("user_id", id)
-        .eq("milestone", milestone);
+        .eq("milestone", milestone)
+        .eq("lease_id", leaseId)
+        .is("delivered_at", null);
+      if (releaseError) {
+        console.error(`❌ Trial milestone release failed for user ${id}:`, releaseError.message);
+      }
       result.failed++;
     }
   }

@@ -260,9 +260,7 @@ export async function hasCapacity(
       .gt("started_at", windowStart.toISOString())
       .order("started_at", { ascending: true });
 
-    if (error) {
-      return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
-    }
+    if (error) throw error;
 
     const rows = data ?? [];
     const used = rows.length;
@@ -275,7 +273,8 @@ export async function hasCapacity(
 
     return { ok: used < ent.maxWeeklySessions, used, remaining, resetsAt };
   } catch (err: any) {
-    return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
+    console.error(`❌ hasCapacity(${userId}) failed:`, err?.message || err);
+    throw err;
   }
 }
 
@@ -302,12 +301,10 @@ export async function recordSessionStart(userId: number): Promise<void> {
  * `client_ready` connections could both pass a separate hasCapacity() and both
  * record — exceeding the cap.
  *
- * Strategy (insert-then-rank): INSERT my start row first, then rank all of the
- * user's rows in the 7-day window by started_at. If my row's rank exceeds the
- * limit, I lost the race — delete my row and reject. Concurrent claimants each
- * count including the other's just-inserted row, so at most `limit` of them can
- * rank within bounds. Fails OPEN (allows the pitch) on a genuine DB error, so a
- * transient outage never blocks the core action — the same posture as before.
+ * A security-definer database function locks the owning user row, checks the
+ * rolling window, and records an admitted start in one transaction. This works
+ * across processes and backend instances. Errors propagate so quota enforcement
+ * fails closed with a retryable service response.
  */
 export async function claimSessionSlot(
   userId: number,
@@ -318,58 +315,24 @@ export async function claimSessionSlot(
     return { ok: true, used: 0, remaining: Infinity, resetsAt: null };
   }
 
-  const windowStart = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-  const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-
   try {
-    // 1. Claim a slot up-front.
-    const { data: mine, error: insErr } = await supabase
-      .from("session_starts")
-      .insert([{ user_id: userId }])
-      .select("id, started_at")
-      .single();
-
-    if (insErr || !mine) {
-      // Could not record — fail open (allow) rather than block a real pitch on a
-      // DB blip. Soft quota bypass only; no paid capability is granted.
-      console.error(`❌ claimSessionSlot(${userId}) insert failed:`, insErr?.message);
-      return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
+    const { data, error } = await supabase.rpc("claim_weekly_session_slot", {
+      p_user_id: userId,
+      p_limit: ent.maxWeeklySessions,
+    });
+    if (error) throw error;
+    const result = Array.isArray(data) ? data[0] : data;
+    if (!result || typeof result.allowed !== "boolean") {
+      throw new Error("INVALID_QUOTA_CLAIM_RESPONSE");
     }
-
-    // 2. Rank my row among the window's rows.
-    const { data: rows, error: cntErr } = await supabase
-      .from("session_starts")
-      .select("id, started_at")
-      .eq("user_id", userId)
-      .gt("started_at", windowStart.toISOString())
-      .order("started_at", { ascending: true })
-      .order("id", { ascending: true });
-
-    if (cntErr || !rows) {
-      // Count failed after a successful insert — allow (fail open); the row
-      // stays, so it is still metered.
-      return { ok: true, used: 1, remaining: ent.maxWeeklySessions - 1, resetsAt: null };
-    }
-
-    const rank = rows.findIndex((r: any) => r.id === mine.id) + 1; // 1-based
-    const used = rows.length;
-    const oldest = rows[0]?.started_at as string | undefined;
-    const resetsAt = oldest ? new Date(new Date(oldest).getTime() + WEEK_MS) : null;
-
-    if (rank > ent.maxWeeklySessions) {
-      // Lost the race / over the cap — release the slot so it isn't wasted.
-      await supabase.from("session_starts").delete().eq("id", mine.id);
-      return { ok: false, used: used - 1, remaining: 0, resetsAt };
-    }
-
     return {
-      ok: true,
-      used,
-      remaining: Math.max(0, ent.maxWeeklySessions - used),
-      resetsAt,
+      ok: result.allowed,
+      used: Number(result.used) || 0,
+      remaining: Math.max(0, Number(result.remaining) || 0),
+      resetsAt: result.resets_at ? new Date(result.resets_at) : null,
     };
   } catch (err: any) {
     console.error(`❌ claimSessionSlot(${userId}) threw:`, err?.message || err);
-    return { ok: true, used: 0, remaining: ent.maxWeeklySessions, resetsAt: null };
+    throw err;
   }
 }

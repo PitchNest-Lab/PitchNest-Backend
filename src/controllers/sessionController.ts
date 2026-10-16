@@ -1,11 +1,21 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { getEntitlements } from "../services/entitlementService.ts";
-import { signLocalFileUrl } from "../services/storageService.ts";
-import { isRecordingObjectPath, storagePathFromUrl } from "../utils/storagePath.ts";
+import {
+  removeOwnedRecordingReference,
+  signLocalFileUrl,
+  uploadDir,
+} from "../services/storageService.ts";
+import {
+  isOwnRecordingReference,
+  isRecordingObjectPath,
+  storagePathFromUrl,
+} from "../utils/storagePath.ts";
 import {
   computeAttemptStates,
   loadAttemptStates,
@@ -77,7 +87,7 @@ export const listSessions = async (req: Request, res: Response) => {
     }
 
     const { data: sessions, error } = await supabase
-      .from("sessions")
+      .from("session_list_safe")
       .select("*")
       .eq("user_id", userId)
       .order("timestamp", { ascending: false });
@@ -94,11 +104,15 @@ export const listSessions = async (req: Request, res: Response) => {
 
     const formatted = (sessions || []).map((s: any) => {
       const state = attemptStates.get(Number(s.id));
+      const parsedReport = safeParseJSON(s.evaluation_report);
+      const { transcript: _privateTranscript, ...listReport } = parsedReport || {};
       return {
         ...s,
         created_at: s.created_at || s.timestamp,
-        evaluation_report: safeParseJSON(s.evaluation_report),
-        has_recording: !!s.video_url,
+        // The database view already removed transcript and recording paths, so
+        // these sensitive fields never travel to Node on bulk archive reads.
+        evaluation_report: listReport,
+        has_recording: s.has_recording === true,
         attempts: state ? serializeAttemptState(state) : fallbackAttemptState(),
       };
     });
@@ -149,8 +163,9 @@ export const getSession = async (req: Request, res: Response) => {
     // their pitch history.
     const attemptState = (await loadAttemptStates(userId)).get(Number(session.id));
 
+    const { video_url: _privateRecordingPath, ...safeSession } = session as any;
     const formatted = {
-      ...session,
+      ...safeSession,
       created_at: session.created_at || session.timestamp,
       evaluation_report: safeParseJSON(session.evaluation_report),
       has_recording: !!session.video_url,
@@ -226,7 +241,9 @@ export const getSessionRecording = async (req: Request, res: Response) => {
 
     const objectPath = storagePathFromUrl(stored);
     if (!objectPath) {
-      return res.json({ url: stored, available: true });
+      // Historical rows could contain a client-supplied absolute URL. Never
+      // reflect or load an arbitrary origin from a privileged API response.
+      return res.json({ url: "", available: false });
     }
     // Only ever sign recording keys. A row whose video_url was pointed at a
     // deck or another file (set_video_url is client input; older rows predate
@@ -292,6 +309,59 @@ export const getPitchAttempts = async (req: Request, res: Response) => {
   }
 };
 
+/** Attach an uploaded audio object to its owner session without relying on a live WebSocket. */
+export const attachSessionRecording = async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  const recording = typeof req.body?.recording === "string" ? req.body.recording.trim() : "";
+  if (!userId) return res.status(401).json({ error: "Authentication required" });
+  if (!isOwnRecordingReference(recording, userId)) {
+    return res.status(400).json({ error: "Invalid recording reference" });
+  }
+
+  try {
+    const { data: session, error: readError } = await supabase
+      .from("sessions")
+      .select("id, video_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (readError) throw readError;
+    if (!session) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Unattached recording cleanup failed:", error),
+      );
+      return res.status(404).json({ error: "Session not found" });
+    }
+    if (session.video_url === recording) return res.json({ success: true });
+    if (typeof session.video_url === "string" && session.video_url.trim()) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Duplicate recording cleanup failed:", error),
+      );
+      return res.status(409).json({ error: "This session already has a recording" });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("sessions")
+      .update({ video_url: recording })
+      .eq("id", session.id)
+      .eq("user_id", userId)
+      .is("video_url", null)
+      .select("id")
+      .maybeSingle();
+    if (updateError || !updated) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Failed recording rollback cleanup:", error),
+      );
+      if (updateError) throw updateError;
+      return res.status(409).json({ error: "Recording could not be attached" });
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Attach session recording failed:", error);
+    return res.status(500).json({ error: "Failed to attach recording" });
+  }
+};
+
 export const deleteSession = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -299,10 +369,53 @@ export const deleteSession = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
+    const { data: session, error: readError } = await supabase
+      .from("sessions")
+      .select("id, video_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (readError) {
+      console.error("Session lookup failed in deleteSession:", readError);
+      return res.status(500).json({ error: "Failed to delete session" });
+    }
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const recording = typeof session.video_url === "string" ? session.video_url.trim() : "";
+    if (recording.startsWith("/uploads/")) {
+      const localName = recording.slice("/uploads/".length);
+      if (
+        localName !== path.basename(localName) ||
+        !localName.startsWith(`rec_${userId}_`) ||
+        localName.includes("..")
+      ) {
+        return res.status(500).json({ error: "Session has an invalid recording reference" });
+      }
+      try {
+        await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+      } catch (storageError) {
+        console.error("Local session recording cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the recording. Please retry." });
+      }
+    } else if (recording) {
+      const objectPath = storagePathFromUrl(recording);
+      if (!isRecordingObjectPath(objectPath)) {
+        return res.status(500).json({ error: "Session has an invalid recording reference" });
+      }
+      const { error: storageError } = await supabase.storage
+        .from(config.storageBucket)
+        .remove([objectPath!]);
+      if (storageError) {
+        console.error("Session recording cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the recording. Please retry." });
+      }
+    }
+
     const { error } = await supabase
       .from("sessions")
       .delete()
-      .eq("id", req.params.id)
+      .eq("id", session.id)
       .eq("user_id", userId);
 
     if (error) {

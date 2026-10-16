@@ -65,7 +65,11 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
           .eq("id", decoded.id)
           .maybeSingle();
 
-        if (error || !organization || organization.org_code == null) {
+        if (error) {
+          console.error("Organization authentication lookup failed:", error.message);
+          return res.status(503).json({ error: "Authentication service is temporarily unavailable." });
+        }
+        if (!organization || organization.org_code == null) {
           return res.status(401).json({
             error: "Organization access was revoked. Please log in again.",
           });
@@ -106,7 +110,11 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
         .eq("id", decoded.id)
         .maybeSingle();
 
-      if (error || !user) {
+      if (error) {
+        console.error("User authentication lookup failed:", error.message);
+        return res.status(503).json({ error: "Authentication service is temporarily unavailable." });
+      }
+      if (!user) {
         return res.status(401).json({
           error: "User no longer exists or access was revoked. Please log in again.",
         });

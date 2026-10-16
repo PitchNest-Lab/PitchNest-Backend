@@ -5,6 +5,8 @@ import os from "os";
 import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { config } from "../config/env.ts";
+import { supabase } from "../config/supabase.ts";
+import { isOwnRecordingReference, storagePathFromUrl } from "../utils/storagePath.ts";
 
 // Set uploads directory based on environment (local vs GAE/GCF /tmp)
 export const uploadDir = config.isGoogleCloud 
@@ -155,6 +157,8 @@ export const videoUpload = multer({
  * worthless if leaked into a log or browser history. Same TTL as Supabase
  * signed URLs (SIGNED_URL_TTL_SECONDS). */
 const LOCAL_FILE_TOKEN_TTL_SECONDS = 300;
+const LOCAL_FILE_TOKEN_ISSUER = "pitchnest";
+const LOCAL_FILE_TOKEN_AUDIENCE = "pitchnest-local-file";
 
 /**
  * Mints a relative URL for a local-fallback file, signed with the app's JWT
@@ -175,9 +179,14 @@ export function signLocalFileUrl(
   ttlSeconds: number = LOCAL_FILE_TOKEN_TTL_SECONDS,
 ): string {
   const token = jwt.sign(
-    { file: name, uid: userId },
+    { kind: "local-file", file: name, uid: userId },
     config.jwtSecret,
-    { expiresIn: ttlSeconds },
+    {
+      algorithm: "HS256",
+      issuer: LOCAL_FILE_TOKEN_ISSUER,
+      audience: LOCAL_FILE_TOKEN_AUDIENCE,
+      expiresIn: ttlSeconds,
+    },
   );
   return `/api/files/${encodeURIComponent(name)}?token=${token}`;
 }
@@ -193,11 +202,17 @@ export function verifyLocalFileToken(
 ): number | null {
   if (typeof token !== "string" || !token) return null;
   try {
-    const payload = jwt.verify(token, config.jwtSecret) as {
+    const payload = jwt.verify(token, config.jwtSecret, {
+      algorithms: ["HS256"],
+      issuer: LOCAL_FILE_TOKEN_ISSUER,
+      audience: LOCAL_FILE_TOKEN_AUDIENCE,
+    }) as {
+      kind?: unknown;
       file?: unknown;
       uid?: unknown;
     };
     if (
+      payload.kind !== "local-file" ||
       typeof payload.file !== "string" ||
       payload.file !== name ||
       typeof payload.uid !== "number"
@@ -208,4 +223,26 @@ export function verifyLocalFileToken(
   } catch {
     return null;
   }
+}
+
+/** Delete a recording reference that was minted for this user. */
+export async function removeOwnedRecordingReference(
+  value: string,
+  userId: number,
+): Promise<void> {
+  if (!isOwnRecordingReference(value, userId)) {
+    throw new Error("Invalid recording reference");
+  }
+  if (value.startsWith("/uploads/")) {
+    const name = value.slice("/uploads/".length);
+    if (name !== path.basename(name) || name.includes("..")) {
+      throw new Error("Invalid local recording reference");
+    }
+    await fs.promises.rm(path.join(uploadDir, name), { force: true });
+    return;
+  }
+  const objectPath = storagePathFromUrl(value);
+  if (!objectPath) throw new Error("Invalid storage recording reference");
+  const { error } = await supabase.storage.from(config.storageBucket).remove([objectPath]);
+  if (error) throw error;
 }

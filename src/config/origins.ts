@@ -10,9 +10,6 @@ export function allowedBrowserOrigins(): Set<string> {
   const origins = new Set(
     [
       config.allowedOrigin,
-      "https://pitchnestapp.vercel.app",
-      "https://www.pitchnest.app",
-      "https://pitchnest.app",
       ...config.corsExtraOrigins,
       ...(config.nodeEnv === "production"
         ? []

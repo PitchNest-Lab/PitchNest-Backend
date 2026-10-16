@@ -5,6 +5,7 @@ import { loadDirectoryEngagement } from "./discoverEngagementController.ts";
 import { renderPublicBusinessShareDocument } from "../utils/publicBusinessMetadata.ts";
 import { logEvent } from "../services/eventService.ts";
 import { loadPublicTeam, publicMediaUrl, type PublicTeamMember } from "../services/businessMediaService.ts";
+import { config } from "../config/env.ts";
 
 const DEFAULT_PAGE_SIZE = 12;
 const MAX_PAGE_SIZE = 24;
@@ -48,7 +49,10 @@ function safeWebsite(value: unknown): string {
   if (!website) return "";
   try {
     const parsed = new URL(website);
-    return parsed.protocol === "http:" || parsed.protocol === "https:" ? parsed.toString() : "";
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") &&
+      !parsed.username && !parsed.password
+      ? parsed.toString()
+      : "";
   } catch {
     return "";
   }
@@ -267,9 +271,8 @@ function xmlEscape(value: string): string {
 }
 
 export function publicSiteOrigin(): string {
-  const candidate = process.env.PUBLIC_SITE_URL || process.env.CLIENT_URL || "https://www.pitchnest.app";
   try {
-    const url = new URL(candidate);
+    const url = new URL(config.publicSiteUrl);
     return url.protocol === "http:" || url.protocol === "https:"
       ? url.origin
       : "https://www.pitchnest.app";

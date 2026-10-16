@@ -37,6 +37,15 @@ const authLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+const sessionMaintenanceLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 120,
+  keyGenerator: (req) => String(req.user?.accountType ?? "account") + ":" + String(req.user?.id ?? req.ip),
+  message: { error: "Too many session requests. Please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // SECURITY: The database wipe endpoint has been removed. If you need to
 // clear data in development, use the Supabase SQL editor directly.
 
@@ -51,29 +60,39 @@ router.post("/verify-email-otp", authLimiter, verifyEmailOtp);
 router.post("/resend-verification", authLimiter, resendEmailVerification);
 
 router.get("/me", accountAuthMiddleware, async (req, res) => {
-  // Fetch the live row so a refetch keeps role (and name/email) fresh. If the
-  // lookup fails transiently, fall back to the JWT identity so a healthy token
-  // is never treated as logged-out — same liveness semantics as before.
+  // Fetch the live row so a refetch keeps role, plan and profile data fresh.
+  // Fail closed: a token snapshot is not a substitute for the authoritative
+  // account row and could show stale entitlements or deleted profile data.
   try {
     if (req.user!.accountType === "organization") {
-      const { data: organization } = await supabase
+      const { data: organization, error } = await supabase
         .from("Organizations")
         .select("*")
         .eq("id", req.user!.id)
         .maybeSingle();
 
+      if (error) {
+        console.error("GET /me organization lookup failed:", error.message);
+        return res.status(503).json({ error: "Unable to load organization account." });
+      }
+
       if (organization) {
         return res.json(toPublicOrganization(organization));
       }
 
-      return res.status(503).json({ error: "Unable to load organization account." });
+      return res.status(401).json({ error: "Organization account no longer exists." });
     }
 
-    const { data: user } = await supabase
+    const { data: user, error } = await supabase
       .from("users")
       .select("*")
       .eq("id", req.user!.id)
       .maybeSingle();
+
+    if (error) {
+      console.error("GET /me user lookup failed:", error.message);
+      return res.status(503).json({ error: "Unable to load account." });
+    }
 
     if (user) {
       return res.json({
@@ -81,22 +100,17 @@ router.get("/me", accountAuthMiddleware, async (req, res) => {
         isEmailVerified: user.isEmailVerified,
       });
     }
+    return res.status(401).json({ error: "Account no longer exists." });
   } catch (err) {
-    console.warn("GET /me lookup failed, falling back to token identity:", err);
+    console.error("GET /me lookup threw:", err);
+    return res.status(503).json({ error: "Unable to load account." });
   }
-  res.json({
-    id: req.user!.id,
-    email: req.user!.email,
-    accountType: req.user!.accountType,
-    orgCode: req.user!.orgCode,
-    isEmailVerified: false,
-  });
 });
 
 // Deliberately not behind authLimiter — it fires on a timer for every active
 // user, and the shared 20-per-15-min cap would starve real logins.
-router.post("/refresh", accountAuthMiddleware, refreshToken);
-router.post("/logout", accountAuthMiddleware, logout);
+router.post("/refresh", accountAuthMiddleware, sessionMaintenanceLimiter, refreshToken);
+router.post("/logout", accountAuthMiddleware, sessionMaintenanceLimiter, logout);
 
 router.patch("/me", authMiddleware, updateMe);
 router.patch("/settings", authMiddleware, updateSettings);

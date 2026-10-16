@@ -3,13 +3,16 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "start": "node --max-old-space-size=384 ./node_modules/tsx/dist/cli.mjs server.ts",
     "dev": "tsx watch server.ts",
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch && npm run test:ai-models && npm run test:speech && npm run test:business-media && npm run test:founders",
+    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch && npm run test:ai-models && npm run test:speech && npm run test:business-media && npm run test:founders && npm run test:billing",
     "test:core": "tsx src/tests/run_tests.ts",
     "test:organization-security": "tsx src/tests/organization_security_test.ts",
     "test:business-security": "tsx src/tests/business_security_test.ts",
@@ -25,7 +28,9 @@
     "test:ai-models": "tsx src/tests/ai_models_test.ts",
     "test:speech": "tsx src/tests/speech_context_test.ts",
     "test:business-media": "tsx src/tests/business_media_test.ts",
-    "test:founders": "tsx src/tests/founder_test.ts"
+    "test:founders": "tsx src/tests/founder_test.ts",
+    "test:billing": "tsx src/tests/subscription_billing_test.ts",
+    "job:trial-lifecycle": "tsx src/jobs/runTrialLifecycle.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.106.2",
@@ -54,7 +59,7 @@
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.1.0",
-    "@types/node": "^22.14.0",
+    "@types/node": "^24.10.0",
     "typescript": "~5.8.2"
   },
   "overrides": {

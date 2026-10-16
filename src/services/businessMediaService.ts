@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import sharp from "sharp";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
+import { safeAvatarUrl } from "../utils/storagePath.ts";
 
 /**
  * Business logos and cover images, and the public team list.
@@ -269,16 +270,6 @@ export const PUBLIC_TITLE_MAX = 80;
 const MAX_PUBLIC_TEAM = 12;
 const ROLE_ORDER: Record<string, number> = { owner: 0, admin: 1, editor: 2, viewer: 3 };
 
-function safeHttpUrl(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Shapes consenting member rows into the public team list (allowlisted). */
 export function toPublicTeam(
   memberships: Array<{ user_id: number; role: string; public_title?: string | null; joined_at?: string | null }>,
@@ -299,7 +290,7 @@ export function toPublicTeam(
       return [{
         name,
         title: typeof membership.public_title === "string" ? membership.public_title.trim().slice(0, PUBLIC_TITLE_MAX) : "",
-        avatarUrl: safeHttpUrl(user?.avatar_url),
+        avatarUrl: safeAvatarUrl(user?.avatar_url),
         handle: handles.get(membership.user_id) ?? null,
       }];
     })

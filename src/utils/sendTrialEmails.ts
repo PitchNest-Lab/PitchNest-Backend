@@ -1,5 +1,6 @@
 import { Resend } from "resend";
 import { config } from "../config/env.ts";
+import { withTimeout } from "./withTimeout.ts";
 
 /**
  * The trial reminder emails.
@@ -29,6 +30,8 @@ import { config } from "../config/env.ts";
 export type TrialMilestone = "t7" | "t3" | "t1" | "expired";
 
 export interface TrialEmailInput {
+  /** Stable, non-PII provider key component used to make retries safe. */
+  userId: number;
   to: string;
   /** Founder's own name. Escaped before it reaches the HTML. */
   name: string;
@@ -126,21 +129,18 @@ function opener(input: TrialEmailInput): string {
 }
 
 /**
- * There is no unsubscribe link, and that is a decision rather than an omission.
- * These are four account emails over the life of a trial, not a marketing list,
- * and the settings screen's notification toggles are currently inert — pointing
- * at them would imply an opt-out that does not exist. If the toggles are ever
- * wired up (see the retention work), this footer is where the link goes, and the
- * sweep must read the toggle before claiming a milestone.
+ * The sweep honours Settings → Notifications → Trial and plan emails before it
+ * claims a milestone. The footer tells the recipient where to change it without
+ * putting a reusable account-management token into an email URL.
  */
 function footer(milestone: TrialMilestone): string {
   return milestone === "expired"
-    ? "You're receiving this because you have a PitchNest account. This is the last trial email."
-    : "You're receiving this because you have a PitchNest account. At most two more will follow before the trial ends.";
+    ? "You're receiving this because you have a PitchNest account. This is the last trial email. You can change trial email preferences in Settings."
+    : "You're receiving this because you have a PitchNest account. You can turn off trial emails in Settings → Notifications.";
 }
 
 export async function sendTrialEmail(input: TrialEmailInput): Promise<void> {
-  const { to, name, milestone, daysRemaining } = input;
+  const { userId, to, name, milestone, daysRemaining } = input;
   const safeName = escapeHtml((name || "").trim() || "there");
   const pricingUrl = `${config.clientUrl}/pricing`;
   const { subject, headline } =
@@ -181,13 +181,19 @@ export async function sendTrialEmail(input: TrialEmailInput): Promise<void> {
     </div>
   `;
 
-  const { error } = await resend.emails.send({
-    from: config.emailFrom,
-    replyTo: config.emailReplyTo,
-    to,
-    subject,
-    html,
-  });
+  const { error } = await withTimeout(
+    resend.emails.send({
+      from: config.emailFrom,
+      replyTo: config.emailReplyTo,
+      to,
+      subject,
+      html,
+    }, {
+      idempotencyKey: `trial/${userId}/${milestone}`,
+    }),
+    15_000,
+    "Trial email request",
+  );
 
   if (error) {
     throw new Error(error.message);

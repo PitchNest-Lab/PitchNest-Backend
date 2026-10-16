@@ -27,6 +27,14 @@ function positiveDaysEnv(name: string, fallback: number): number {
   return Number.isInteger(value) && value > 0 && value <= 3_650 ? value : fallback;
 }
 
+/** A whole number from 0 to max; anything else (unset, negative, junk) is the fallback. */
+function wholeNumberEnv(name: string, fallback: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 && value <= max ? value : fallback;
+}
+
 function currencyEnv(name: string, fallback: string): string {
   const value = String(process.env[name] || "").trim().toUpperCase();
   return /^[A-Z]{3}$/.test(value) ? value : fallback;
@@ -34,7 +42,6 @@ function currencyEnv(name: string, fallback: string): string {
 
 export const config = {
   supabaseUrl: normalizeSupabaseProjectUrl(process.env.SUPABASE_URL || ""),
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
   isGoogleCloud: !!process.env.K_SERVICE,
@@ -57,7 +64,10 @@ export const config = {
   azureOpenAiEndpoint: process.env.AZURE_OPENAI_ENDPOINT || "",
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
-  azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
+  // Used only for classic Azure endpoints. `/openai/v1` endpoints do not use a
+  // dated API version, but keeping a current GA default preserves compatibility
+  // for existing classic-resource deployments.
+  azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-10-21",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
   resendApiKey: (process.env.RESEND_API_KEY || "").trim(),
   // Defaults to "production" so a deploy that FORGETS to set NODE_ENV fails
@@ -79,6 +89,11 @@ export const config = {
   // config rather than scattered process.env lookups. Trailing slashes are
   // tolerated by the consumers, which strip them before composing a path.
   clientUrl: (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, ""),
+  publicSiteUrl: (
+    process.env.PUBLIC_SITE_URL ||
+    process.env.CLIENT_URL ||
+    "http://localhost:5174"
+  ).replace(/\/+$/, ""),
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
@@ -119,6 +134,12 @@ export const config = {
   proPlanCurrency: currencyEnv("PRO_PLAN_CURRENCY", "USD"),
   /** Days of Pro granted per successful payment. */
   proPlanDays: positiveDaysEnv("PRO_PLAN_DAYS", 30),
+  /**
+   * Free months added to a user's first subscription (pay for one period, get
+   * this many extra months on top). 0 turns the offer off everywhere: the
+   * pricing page, the sidebar and checkout all read this one value.
+   */
+  firstSubscriptionFreeMonths: wholeNumberEnv("FIRST_SUBSCRIPTION_FREE_MONTHS", 1, 12),
   /** Where Flutterwave returns the user after checkout. */
   appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
   // ── Ecosystem feature flags ──────────────────────────────────────────────
@@ -241,6 +262,9 @@ if (config.jwtSecret === FALLBACK_JWT_SECRET) {
       "on a deployed environment.",
   );
 }
+if (Buffer.byteLength(config.jwtSecret, "utf8") < 32) {
+  throw new Error("FATAL: JWT_SECRET must contain at least 32 bytes of entropy.");
+}
 
 export function hasGoogleAuthConfig(): boolean {
   return !!config.googleClientId;
@@ -294,10 +318,36 @@ if (config.flutterwaveSecretKey && !config.flutterwaveWebhookHash) {
   );
 }
 
-if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {
-  console.warn(
-    "⚠️ Warning: SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY is missing in your backend environment variables!",
+if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
+  throw new Error(
+    "FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required by the backend.",
   );
+}
+
+if (config.nodeEnv === "production") {
+  for (const [name, value] of [
+    ["ALLOWED_ORIGIN", config.allowedOrigin],
+    ["CLIENT_URL", config.clientUrl],
+    ["APP_BASE_URL", config.appBaseUrl],
+    ["PUBLIC_SITE_URL", config.publicSiteUrl],
+    ...config.corsExtraOrigins.map((value, index) => [
+      `CORS_EXTRA_ORIGINS entry ${index + 1}`,
+      value,
+    ] as const),
+  ] as const) {
+    let valid = false;
+    try {
+      const url = new URL(value);
+      valid =
+        url.protocol === "https:" &&
+        url.hostname !== "localhost" &&
+        url.hostname !== "127.0.0.1" &&
+        url.origin === value.replace(/\/+$/, "");
+    } catch {}
+    if (!valid) {
+      throw new Error(`FATAL: ${name} must be a public HTTPS URL in production.`);
+    }
+  }
 }
 
 if (!hasOpenAiConfig()) {

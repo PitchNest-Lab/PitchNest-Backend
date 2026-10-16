@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
+import { safeAvatarUrl } from "../utils/storagePath.ts";
 import { cleanPublicText, validatePublicText } from "../utils/publicText.ts";
 import { normalizeReportDetails, REPORT_REASONS } from "./discoverEngagementController.ts";
 import { logEvent } from "../services/eventService.ts";
@@ -43,16 +44,6 @@ function iso(value: unknown): string {
 function authorName(value: unknown): string {
   const name = typeof value === "string" ? value.trim().slice(0, 80) : "";
   return name || "PitchNest member";
-}
-
-function safeAvatarUrl(value: unknown): string | null {
-  if (typeof value !== "string" || !value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
-  } catch {
-    return null;
-  }
 }
 
 function rows(data: unknown): any[] {

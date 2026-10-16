@@ -104,7 +104,15 @@ export const uploadVideo = async (req: Request, res: Response) => {
       });
 
     if (error) {
-      // Local fallback if Supabase Storage has an issue
+      console.error("❌ Recording storage upload failed:", error.message);
+      // Production hosts such as Render use ephemeral disks. Reporting a local
+      // copy as successful would create a recording that disappears on the
+      // next spin-down or deploy, so disk fallback is development-only.
+      if (config.nodeEnv === "production") {
+        return res.status(503).json({
+          error: "Recording storage is temporarily unavailable. Please retry.",
+        });
+      }
       const localName = recordingLocalName(userId, originalName);
       const destination = path.join(uploadDir, localName);
       await fs.promises.copyFile(tempPath, destination);

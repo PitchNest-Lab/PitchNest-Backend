@@ -1,6 +1,32 @@
 import { config } from "../config/env.ts";
 
 /**
+ * Only return avatar URLs issued by this deployment's public avatar bucket.
+ * Legacy arbitrary http(s) values are not rendered: an external image on a
+ * public profile is a third-party tracking pixel for every visitor who sees it.
+ */
+export function safeAvatarUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value || value.length > 2_048) return null;
+  try {
+    const url = new URL(value);
+    const storageOrigin = new URL(config.supabaseUrl).origin;
+    const prefix = `/storage/v1/object/public/${config.avatarBucket}/avatars/`;
+    if (
+      url.protocol !== "https:" ||
+      url.origin !== storageOrigin ||
+      !url.pathname.startsWith(prefix) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Derive a Supabase Storage object path from a stored value, tolerant of both
  * historical full public URLs and bare object paths.
  *
