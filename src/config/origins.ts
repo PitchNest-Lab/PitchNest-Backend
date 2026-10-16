@@ -21,7 +21,8 @@ export function allowedBrowserOrigins(): Set<string> {
             "http://localhost:3000",
           ]),
     ]
-      .map((origin) => origin.trim().replace(/\/+$/, ""))
+      // Lowercased because a browser's Origin header always is.
+      .map((origin) => origin.trim().replace(/\/+$/, "").toLowerCase())
       .filter(Boolean),
   );
   return origins;

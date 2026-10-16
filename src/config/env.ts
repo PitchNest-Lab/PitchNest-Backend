@@ -46,7 +46,7 @@ export const config = {
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
   isGoogleCloud: !!process.env.K_SERVICE,
   jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
-  allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
+  allowedOrigin: (process.env.ALLOWED_ORIGIN || "").trim() || "http://localhost:5174",
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
   // Fallback speech-to-text language for anyone who has not chosen one. en-NG is
@@ -88,10 +88,10 @@ export const config = {
   // end for the recipient and silently unrecoverable, so this is read through
   // config rather than scattered process.env lookups. Trailing slashes are
   // tolerated by the consumers, which strip them before composing a path.
-  clientUrl: (process.env.CLIENT_URL || "http://localhost:5174").replace(/\/+$/, ""),
+  clientUrl: ((process.env.CLIENT_URL || "").trim() || "http://localhost:5174").replace(/\/+$/, ""),
   publicSiteUrl: (
-    process.env.PUBLIC_SITE_URL ||
-    process.env.CLIENT_URL ||
+    (process.env.PUBLIC_SITE_URL || "").trim() ||
+    (process.env.CLIENT_URL || "").trim() ||
     "http://localhost:5174"
   ).replace(/\/+$/, ""),
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
@@ -141,7 +141,10 @@ export const config = {
    */
   firstSubscriptionFreeMonths: wholeNumberEnv("FIRST_SUBSCRIPTION_FREE_MONTHS", 1, 12),
   /** Where Flutterwave returns the user after checkout. */
-  appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
+  appBaseUrl:
+    (process.env.APP_BASE_URL || "").trim() ||
+    (process.env.ALLOWED_ORIGIN || "").trim() ||
+    "http://localhost:5174",
   // ── Ecosystem feature flags ──────────────────────────────────────────────
   // Public mutation surfaces ship dark. Discover engagement (support, follow,
   // comments, reports) is on in development and OFF in production until
@@ -335,19 +338,38 @@ if (config.nodeEnv === "production") {
       value,
     ] as const),
   ] as const) {
-    let valid = false;
-    try {
-      const url = new URL(value);
-      valid =
-        url.protocol === "https:" &&
-        url.hostname !== "localhost" &&
-        url.hostname !== "127.0.0.1" &&
-        url.origin === value.replace(/\/+$/, "");
-    } catch {}
-    if (!valid) {
-      throw new Error(`FATAL: ${name} must be a public HTTPS URL in production.`);
+    const problem = publicOriginProblem(value);
+    if (problem) {
+      // Origins are public, so the value is safe to log — and without it the
+      // operator has to guess which part of the dashboard setting is wrong.
+      throw new Error(
+        `FATAL: ${name} must be a public HTTPS URL in production (${problem}; got ${JSON.stringify(value)}).`,
+      );
     }
   }
+}
+
+/**
+ * Why a configured origin is unusable in production, or null when it is fine.
+ * Normalised the way origins.ts consumes it (trimmed, trailing slash dropped,
+ * case-insensitive host), so formatting that works at runtime can't fail boot.
+ */
+function publicOriginProblem(value: string): string | null {
+  const candidate = value.trim().replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    return "not a URL";
+  }
+  if (url.protocol !== "https:") return "must start with https://";
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    return "points at localhost — is it unset?";
+  }
+  if (url.origin !== candidate.toLowerCase()) {
+    return "must be scheme and host only, with no path, query or comma-separated list";
+  }
+  return null;
 }
 
 if (!hasOpenAiConfig()) {
