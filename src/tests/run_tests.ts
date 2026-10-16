@@ -33,6 +33,11 @@ import {
 } from "../services/founderMemoryService.ts";
 import { computeDeliveryMetrics } from "../utils/deliveryMetrics.ts";
 import {
+  buildRotationDirective,
+  detectPanelHandoff,
+  MAX_SAME_SPEAKER_TURNS,
+} from "../utils/panelTurnPolicy.ts";
+import {
   hashAuthToken,
   isEmailCode,
   isLongAuthToken,
@@ -565,5 +570,23 @@ const paceZero = computeDeliveryMetrics([
   { type: "user", text: "more words here", speakSeconds: -30 },
 ]);
 assert(paceZero.paceWpm === null, "Zero and negative turn durations are ignored, not counted");
+
+// 25. Panel hand-offs: the named panelist must be brought in, a mention must not
+assert(
+  detectPanelHandoff("That reconciles nothing yet. Marcus, please close with your final takeaway.", "Sarah") === "Marcus",
+  "A closing hand-off by name is detected",
+);
+assert(detectPanelHandoff("Good margins so far. What's your read, Chen?", "Sarah") === "Chen", "A trailing vocative question is a hand-off");
+assert(detectPanelHandoff("Over to you, Sarah.", "Marcus") === "Sarah", "'Over to you, <name>' is a hand-off");
+assert(detectPanelHandoff("Building on what Marcus said, what is your churn?", "Sarah") === null, "A passing mention is not a hand-off");
+assert(detectPanelHandoff("Good point, Sarah.", "Marcus") === null, "A statement ending on a name is not a hand-off");
+assert(detectPanelHandoff("Chen, can you take this? What's your CAC?", "Sarah") === null, "A hand-off followed by a question to the founder leaves the founder on the floor");
+assert(detectPanelHandoff("Marcus, please close.", "Marcus") === null, "A panelist cannot hand off to themself");
+
+// 26. Speaker rotation: a streak forces a different panelist unless the founder named one
+assert(buildRotationDirective("Sarah", MAX_SAME_SPEAKER_TURNS - 1, "Our CAC is five dollars.") === "", "No directive below the streak limit");
+const rotation = buildRotationDirective("Sarah", MAX_SAME_SPEAKER_TURNS, "Our CAC is five dollars.");
+assert(rotation.includes("Sarah does not speak") && rotation.includes("Marcus or Chen"), "A streak hands the next turn to the other panelists");
+assert(buildRotationDirective("Sarah", MAX_SAME_SPEAKER_TURNS + 2, "Sarah, to your question: it is ten dollars.") === "", "The founder addressing a panelist overrides rotation");
 
 console.log("\n🎉 All security & reasoning test assertions PASSED successfully!\n");

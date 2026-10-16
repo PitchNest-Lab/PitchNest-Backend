@@ -55,6 +55,11 @@ import {
   classifyConfirmationReply,
 } from "../utils/endSessionIntent.ts";
 import { detectFloorHandback } from "../utils/floorControl.ts";
+import {
+  buildHandoffCue,
+  buildRotationDirective,
+  detectPanelHandoff,
+} from "../utils/panelTurnPolicy.ts";
 import { applyConversationWindow } from "../utils/conversationWindow.ts";
 import {
   researchStartup,
@@ -577,6 +582,11 @@ type QueuedTurn = {
   // after its audio is queued, the server signals the client to conclude.
   isCanned?: boolean;
   endAfter?: boolean;
+  // Server-generated "[SYSTEM: ...]" cue (time check, hand-off). Not founder
+  // speech, so it must never update pitch memory or mark a question answered.
+  isSystemCue?: boolean;
+  // A hand-off cue's own turn never chains into another hand-off.
+  isHandoff?: boolean;
 };
 
 // ── Per-user concurrency cap ───────────────────────────────────────────────
@@ -959,6 +969,10 @@ export function initRestSocket(wss: WebSocketServer) {
     }> = [];
     // The greeting invites the pitch, so the founder's first turn is prompted.
     let lastPanelTurnHadQuestion = true;
+    // Speaker rotation: who spoke the last panel turn and how many in a row.
+    // A long streak means one panelist is stuck drilling a single thread.
+    let lastPanelSpeaker: string | null = null;
+    let panelSpeakerStreak = 0;
     let unpromptedSellingTurns = 0;
 
     // One-shot proactive time cues (halfway check-in, two-minute wrap-up) —
@@ -1214,7 +1228,14 @@ export function initRestSocket(wss: WebSocketServer) {
         let userInputToUse = userInput;
 
         // Structured Pitch Memory Update: update state with the founder's latest utterance
-        if (!turn.isGreeting && !turn.isCanned && !turn.isVerdict && turn.text) {
+        if (
+          !turn.isGreeting &&
+          !turn.isCanned &&
+          !turn.isVerdict &&
+          !turn.isSystemCue &&
+          !turn.isNudge &&
+          turn.text
+        ) {
           pitchSessionState = updatePitchMemory(
             pitchSessionState,
             turn.text,
@@ -1242,6 +1263,17 @@ export function initRestSocket(wss: WebSocketServer) {
         if (!isCoachMode && !turn.isGreeting) {
           const stateLine = buildPanelStateLine();
           if (stateLine) userInputToUse = `${stateLine}\n${userInputToUse}`;
+          // Speaker rotation is enforced here, not left to the prompt: after
+          // MAX_SAME_SPEAKER_TURNS straight turns, another panelist takes over.
+          // Founder turns only — system cues already say who speaks.
+          if (!turn.isSystemCue && !turn.isNudge) {
+            const rotation = buildRotationDirective(
+              lastPanelSpeaker,
+              panelSpeakerStreak,
+              turn.text,
+            );
+            if (rotation) userInputToUse = `${rotation}\n${userInputToUse}`;
+          }
         }
 
         // Deck slide mapping. Two sources, in order of trust:
@@ -1510,6 +1542,11 @@ export function initRestSocket(wss: WebSocketServer) {
         if (!isCoachMode && !turn.isGreeting && fullSpokenText.trim()) {
           lastPanelTurnHadQuestion = /\?/.test(fullSpokenText);
         }
+        if (!isCoachMode && !turn.isGreeting && !turn.isCanned && fullSpokenText.trim()) {
+          panelSpeakerStreak =
+            activeSpeaker === lastPanelSpeaker ? panelSpeakerStreak + 1 : 1;
+          lastPanelSpeaker = activeSpeaker;
+        }
 
         // Two-step interruption (Item D): commit the floor hold. The panel
         // signals intent with @@FLOOR hold AND keeps STEP 1 to a short intent
@@ -1570,6 +1607,34 @@ export function initRestSocket(wss: WebSocketServer) {
           sendJson(ws, { type: "turn_aborted" });
         } else {
           sendJson(ws, { type: "turn_complete", audioChunks: chunksProcessed });
+        }
+
+        // Panelist hand-off ("Marcus, please close…"): the named panelist only
+        // speaks if a turn is queued for them, otherwise the room goes silent
+        // and the founder thinks the question is theirs. Skipped when the
+        // founder has already spoken (their turn will be answered anyway) and
+        // never chained, so two panelists can't pass the floor back and forth.
+        if (
+          !isCoachMode &&
+          !wasAborted &&
+          !turn.isGreeting &&
+          !turn.isCanned &&
+          !turn.isHandoff &&
+          !sessionEnded &&
+          !floorHeldByPanel &&
+          turnQueue.length === 0 &&
+          getTimeLeftSeconds() > 0
+        ) {
+          const handoffTo = detectPanelHandoff(fullSpokenText, activeSpeaker);
+          if (handoffTo) {
+            enqueueTurn({
+              text: buildHandoffCue(activeSpeaker, handoffTo),
+              inputMethod: "chat",
+              timeLeft: getTimeLeftSeconds(),
+              isSystemCue: true,
+              isHandoff: true,
+            });
+          }
         }
 
         // Voice end-session: the closing remark has now finished streaming to
@@ -1717,6 +1782,7 @@ export function initRestSocket(wss: WebSocketServer) {
             ? `[SYSTEM: The founder just handed you the floor back. Riley — now ask the question you were going to interrupt with. ONE short spoken question, then stop.]`
             : `[SYSTEM: The founder just handed the floor back to the panel. The panelist who interrupted — ask the question you were holding. ONE short spoken question, one speaker, then stop.]`,
           inputMethod: "chat",
+          isSystemCue: true,
         });
         console.log(
           "🎙 Two-step interruption: founder handed the floor back — panel asks its held question.",
@@ -1735,6 +1801,7 @@ export function initRestSocket(wss: WebSocketServer) {
             ? `[SYSTEM: The founder kept talking after your interruption. Riley — go ahead and ask your question now. ONE short spoken question, one speaker, then stop.]`
             : `[SYSTEM: The founder kept talking after the interruption without handing the floor back. The interrupting panelist — go ahead and ask your question now. ONE short spoken question, one speaker, then stop.]`,
           inputMethod: "chat",
+          isSystemCue: true,
         });
         console.log(
           "🎙 Two-step interruption: founder did not hand back after re-signal — panel asks anyway.",
@@ -2602,6 +2669,7 @@ export function initRestSocket(wss: WebSocketServer) {
                   text: `[SYSTEM: Time check — about half the session remains (${mins}:${String(secs).padStart(2, "0")} left). ${isCoachMode ? "Riley" : "The most natural panelist"} should acknowledge the time in ONE short spoken sentence and steer toward the most important area not yet covered. Keep it natural — no lecture about time.]`,
                   inputMethod: "chat",
                   timeLeft: timeLeftSeconds,
+                  isSystemCue: true,
                 });
               }
               // Two-minute wrap-up — start landing the plane so the hard stop
@@ -2611,9 +2679,10 @@ export function initRestSocket(wss: WebSocketServer) {
                 enqueueTurn({
                   text: isCoachMode
                     ? `[SYSTEM: Only ${mins}:${String(secs).padStart(2, "0")} remains. Riley — tell the founder time is almost up, invite their closing summary, and prepare one final encouraging takeaway. Short spoken sentences only.]`
-                    : `[SYSTEM: Only ${mins}:${String(secs).padStart(2, "0")} remains. Panel — say so out loud and begin wrapping up: no new complex topics, one final clarification at most, then Marcus steers toward closing remarks so the verdict doesn't cut anyone off. ONE speaker, 1-2 sentences.]`,
+                    : `[SYSTEM: Only ${mins}:${String(secs).padStart(2, "0")} remains. Marcus speaks this turn: say out loud that time is nearly up, then either ask the ONE final question that matters most for your verdict or invite the founder's closing line. No new complex topics. Speak to the founder only — do not hand the floor to another panelist. 1-2 sentences.]`,
                   inputMethod: "chat",
                   timeLeft: timeLeftSeconds,
+                  isSystemCue: true,
                 });
               }
             }

@@ -592,7 +592,9 @@ export function buildPitchMemoryPromptBlock(state: PitchSessionState): string {
   if (state.numericalNotes.length > 0 || state.contradictionsDetected.length > 0) {
     parts.push(`NUMERICAL INTEGRITY:`);
     for (const n of state.numericalNotes) parts.push(`- ✓ ${n}`);
-    for (const c of state.contradictionsDetected) parts.push(`- 🚨 CONTRADICTION: ${c} (Prioritize probing this!)`);
+    // Auto-detected from speech-to-text: a subset ("the other 50 users" after
+    // "200 users") or a mis-hearing can trip it, so it is a lead, not a fact.
+    for (const c of state.contradictionsDetected) parts.push(`- 🚨 POSSIBLE CONTRADICTION: ${c} (Worth one question if the conversation itself shows the conflict; drop it once the founder explains. Never cite "our record" to the founder.)`);
   }
 
   // Deck Discrepancies vs Speech
