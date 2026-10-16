@@ -273,12 +273,11 @@ function xmlEscape(value: string): string {
 export function publicSiteOrigin(): string {
   try {
     const url = new URL(config.publicSiteUrl);
-    return url.protocol === "http:" || url.protocol === "https:"
-      ? url.origin
-      : "https://www.pitchnest.app";
-  } catch {
-    return "https://www.pitchnest.app";
-  }
+    if (url.protocol === "http:" || url.protocol === "https:") return url.origin;
+  } catch {}
+  // Production refuses to boot with an invalid PUBLIC_SITE_URL (config/env.ts),
+  // so this only answers in a misconfigured development setup.
+  return "http://localhost:5174";
 }
 
 export async function getPublicBusinessSitemap(_req: Request, res: Response) {

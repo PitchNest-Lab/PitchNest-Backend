@@ -89,9 +89,10 @@ router.post("/events", eventLimiter, optionalUserAuth, recordClientEvent);
 router.get("/opportunities", discoverReadLimiter, listPublicOpportunities);
 router.get("/businesses", discoverReadLimiter, listPublicBusinesses);
 router.get("/businesses/:slug", discoverReadLimiter, getPublicBusiness);
-// Link-preview HTML for social crawlers. Vercel rewrites crawler requests for
-// www.pitchnest.app/businesses/:slug here (see frontend/vercel.json), because
-// the static SPA shell cannot carry per-business Open Graph tags.
+// Link-preview HTML for social crawlers, because the static SPA shell cannot
+// carry per-business Open Graph tags. Only reached once the frontend host
+// forwards crawler requests for /businesses/:slug here — not yet set up on
+// the Cloudflare frontend.
 router.get("/businesses/:slug/share-html", discoverReadLimiter, getPublicBusinessShareHtml);
 router.get(
   "/businesses/:slug/engagement",

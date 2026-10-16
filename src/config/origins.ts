@@ -3,7 +3,7 @@ import { config } from "./env.ts";
 /**
  * Browser origins allowed to call either HTTP or WebSocket endpoints.
  * Preview deployments are opt-in through CORS_EXTRA_ORIGINS; accepting every
- * *.vercel.app / *.pages.dev hostname lets any stranger-controlled project
+ * *.workers.dev / *.pages.dev hostname lets any stranger-controlled project
  * become an allowed browser origin.
  */
 export function allowedBrowserOrigins(): Set<string> {

@@ -28,10 +28,10 @@ function replaceCanonical(html: string, url: string): string {
 
 /**
  * A tiny standalone document for social crawlers (WhatsApp, LinkedIn, X,
- * Slack, Facebook…). Production serves the SPA from Vercel, whose static shell
- * cannot carry per-business tags, so Vercel rewrites crawler user agents to
- * the backend route that returns this. Humans never receive it; if one does,
- * the link points to the canonical page.
+ * Slack, Facebook…). The frontend's static shell cannot carry per-business
+ * tags, so the frontend host is meant to forward crawler user agents to the
+ * backend route that returns this (not yet set up on Cloudflare). Humans never
+ * receive it; if one does, the link points to the canonical page.
  */
 export function renderPublicBusinessShareDocument(
   business: PublicBusinessProfile | null,

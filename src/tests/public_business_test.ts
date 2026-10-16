@@ -98,16 +98,16 @@ const htmlTemplate = `<!doctype html><html><head>
 const profileHtml = injectPublicBusinessMetadata(
   htmlTemplate,
   { ...profile, name: "Market <Bridge>" },
-  "https://www.pitchnest.app",
+  "https://site.example",
   "market-bridge",
 );
 assert.match(profileHtml, /Market &lt;Bridge&gt;/);
 assert.match(profileHtml, /name="robots" content="index, follow"/);
-assert.match(profileHtml, /rel="canonical" href="https:\/\/www\.pitchnest\.app\/businesses\/market-bridge"/);
+assert.match(profileHtml, /rel="canonical" href="https:\/\/site\.example\/businesses\/market-bridge"/);
 const unavailableHtml = injectPublicBusinessMetadata(
   htmlTemplate,
   null,
-  "https://www.pitchnest.app",
+  "https://site.example",
   "private-draft",
 );
 assert.match(unavailableHtml, /name="robots" content="noindex, follow"/);
@@ -203,15 +203,15 @@ try {
 // Crawler share document: escaped, canonical, and noindex when unavailable.
 const shareDocument = renderPublicBusinessShareDocument(
   { ...profile, name: "Market <Bridge>" },
-  "https://www.pitchnest.app",
+  "https://site.example",
   "market-bridge",
 );
 assert.match(shareDocument, /<meta property="og:title" content="Market &lt;Bridge&gt; — PitchNest" \/>/);
-assert.match(shareDocument, /href="https:\/\/www\.pitchnest\.app\/businesses\/market-bridge"/);
+assert.match(shareDocument, /href="https:\/\/site\.example\/businesses\/market-bridge"/);
 assert.doesNotMatch(shareDocument, /<Bridge>/);
-const missingShareDocument = renderPublicBusinessShareDocument(null, "https://www.pitchnest.app", "private-draft");
+const missingShareDocument = renderPublicBusinessShareDocument(null, "https://site.example", "private-draft");
 assert.match(missingShareDocument, /name="robots" content="noindex, follow"/);
-assert.match(missingShareDocument, /href="https:\/\/www\.pitchnest\.app\/discover"/);
+assert.match(missingShareDocument, /href="https:\/\/site\.example\/discover"/);
 
 const migration = readFileSync(
   new URL("../../migrations/0020_discover_public_reads.sql", import.meta.url),
