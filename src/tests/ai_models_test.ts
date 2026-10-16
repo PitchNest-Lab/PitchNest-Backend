@@ -1,9 +1,11 @@
 import "./testEnv.ts";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_LIVE_REASONING_EFFORT,
   JUDGE_MODEL,
   MODEL_CATALOG,
   PLAN_AI_PROFILES,
+  REASONING_HEADROOM,
   isModelId,
   type ModelId,
 } from "../config/aiModels.ts";
@@ -42,6 +44,7 @@ process.env.AZURE_OPENAI_DEPLOYMENT = "base-deploy";
 delete process.env.AZURE_OPENAI_DEPLOYMENT_ADVANCED;
 delete process.env.AI_ADVANCED_REASONING_EFFORT;
 delete process.env.AI_STANDARD_REASONING_EFFORT;
+delete process.env.AI_LIVE_REASONING_EFFORT;
 __setClientFactoryForTests(null);
 
 const fellBack = resolveModel("advanced");
@@ -66,6 +69,7 @@ process.env.AI_ADVANCED_REASONING_EFFORT = "high";
 
 const calls: any[] = [];
 let rejectNext: string | null = null;
+const refusedEfforts = new Set<string>();
 
 function fakeClient(): any {
   return {
@@ -75,6 +79,13 @@ function fakeClient(): any {
           calls.push(params);
           if (rejectNext && rejectNext in params) {
             const err: any = new Error(`400 Unsupported parameter: '${rejectNext}' is not supported with this model.`);
+            err.status = 400;
+            throw err;
+          }
+          if (refusedEfforts.has(params.reasoning_effort)) {
+            const err: any = new Error(
+              `400 Unsupported value: 'reasoning_effort' does not support '${params.reasoning_effort}' with this model.`,
+            );
             err.status = 400;
             throw err;
           }
@@ -102,11 +113,43 @@ assert.deepEqual(calls[0].response_format, { type: "json_object" });
 assert.equal(calls[0].max_completion_tokens, MODEL_CATALOG.advanced.maxOutputTokens, "budget clamped to the model ceiling");
 
 // No effort configured → none sent; no JSON requested → no response_format.
+// The budget still leaves room for the reasoning the model does by default.
 calls.length = 0;
 await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50 });
 assert.equal(calls[0].model, "base-deploy");
 assert.equal("reasoning_effort" in calls[0], false);
 assert.equal("response_format" in calls[0], false);
+assert.equal(calls[0].max_completion_tokens, 50 + REASONING_HEADROOM.default, "room for default reasoning");
+
+// Live calls on a model with no effort of its own send the live effort.
+calls.length = 0;
+await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50, live: true });
+assert.equal(calls[0].reasoning_effort, DEFAULT_LIVE_REASONING_EFFORT);
+assert.equal(calls[0].max_completion_tokens, 50 + REASONING_HEADROOM[DEFAULT_LIVE_REASONING_EFFORT]);
+process.env.AI_LIVE_REASONING_EFFORT = "low";
+calls.length = 0;
+await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50, live: true });
+assert.equal(calls[0].reasoning_effort, "low", "the live effort can be overridden");
+delete process.env.AI_LIVE_REASONING_EFFORT;
+
+// A model's own effort wins over the live one, and sizes the budget.
+calls.length = 0;
+await completeChat("advanced", { messages: [{ role: "user", content: "hi" }], maxTokens: 50, live: true });
+assert.equal(calls[0].reasoning_effort, "high");
+assert.equal(calls[0].max_completion_tokens, 50 + REASONING_HEADROOM.high);
+
+// A level the deployment does not offer is stepped up and remembered.
+calls.length = 0;
+refusedEfforts.add("none");
+refusedEfforts.add("minimal");
+text = await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50, live: true });
+assert.equal(text, "ok");
+assert.deepEqual(calls.map((c) => c.reasoning_effort), ["none", "minimal", "low"]);
+calls.length = 0;
+await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50, live: true });
+assert.deepEqual(calls.map((c) => c.reasoning_effort), ["low"], "refused levels are not retried");
+assert.equal(calls[0].max_completion_tokens, 50 + REASONING_HEADROOM.low);
+refusedEfforts.clear();
 
 // A rejected optional parameter is retried without it, then remembered.
 calls.length = 0;
@@ -119,6 +162,7 @@ calls.length = 0;
 await completeChat("advanced", { messages: [{ role: "user", content: "hi" }], maxTokens: 50 });
 assert.equal(calls.length, 1, "the rejection is remembered for the deployment");
 assert.equal("reasoning_effort" in calls[0], false);
+assert.equal(calls[0].max_completion_tokens, 50, "a model that does not reason gets no reasoning room");
 
 // JSON mode rejection is handled the same way.
 calls.length = 0;
@@ -136,6 +180,30 @@ __setClientFactoryForTests(() => ({
 await assert.rejects(
   completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50 }),
   /429/,
+);
+
+// A call that spends its whole budget before answering returns "" and says why.
+__setClientFactoryForTests(() => ({
+  chat: {
+    completions: {
+      create: async () => ({
+        choices: [{ message: { content: "" }, finish_reason: "length" }],
+        usage: { completion_tokens_details: { reasoning_tokens: 2098 } },
+      }),
+    },
+  },
+}) as any);
+const warnings: string[] = [];
+const originalWarn = console.warn;
+console.warn = (message?: any) => {
+  warnings.push(String(message));
+};
+text = await completeChat("standard", { messages: [{ role: "user", content: "hi" }], maxTokens: 50 });
+console.warn = originalWarn;
+assert.equal(text, "");
+assert.ok(
+  warnings.some((w) => w.includes("whole") && w.includes("2098 on reasoning")),
+  "an exhausted budget is logged with its reasoning-token count",
 );
 
 // Streaming yields only the text deltas, in order.

@@ -20,10 +20,43 @@
  * same for every plan, so a score means the same thing whatever the founder
  * pays, survives an upgrade or downgrade, and stays comparable across re-pitches
  * and shared reports. PLAN_AI_PROFILES deliberately has no field for scoring.
+ *
+ * ── REASONING EFFORT ─────────────────────────────────────────────────────────
+ * An effort set for a model (its reasoningEffortEnv) applies to every call on
+ * it. When none is set, live calls — the panel's spoken replies, verdicts and
+ * on-screen tips, where a founder is waiting — use LIVE_REASONING_EFFORT so the
+ * model does not think before it speaks; every other call uses the model's own
+ * default. A level the deployment does not offer is stepped up to the next one
+ * it accepts (services/aiModelRouter.ts).
  */
 
-/** Reasoning effort accepted by reasoning-capable models. */
-export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high";
+/** Reasoning effort accepted by reasoning-capable models. Not every model
+ *  offers every level (gpt-5.6 has no "minimal"; older ones have no "none"). */
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+/** Effort for live calls on a model with no effort of its own. On gpt-5.6,
+ *  "none" cut the panel's median first token from ~2.0 s (model default) to
+ *  ~1.35 s, with questions of the same quality. Override with
+ *  AI_LIVE_REASONING_EFFORT. */
+export const DEFAULT_LIVE_REASONING_EFFORT: ReasoningEffort = "none";
+export const LIVE_REASONING_EFFORT_ENV = "AI_LIVE_REASONING_EFFORT";
+
+/**
+ * Tokens added to a call's budget for hidden reasoning. Reasoning models count
+ * it against max_completion_tokens before writing a word, so a budget sized for
+ * the visible answer alone comes back empty: the evaluation's action-plan and
+ * market sections did, in 3 and 2 of 17 test reports. "default" is for calls
+ * that send no effort. Unused budget is not billed.
+ */
+export const REASONING_HEADROOM: Record<ReasoningEffort | "default", number> = {
+  none: 0,
+  minimal: 256,
+  low: 1024,
+  medium: 2048,
+  default: 2048,
+  high: 4096,
+  xhigh: 8192,
+};
 
 export interface ModelSpec {
   /** Shown in logs only. */
@@ -41,7 +74,8 @@ export interface ModelSpec {
    *  once without a rejected parameter and remembers the result. */
   supportsReasoningEffort: boolean;
   supportsJsonMode: boolean;
-  /** Ceiling for output tokens; larger requests are clamped to it. */
+  /** Ceiling for one call's output, hidden reasoning included; larger budgets
+   *  are clamped to it. */
   maxOutputTokens: number;
 }
 
@@ -53,7 +87,7 @@ export const MODEL_CATALOG = {
     reasoningEffortEnv: "AI_STANDARD_REASONING_EFFORT",
     supportsReasoningEffort: true,
     supportsJsonMode: true,
-    maxOutputTokens: 4000,
+    maxOutputTokens: 8000,
   },
   /** Stronger coaching for Pro. Until AZURE_OPENAI_DEPLOYMENT_ADVANCED is set it
    *  resolves to "standard". It can also be the same deployment as standard
@@ -66,7 +100,7 @@ export const MODEL_CATALOG = {
     reasoningEffortEnv: "AI_ADVANCED_REASONING_EFFORT",
     supportsReasoningEffort: true,
     supportsJsonMode: true,
-    maxOutputTokens: 4000,
+    maxOutputTokens: 8000,
   },
 } as const satisfies Record<string, ModelSpec>;
 
@@ -102,7 +136,8 @@ export function isModelId(value: unknown): value is ModelId {
   return typeof value === "string" && Object.prototype.hasOwnProperty.call(MODEL_CATALOG, value);
 }
 
-const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "minimal", "low", "medium", "high"];
+/** Every level, least reasoning first. */
+export const REASONING_EFFORTS: readonly ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
 
 export function parseReasoningEffort(value: unknown): ReasoningEffort | undefined {
   const v = typeof value === "string" ? value.trim().toLowerCase() : "";

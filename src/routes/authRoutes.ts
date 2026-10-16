@@ -1,5 +1,5 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import {
   signup,
   login,
@@ -40,7 +40,11 @@ const authLimiter = rateLimit({
 const sessionMaintenanceLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
   max: 120,
-  keyGenerator: (req) => String(req.user?.accountType ?? "account") + ":" + String(req.user?.id ?? req.ip),
+  // Keyed by account; the IP fallback goes through ipKeyGenerator so IPv6
+  // clients are grouped by subnet and cannot dodge the limit by rotating
+  // addresses within their own range.
+  keyGenerator: (req) =>
+    String(req.user?.accountType ?? "account") + ":" + String(req.user?.id ?? ipKeyGenerator(req.ip ?? "")),
   message: { error: "Too many session requests. Please try again later." },
   standardHeaders: true,
   legacyHeaders: false,

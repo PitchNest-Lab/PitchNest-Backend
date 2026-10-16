@@ -115,6 +115,15 @@ export function createStreamingRecognizer(
         // confidential company, customer, revenue and fundraising information.
         onFinalText(text, confidence);
       }
+    } else if (e.result.reason === sdk.ResultReason.NoMatch) {
+      // Speech was heard but no words came back, so the panel never replies
+      // and the founder is left waiting. Logged (there is no text to leak) so a
+      // missed answer can be told apart from silence; silence timeouts are
+      // routine during pauses and stay quiet.
+      const reason = sdk.NoMatchDetails.fromResult(e.result).reason;
+      if (reason !== sdk.NoMatchReason.InitialSilenceTimeout) {
+        console.warn(`[stt] speech heard but not recognized (${sdk.NoMatchReason[reason]}, ${recognitionLocale})`);
+      }
     }
   };
 

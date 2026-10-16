@@ -1359,7 +1359,7 @@ export async function generatePanelResponse(
   ];
 
   try {
-    return await completeChat(modelId, { messages, maxTokens: 1000 });
+    return await completeChat(modelId, { messages, maxTokens: 1000, live: true });
   } catch (err: any) {
     console.error("❌ OpenAI Panel Response Error:", err.message);
     throw err;
@@ -1413,6 +1413,9 @@ RULES:
         // JSON punctuation and a verbose model while cutting the tail latency.
         maxTokens: 220,
         json: true,
+        // Live: at the model's default effort, hidden reasoning could use up
+        // all 220 tokens and the card would come back empty.
+        live: true,
       })
     ).trim();
     if (!raw) return null;
@@ -1454,7 +1457,7 @@ export async function* streamPanelResponse(
   try {
     // Pass the abort signal so the LLM generation itself is cancelled on
     // barge-in — we stop paying for tokens we'll throw away.
-    const stream = await streamChat(modelId, { messages, maxTokens: 1000 }, { signal });
+    const stream = await streamChat(modelId, { messages, maxTokens: 1000, live: true }, { signal });
 
     for await (const text of stream) {
       if (signal?.aborted) break;
