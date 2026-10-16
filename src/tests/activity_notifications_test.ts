@@ -119,7 +119,7 @@ assert.equal(toNotificationView({ type: "something_else" }), null);
 // ─── Settings switches ───────────────────────────────────────────────────────
 assert.deepEqual(
   sanitizeSettings({ notifications: { pitchAlerts: true, businessActivity: false, followedUpdates: true } }).notifications,
-  { pitchAlerts: true, weeklyReport: false, investorInquiries: false, businessActivity: false, followedUpdates: true },
+  { pitchAlerts: true, businessActivity: false, followedUpdates: true },
 );
 const olderClient = sanitizeSettings({ notifications: { pitchAlerts: true } }).notifications as Record<string, unknown>;
 assert.equal("businessActivity" in olderClient, false, "a missing switch stays missing, which means on");

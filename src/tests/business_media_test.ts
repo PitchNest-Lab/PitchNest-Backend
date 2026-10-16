@@ -19,6 +19,7 @@ import { updateMyPublicProfile } from "../controllers/businessController.ts";
 import { injectPublicBusinessMetadata } from "../utils/publicBusinessMetadata.ts";
 
 const BUSINESS_ID = "11111111-1111-4111-8111-111111111111";
+const TRUSTED_AVATAR_URL = `${new URL(config.supabaseUrl).origin}/storage/v1/object/public/${config.avatarBucket}/avatars/1/profile`;
 
 async function photo(width: number, height: number, withGps = false): Promise<Buffer> {
   let image = sharp({ create: { width, height, channels: 3, background: { r: 200, g: 120, b: 40 } } }).jpeg();
@@ -102,13 +103,13 @@ const team = toPublicTeam(
     { user_id: 4, role: "viewer", public_title: "x", joined_at: "2026-03-01" },
   ],
   [
-    { id: 1, name: "Amaka Obi", avatar_url: "https://storage.example/avatars/1/profile" },
+    { id: 1, name: "Amaka Obi", avatar_url: TRUSTED_AVATAR_URL },
     { id: 3, name: "Tunde Bello", avatar_url: "javascript:alert(1)" },
     { id: 4, name: "  ", avatar_url: null },
   ],
 );
 assert.deepEqual(team, [
-  { name: "Amaka Obi", title: "", avatarUrl: "https://storage.example/avatars/1/profile", handle: null },
+  { name: "Amaka Obi", title: "", avatarUrl: TRUSTED_AVATAR_URL, handle: null },
   { name: "Tunde Bello", title: "Head of Growth", avatarUrl: null, handle: null },
 ]);
 assert.deepEqual(Object.keys(team[0]), ["name", "title", "avatarUrl", "handle"], "no ids, emails or roles");
