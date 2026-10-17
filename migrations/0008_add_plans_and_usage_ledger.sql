@@ -43,12 +43,9 @@ ALTER TABLE users
 -- has the product today wakes up tomorrow behind a wall they cannot pay past —
 -- there is no checkout yet. Only accounts created AFTER this runs start free.
 --
--- ⚠️ THIS STATEMENT IS NOT IDEMPOTENT IN EFFECT. ⚠️
--- Re-running this file after launch would silently upgrade every free user to
--- pro and hand away the product. Before re-running 0008 for any reason, either
--- delete this UPDATE or bound it with the launch date, e.g.
---     UPDATE users SET plan = 'pro' WHERE created_at < '2026-08-10';
-UPDATE users SET plan = 'pro';
+-- The one-time launch backfill that used to upgrade every row to Pro has been
+-- removed. Historical migrations must remain safe to replay. Comped access is
+-- now granted explicitly to a named account through an audited operator action.
 
 -- ──────────────────────────────────────────────────────────────────────────────
 -- 3. SESSION_STARTS — the usage ledger

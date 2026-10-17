@@ -8,6 +8,9 @@ import {
   generateSessionPDF,
   getSessionRecording,
   getPitchAttempts,
+  enableSessionShare,
+  disableSessionShare,
+  attachSessionRecording,
 } from "../controllers/sessionController.ts";
 
 const router = Router();
@@ -22,6 +25,12 @@ const pdfLimiter = rateLimit({
   legacyHeaders: false,
 });
 
+// NOTE: the public share read deliberately does NOT live here. This router is
+// mounted at /api/sessions, so a route declared here would resolve to
+// /api/sessions/public/<id> and sit one careless edit away from the owner-only
+// paths around it. Public endpoints are in routes/publicRoutes.ts, mounted at
+// /api/public — one file to audit for "what can a stranger reach".
+
 router.get("/", authMiddleware, listSessions);
 router.get("/:id/pdf", authMiddleware, pdfLimiter, generateSessionPDF);
 // Replay support: a short-lived signed URL for the session's AUDIO recording,
@@ -29,7 +38,12 @@ router.get("/:id/pdf", authMiddleware, pdfLimiter, generateSessionPDF);
 // to. Both are owner-only and must stay ABOVE the bare "/:id" route so Express
 // doesn't match them as a session id.
 router.get("/:id/recording", authMiddleware, getSessionRecording);
+router.put("/:id/recording", authMiddleware, attachSessionRecording);
 router.get("/:id/attempts", authMiddleware, getPitchAttempts);
+// Public sharing is opt-in and one boolean write either way; no limiter beyond
+// the global one, since only the owner can call these.
+router.post("/:id/share", authMiddleware, enableSessionShare);
+router.delete("/:id/share", authMiddleware, disableSessionShare);
 router.get("/:id", authMiddleware, getSession);
 router.delete("/:id", authMiddleware, deleteSession);
 // NOTE: POST /create was removed. Sessions are created server-side in

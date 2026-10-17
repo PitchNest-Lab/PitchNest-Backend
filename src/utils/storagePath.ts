@@ -1,6 +1,32 @@
 import { config } from "../config/env.ts";
 
 /**
+ * Only return avatar URLs issued by this deployment's public avatar bucket.
+ * Legacy arbitrary http(s) values are not rendered: an external image on a
+ * public profile is a third-party tracking pixel for every visitor who sees it.
+ */
+export function safeAvatarUrl(value: unknown): string | null {
+  if (typeof value !== "string" || !value || value.length > 2_048) return null;
+  try {
+    const url = new URL(value);
+    const storageOrigin = new URL(config.supabaseUrl).origin;
+    const prefix = `/storage/v1/object/public/${config.avatarBucket}/avatars/`;
+    if (
+      url.protocol !== "https:" ||
+      url.origin !== storageOrigin ||
+      !url.pathname.startsWith(prefix) ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash
+    ) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Derive a Supabase Storage object path from a stored value, tolerant of both
  * historical full public URLs and bare object paths.
  *
@@ -42,4 +68,43 @@ export function storagePathFromUrl(
 
   // Otherwise treat it as an already-bare object path (e.g. "decks/123_x.pdf").
   return trimmed.split("?")[0] || null;
+}
+
+/** Storage key for a new session recording, scoped to its owner. */
+export function recordingObjectPath(userId: number, safeName: string): string {
+  return `pitches/${userId}/${Date.now()}_${safeName}`;
+}
+
+/** Local-fallback file name for a new session recording, scoped to its owner. */
+export function recordingLocalName(userId: number, safeName: string): string {
+  return `rec_${userId}_${Date.now()}_${safeName}`;
+}
+
+// Matches sanitizeUploadName output: no slashes, so no path traversal; ".."
+// is additionally refused below.
+const SAFE_NAME = "[A-Za-z0-9._-]{1,200}";
+
+/**
+ * True only for a recording reference this user's own upload could have
+ * produced: "pitches/<userId>/<ts>_<name>" in storage, or
+ * "/uploads/rec_<userId>_<ts>_<name>" on local fallback.
+ *
+ * The WebSocket's set_video_url message is client input. Without this check a
+ * founder could point their own session at another user's deck or recording
+ * ("decks/…", "/uploads/<someone else's file>") and have the recording
+ * endpoint sign it for them with the service role.
+ */
+export function isOwnRecordingReference(value: unknown, userId: number): boolean {
+  if (typeof value !== "string" || !Number.isInteger(userId) || userId <= 0) return false;
+  const storage = new RegExp(`^pitches/${userId}/\\d{10,16}_${SAFE_NAME}$`);
+  const local = new RegExp(`^/uploads/rec_${userId}_\\d{10,16}_${SAFE_NAME}$`);
+  return (storage.test(value) || local.test(value)) && !value.includes("..");
+}
+
+/**
+ * True for any value the recording endpoint may sign: a recording object path
+ * ("pitches/…", including legacy unscoped keys). Never a deck or avatar path.
+ */
+export function isRecordingObjectPath(objectPath: string | null): boolean {
+  return typeof objectPath === "string" && objectPath.startsWith("pitches/") && !objectPath.includes("..");
 }

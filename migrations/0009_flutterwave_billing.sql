@@ -91,6 +91,7 @@ CREATE OR REPLACE FUNCTION grant_pro_access(
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 DECLARE
   v_payment payments;
@@ -140,6 +141,11 @@ BEGIN
   RETURN true;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT, INTEGER)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT, INTEGER)
+  TO service_role;
 
 -- ──────────────────────────────────────────────────────────────────────────────
 -- 4. RLS — deny anon, mirroring 0004

@@ -27,25 +27,34 @@ export const saveProfile = async (req: Request, res: Response) => {
     }
 
     // Upsert: insert if not exists, update if exists
+    const cleaned = Object.fromEntries(
+      Object.entries({ startup_name, industry, goal, funding_stage }).map(([key, value]) => [
+        key,
+        typeof value === "string" ? value.trim() : value,
+      ]),
+    );
+
     const { data, error } = await supabase
       .from("profiles")
       .upsert(
-        { user_id: userId, startup_name, industry, goal, funding_stage },
+        { user_id: userId, ...cleaned },
         { onConflict: "user_id" },
       )
       .select()
       .single();
 
-    await supabase
-      .from("users")
-      .update({
-        onboardingCompleted: true,
-      })
-      .eq("id", userId);
-
     if (error) {
       console.error("❌ Profile save error:", error);
       return res.status(500).json({ error: "Failed to save profile." });
+    }
+
+    const { error: userError } = await supabase
+      .from("users")
+      .update({ onboardingCompleted: true })
+      .eq("id", userId);
+    if (userError) {
+      console.error("❌ Onboarding status update failed:", userError);
+      return res.status(500).json({ error: "Profile saved, but onboarding could not be completed." });
     }
 
     res.status(200).json(data);
@@ -58,14 +67,18 @@ export const saveProfile = async (req: Request, res: Response) => {
 export const skipOnbording = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-    let data = await supabase
+    if (!userId) return res.status(401).json({ error: "Authentication required." });
+    const { error } = await supabase
       .from("users")
       .update({
         onboardingCompleted: true,
       })
       .eq("id", userId);
-
-    res.status(200).json(data);
+    if (error) {
+      console.error("❌ skip onboarding update failed:", error);
+      return res.status(500).json({ error: "Failed to save profile." });
+    }
+    res.status(200).json({ success: true });
   } catch (error) {
     console.error("❌ skip onboarding exception:", error);
     res.status(500).json({ error: "Failed to save profile." });

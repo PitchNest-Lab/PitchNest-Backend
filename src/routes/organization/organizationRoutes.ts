@@ -10,8 +10,14 @@ import {
   replays,
   orgDetails,
 } from "../../controllers/organization/organizationController";
+import {
+  organizationAuthMiddleware,
+  requireOrgRole,
+} from "../../middleware/authMiddleware.ts";
 
 const router = Router();
+
+router.use(organizationAuthMiddleware, requireOrgRole("owner", "admin", "facilitator"));
 
 router.post("/details", orgDetails);
 router.post("/overview", overview);

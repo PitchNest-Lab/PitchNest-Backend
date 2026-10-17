@@ -1,106 +1,118 @@
 import { Request, Response } from "express";
-import { supabase } from "../config/supabase.ts";
 import fs from "fs";
 import path from "path";
+import { supabase } from "../config/supabase.ts";
+import { config } from "../config/env.ts";
 
-// Waitlist local fallback file path
 const waitlistFile = path.join(process.cwd(), "waitlist.json");
+const surveyFile = path.join(process.cwd(), "survey-responses.json");
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 
-/**
- * Handle waitlist signups.
- * Attempts to save to Supabase table `waitlist`, falling back to local waitlist.json.
- */
+function normalizeEmail(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const email = value.trim().toLowerCase();
+  return email.length <= 254 && EMAIL_PATTERN.test(email) ? email : null;
+}
+
+function cleanSurveyAnswer(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const answer = value
+    .replace(/[\u0000-\u001F\u007F]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return answer ? answer.slice(0, 500) : undefined;
+}
+
+async function readJsonArray<T>(file: string): Promise<T[]> {
+  try {
+    const parsed = JSON.parse(await fs.promises.readFile(file, "utf-8"));
+    return Array.isArray(parsed) ? parsed.slice(-10_000) : [];
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") {
+      console.warn("Local development submission file is invalid:", error);
+    }
+    return [];
+  }
+}
+
+/** Add one email to the waitlist without exposing whether it was already present. */
 export const handleWaitlist = async (req: Request, res: Response) => {
   try {
-    const { email } = req.body;
-    if (!email || !email.includes("@")) {
+    const cleanEmail = normalizeEmail(req.body?.email);
+    if (!cleanEmail) {
       return res.status(400).json({ error: "Please provide a valid email." });
     }
 
-    const cleanEmail = email.toLowerCase().trim();
+    const { error } = await supabase.from("waitlist").insert([{ email: cleanEmail }]);
 
-    // Try Supabase insert
-    const { error } = await supabase
-      .from("waitlist")
-      .insert([{ email: cleanEmail }]);
-
-    if (error) {
-      console.warn("⚠️ Warning: Supabase 'waitlist' table is missing. Saving to local waitlist.json instead.");
-      
-      // Fallback: save to local waitlist.json
-      let list: string[] = [];
-      if (fs.existsSync(waitlistFile)) {
-        try {
-          list = JSON.parse(fs.readFileSync(waitlistFile, "utf-8"));
-        } catch (e) {}
+    // PostgreSQL unique violation means this address is already registered and
+    // gets the same response, avoiding a public email-enumeration oracle.
+    if (error && error.code !== "23505") {
+      console.error("Waitlist insert failed:", error);
+      // Never put email addresses on a production instance's ephemeral disk.
+      // The file fallback exists only to keep local UI development convenient.
+      if (config.nodeEnv === "production") {
+        return res.status(503).json({
+          error: "Waitlist is temporarily unavailable. Please retry.",
+        });
       }
-      if (!list.includes(cleanEmail)) {
-        list.push(cleanEmail);
-        fs.writeFileSync(waitlistFile, JSON.stringify(list, null, 2));
-      }
+      const list = await readJsonArray<string>(waitlistFile);
+      if (!list.includes(cleanEmail)) list.push(cleanEmail);
+      await fs.promises.writeFile(
+        waitlistFile,
+        JSON.stringify(list.slice(-10_000), null, 2),
+        "utf-8",
+      );
     }
 
     res.status(200).json({ success: true, message: "Thank you for signing up!" });
   } catch (error) {
-    console.error("❌ Waitlist error:", error);
+    console.error("Waitlist error:", error);
     res.status(500).json({ error: "Failed to sign up." });
   }
 };
 
-/**
- * Handle survey submissions.
- * Upserts into Supabase `waitlist` table with survey-specific fields
- * (pitch_type, frustration, next_pitch) using on_conflict=email.
- */
+/** Upsert bounded survey answers for a waitlist email. */
 export const handleSurvey = async (req: Request, res: Response) => {
   try {
-    const { email, pitch_type, frustration, next_pitch } = req.body;
-
-    if (!email || !email.includes("@")) {
+    const cleanEmail = normalizeEmail(req.body?.email);
+    if (!cleanEmail) {
       return res.status(400).json({ error: "Please provide a valid email." });
     }
 
-    const cleanEmail = email.toLowerCase().trim();
-
     const row: Record<string, string> = { email: cleanEmail };
-    // Validate and truncate optional survey fields.
-    const MAX_SURVEY_LEN = 500;
-    if (pitch_type && typeof pitch_type === "string")
-      row.pitch_type = pitch_type.slice(0, MAX_SURVEY_LEN);
-    if (frustration && typeof frustration === "string")
-      row.frustration = frustration.slice(0, MAX_SURVEY_LEN);
-    if (next_pitch && typeof next_pitch === "string")
-      row.next_pitch = next_pitch.slice(0, MAX_SURVEY_LEN);
+    const pitchType = cleanSurveyAnswer(req.body?.pitch_type);
+    const frustration = cleanSurveyAnswer(req.body?.frustration);
+    const nextPitch = cleanSurveyAnswer(req.body?.next_pitch);
+    if (pitchType) row.pitch_type = pitchType;
+    if (frustration) row.frustration = frustration;
+    if (nextPitch) row.next_pitch = nextPitch;
 
-    // Upsert so repeat submissions update existing rows
     const { error } = await supabase
       .from("waitlist")
       .upsert([row], { onConflict: "email" });
 
     if (error) {
-      console.error("❌ Supabase survey upsert error:", error);
-
-      // Fallback: save to local file
-      const surveyFile = path.join(process.cwd(), "survey-responses.json");
-      let list: Record<string, string>[] = [];
-      if (fs.existsSync(surveyFile)) {
-        try {
-          list = JSON.parse(fs.readFileSync(surveyFile, "utf-8"));
-        } catch (e) {}
+      console.error("Survey upsert failed:", error);
+      if (config.nodeEnv === "production") {
+        return res.status(503).json({
+          error: "Survey is temporarily unavailable. Please retry.",
+        });
       }
-      // Replace existing entry for the same email, or add new
-      const idx = list.findIndex((item) => item.email === cleanEmail);
-      if (idx >= 0) {
-        list[idx] = { ...list[idx], ...row };
-      } else {
-        list.push(row);
-      }
-      fs.writeFileSync(surveyFile, JSON.stringify(list, null, 2));
+      const list = await readJsonArray<Record<string, string>>(surveyFile);
+      const index = list.findIndex((item) => item.email === cleanEmail);
+      if (index >= 0) list[index] = { ...list[index], ...row };
+      else list.push(row);
+      await fs.promises.writeFile(
+        surveyFile,
+        JSON.stringify(list.slice(-10_000), null, 2),
+        "utf-8",
+      );
     }
 
     res.status(200).json({ success: true, message: "Survey submitted successfully!" });
   } catch (error) {
-    console.error("❌ Survey error:", error);
+    console.error("Survey error:", error);
     res.status(500).json({ error: "Failed to submit survey." });
   }
 };

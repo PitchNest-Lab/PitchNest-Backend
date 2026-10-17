@@ -3,6 +3,7 @@ import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { computeFounderPercentile, AVERAGE_FOUNDER_SCORE } from "./aiService.ts";
+import { computeDeliveryMetrics } from "../utils/deliveryMetrics.ts";
 
 type PDFDoc = InstanceType<typeof PDFDocument>;
 
@@ -110,65 +111,12 @@ function formatDate(dateStr?: string): string {
   }
 }
 
-// ── Delivery metrics computed from the REAL transcript ───────────────────────
-// Code owns every number on the report. Anything not derivable from the saved
-// transcript is returned as null so the caller renders "N/A" (honestly absent)
-// instead of a fabricated placeholder. We deliberately do NOT compute Speaking
-// Pace (WPM), Average Pause, or Avg Response: those need per-utterance audio
-// timestamps the session does not record, and a fake number on the one claim a
-// founder can personally disprove would discredit the whole report.
-const FILLER_RE =
-  /\b(?:u+m+|u+h+|e+r+|e+h+|a+h+|hmm+|like|y'?know|you know|i mean|sort of|kind of|kinda|sorta|basically|literally|actually)\b/gi;
+// ── Delivery metrics ─────────────────────────────────────────────────────────
+// Moved to utils/deliveryMetrics.ts. These numbers now feed the cross-session
+// founder profile as well as this PDF, and a second copy of the filler regex
+// would drift until the report and the panel disagreed about how much filler
+// the founder used. Imported above; see that module for the null-not-zero rule.
 
-interface DeliveryMetrics {
-  founderWords: number | null;
-  fillerPct: number | null;
-  questionsAsked: number | null;
-  talkRatioPct: number | null;
-}
-function computeDeliveryMetrics(transcript: unknown): DeliveryMetrics {
-  const empty: DeliveryMetrics = {
-    founderWords: null,
-    fillerPct: null,
-    questionsAsked: null,
-    talkRatioPct: null,
-  };
-  if (!Array.isArray(transcript) || transcript.length === 0) return empty;
-
-  const wordCount = (s: string) => (s.trim().match(/\S+/g) || []).length;
-  let founderWords = 0;
-  let fillerCount = 0;
-  let panelWords = 0;
-  let questionsAsked = 0;
-  let hasFounderTurn = false;
-
-  for (const m of transcript as any[]) {
-    if (m?.type === "user") {
-      hasFounderTurn = true;
-      // Voice turns store the verbatim utterance in `fullText`; `text` holds a
-      // short summary. Use the raw utterance so word and filler counts reflect
-      // what the founder actually said, not the summarized version.
-      const raw = String(m.fullText || m.text || "");
-      founderWords += wordCount(raw);
-      const fillers = raw.match(FILLER_RE);
-      if (fillers) fillerCount += fillers.length;
-    } else if (m?.text) {
-      const t = String(m.text);
-      panelWords += wordCount(t);
-      // A panel turn that contains a question mark counts as one question asked.
-      if (/\?/.test(t)) questionsAsked += 1;
-    }
-  }
-
-  if (!hasFounderTurn) return empty;
-  const totalWords = founderWords + panelWords;
-  return {
-    founderWords: founderWords > 0 ? founderWords : 0,
-    fillerPct: founderWords > 0 ? Math.round((fillerCount / founderWords) * 100) : null,
-    questionsAsked, // 0 is a real, valid answer
-    talkRatioPct: totalWords > 0 ? Math.round((founderWords / totalWords) * 100) : null,
-  };
-}
 
 // ── Pattern B: word-boundary truncation ──────────────────────────────────────
 // One shared truncator: never cuts mid-word, appends a single standard ellipsis,

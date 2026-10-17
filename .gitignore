@@ -7,3 +7,16 @@ coverage/
 .env*
 !.env.example
 Docs
+
+# Terraform local files and sensitive artifacts
+**/.terraform/
+**/*.tfstate
+**/*.tfstate.*
+**/tfplan
+**/tfplan.*
+**/*.tfplan
+**/*.tfvars
+**/*.tfvars.json
+**/crash.log
+**/crash.*.log
+!**/.terraform.lock.hcl
