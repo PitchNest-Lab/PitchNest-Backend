@@ -30,7 +30,7 @@ function replaceCanonical(html: string, url: string): string {
  * A tiny standalone document for social crawlers (WhatsApp, LinkedIn, X,
  * Slack, Facebook…). The frontend's static shell cannot carry per-business
  * tags, so the frontend host is meant to forward crawler user agents to the
- * backend route that returns this (not yet set up on Cloudflare). Humans never
+ * backend route that returns this (not yet set up on the frontend host). Humans never
  * receive it; if one does, the link points to the canonical page.
  */
 export function renderPublicBusinessShareDocument(

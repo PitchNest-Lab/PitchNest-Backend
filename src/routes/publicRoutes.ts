@@ -92,7 +92,7 @@ router.get("/businesses/:slug", discoverReadLimiter, getPublicBusiness);
 // Link-preview HTML for social crawlers, because the static SPA shell cannot
 // carry per-business Open Graph tags. Only reached once the frontend host
 // forwards crawler requests for /businesses/:slug here — not yet set up on
-// the Cloudflare frontend.
+// the frontend host.
 router.get("/businesses/:slug/share-html", discoverReadLimiter, getPublicBusinessShareHtml);
 router.get(
   "/businesses/:slug/engagement",
