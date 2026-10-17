@@ -1,8 +1,12 @@
 import multer from "multer";
 import path from "path";
 import fs from "fs";
+import os from "os";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 import { config } from "../config/env.ts";
+import { supabase } from "../config/supabase.ts";
+import { isOwnRecordingReference, storagePathFromUrl } from "../utils/storagePath.ts";
 
 // Use writable temporary storage in serverless environments.
 // AWS Lambda exposes AWS_LAMBDA_FUNCTION_NAME automatically.
@@ -39,12 +43,6 @@ export function sanitizeUploadName(original: string | undefined | null): string 
     .slice(0, 100);
   return cleaned || "file";
 }
-
-// Configured multer instance with 500MB size limit (perfect for long webm uploads)
-export const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 500 * 1024 * 1024 }
-});
 
 /**
  * Per-kind upload guards.
@@ -100,6 +98,29 @@ export const avatarUpload = makeUpload(
 );
 
 /**
+ * Business logos and covers. 6 MB is the cover limit; logos are held to 2 MB by
+ * businessMediaService, which also re-checks the real bytes and re-encodes.
+ */
+export const businessImageUpload = makeUpload(
+  ["image/png", "image/jpeg", "image/webp"],
+  6 * 1024 * 1024,
+  "image",
+);
+
+// Recordings are much larger than decks and avatars. Keeping up to 150 MB per
+// request in V8's heap makes a handful of concurrent uploads enough to crash
+// the process, so recordings spool to an OS temp directory and are streamed to
+// object storage by the controller. Random server-side names also ensure that
+// no client filename can influence a temporary filesystem path.
+export const recordingTempDir = path.join(os.tmpdir(), "pitchnest-recordings");
+fs.mkdirSync(recordingTempDir, { recursive: true });
+
+const recordingDiskStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, recordingTempDir),
+  filename: (_req, _file, cb) => cb(null, crypto.randomUUID()),
+});
+
+/**
  * Session recordings — AUDIO only in practice.
  *
  * The recorder calls getUserMedia with video: false, so what arrives here is an
@@ -108,11 +129,23 @@ export const avatarUpload = makeUpload(
  * depending on the mimeType the recorder negotiated, and rejecting that would
  * silently lose the founder's recording (and with it, replay).
  */
-export const videoUpload = makeUpload(
-  ["video/webm", "video/mp4", "audio/webm", "audio/ogg", "audio/mpeg", "audio/mp4"],
-  150 * 1024 * 1024,
-  "recording",
-);
+const recordingMimeTypes = new Set([
+  "video/webm",
+  "video/mp4",
+  "audio/webm",
+  "audio/ogg",
+  "audio/mpeg",
+  "audio/mp4",
+]);
+
+export const videoUpload = multer({
+  storage: recordingDiskStorage,
+  limits: { fileSize: 150 * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    if (recordingMimeTypes.has(file.mimetype)) return cb(null, true);
+    cb(new Error(`UNSUPPORTED_FILE_TYPE:recording:${file.mimetype}`));
+  },
+});
 
 // ── Signed local-file delivery (S7) ─────────────────────────────────────────
 // Local-fallback files (written to disk when Supabase Storage errors) used to
@@ -129,6 +162,8 @@ export const videoUpload = makeUpload(
  * worthless if leaked into a log or browser history. Same TTL as Supabase
  * signed URLs (SIGNED_URL_TTL_SECONDS). */
 const LOCAL_FILE_TOKEN_TTL_SECONDS = 300;
+const LOCAL_FILE_TOKEN_ISSUER = "pitchnest";
+const LOCAL_FILE_TOKEN_AUDIENCE = "pitchnest-local-file";
 
 /**
  * Mints a relative URL for a local-fallback file, signed with the app's JWT
@@ -149,9 +184,14 @@ export function signLocalFileUrl(
   ttlSeconds: number = LOCAL_FILE_TOKEN_TTL_SECONDS,
 ): string {
   const token = jwt.sign(
-    { file: name, uid: userId },
+    { kind: "local-file", file: name, uid: userId },
     config.jwtSecret,
-    { expiresIn: ttlSeconds },
+    {
+      algorithm: "HS256",
+      issuer: LOCAL_FILE_TOKEN_ISSUER,
+      audience: LOCAL_FILE_TOKEN_AUDIENCE,
+      expiresIn: ttlSeconds,
+    },
   );
   return `/api/files/${encodeURIComponent(name)}?token=${token}`;
 }
@@ -167,11 +207,17 @@ export function verifyLocalFileToken(
 ): number | null {
   if (typeof token !== "string" || !token) return null;
   try {
-    const payload = jwt.verify(token, config.jwtSecret) as {
+    const payload = jwt.verify(token, config.jwtSecret, {
+      algorithms: ["HS256"],
+      issuer: LOCAL_FILE_TOKEN_ISSUER,
+      audience: LOCAL_FILE_TOKEN_AUDIENCE,
+    }) as {
+      kind?: unknown;
       file?: unknown;
       uid?: unknown;
     };
     if (
+      payload.kind !== "local-file" ||
       typeof payload.file !== "string" ||
       payload.file !== name ||
       typeof payload.uid !== "number"
@@ -182,4 +228,26 @@ export function verifyLocalFileToken(
   } catch {
     return null;
   }
+}
+
+/** Delete a recording reference that was minted for this user. */
+export async function removeOwnedRecordingReference(
+  value: string,
+  userId: number,
+): Promise<void> {
+  if (!isOwnRecordingReference(value, userId)) {
+    throw new Error("Invalid recording reference");
+  }
+  if (value.startsWith("/uploads/")) {
+    const name = value.slice("/uploads/".length);
+    if (name !== path.basename(name) || name.includes("..")) {
+      throw new Error("Invalid local recording reference");
+    }
+    await fs.promises.rm(path.join(uploadDir, name), { force: true });
+    return;
+  }
+  const objectPath = storagePathFromUrl(value);
+  if (!objectPath) throw new Error("Invalid storage recording reference");
+  const { error } = await supabase.storage.from(config.storageBucket).remove([objectPath]);
+  if (error) throw error;
 }

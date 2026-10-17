@@ -3,7 +3,21 @@ import path from "path";
 import fs from "fs";
 import { supabase } from "../config/supabase.ts";
 import { uploadDir, verifyLocalFileToken } from "../services/storageService.ts";
-import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
+import { config } from "../config/env.ts";
+import { allowedBrowserOrigins } from "../config/origins.ts";
+
+function allowedFrameAncestors(): string {
+  const values = new Set(["'self'"]);
+  for (const candidate of [config.clientUrl, ...allowedBrowserOrigins()]) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === "https:" || url.protocol === "http:") values.add(url.origin);
+    } catch {
+      // Invalid deployment values are ignored rather than injected into CSP.
+    }
+  }
+  return [...values].join(" ");
+}
 
 /**
  * S7: token-gated delivery for LOCAL-FALLBACK files.
@@ -48,29 +62,52 @@ export const getLocalFile = async (req: Request, res: Response) => {
   // 404, exactly as before.
   const storedPath = `/uploads/${name}`;
 
-  const { data: deck } = await supabase
+  const { data: deck, error: deckError } = await supabase
     .from("decks")
     .select("id")
     .eq("file_url", storedPath)
     .eq("user_id", uid)
     .maybeSingle();
 
+  if (deckError) {
+    console.error("Local file ownership check failed:", deckError.message);
+    return res.status(503).json({ error: "File access could not be verified" });
+  }
+
   let owned = !!deck;
+  let ownedKind: "deck" | "recording" | null = deck ? "deck" : null;
 
   if (!owned) {
-    const { data: sessions } = await supabase
+    const { data: session, error: sessionError } = await supabase
       .from("sessions")
       .select("id")
       .eq("video_url", storedPath)
       .eq("user_id", uid)
-      .limit(1);
-    // A session row pointing at the file is not proof on its own: video_url
-    // used to be client-supplied, so the name must also be a recording this
-    // user owns (rec_<uid>_… or an unshared legacy name).
-    owned =
-      Array.isArray(sessions) &&
-      sessions.length > 0 &&
-      (await authorizedRecordingTarget(storedPath, uid)) !== null;
+      .maybeSingle();
+    if (sessionError) {
+      console.error("Local recording ownership check failed:", sessionError.message);
+      return res.status(503).json({ error: "File access could not be verified" });
+    }
+    owned = !!session;
+    if (session) ownedKind = "recording";
+
+    // sessions.video_url was historically client-settable, so a session row
+    // pointing at a file is not proof the file is a recording. If ANY deck row
+    // owns this path, it is someone's deck: only the deck branch above may
+    // serve it.
+    if (owned) {
+      const { data: deckOwner, error: deckOwnerError } = await supabase
+        .from("decks")
+        .select("id")
+        .eq("file_url", storedPath)
+        .limit(1)
+        .maybeSingle();
+      if (deckOwnerError) {
+        console.error("Local file collision check failed:", deckOwnerError.message);
+        return res.status(503).json({ error: "File access could not be verified" });
+      }
+      if (deckOwner) owned = false;
+    }
   }
 
   if (!owned) {
@@ -85,5 +122,28 @@ export const getLocalFile = async (req: Request, res: Response) => {
   // Token is in the URL (logs, history, referrers) — never cache it. sendFile
   // sets Content-Type from the extension and supports Range requests.
   res.setHeader("Cache-Control", "private, no-store");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  const ext = path.extname(name).toLowerCase();
+  if (ownedKind === "deck") {
+    // Helmet's global SAMEORIGIN would block a PDF served by the API from the
+    // separately hosted frontend. The capability token and DB ownership check
+    // provide access control; CSP limits embedding to configured app origins.
+    res.removeHeader("X-Frame-Options");
+    res.setHeader(
+      "Content-Security-Policy",
+      `sandbox; default-src 'none'; frame-ancestors ${allowedFrameAncestors()}`,
+    );
+    res.type(ext === ".pdf" ? "application/pdf" : "text/plain; charset=utf-8");
+  } else {
+    res.setHeader("Content-Security-Policy", "sandbox; default-src 'none'; frame-ancestors 'none'");
+    const audioTypes: Record<string, string> = {
+      ".webm": "audio/webm",
+      ".ogg": "audio/ogg",
+      ".mp3": "audio/mpeg",
+      ".mp4": "audio/mp4",
+      ".m4a": "audio/mp4",
+    };
+    res.type(audioTypes[ext] || "application/octet-stream");
+  }
   res.sendFile(absPath);
 };

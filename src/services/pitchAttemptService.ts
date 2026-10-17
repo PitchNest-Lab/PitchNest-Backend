@@ -14,8 +14,9 @@
  *
  * Migration 0013 denormalises that chain onto every row as `pitch_root_id`
  * (id of attempt 1) and `attempt_number`, so counting is one indexed query.
- * Rows written before that migration have NULL in both; every function here
- * falls back to walking `parent_session_id`, which stays the source of truth.
+ * Rows written before that migration were backfilled; walking
+ * `parent_session_id` remains a data-integrity fallback for an individual row,
+ * not a substitute for deploying the required schema.
  *
  * ──────────────────────────────────────────────────────────────────────────────
  * WHY THIS LIVES SERVER-SIDE
@@ -213,9 +214,8 @@ export function computeAttemptStates(
 /**
  * Fetch the minimal chain columns for one user's sessions.
  *
- * Tries the indexed 0013 columns first and degrades to the pre-migration column
- * set when they don't exist yet, so the app works whichever order app and
- * migration are deployed in.
+ * Migration 0013 is required. A missing security-enforcement column must stop
+ * admission instead of silently weakening the attempt limit.
  */
 async function fetchChainRows(userId: number): Promise<ChainRow[]> {
   const withNewCols =
@@ -225,23 +225,11 @@ async function fetchChainRows(userId: number): Promise<ChainRow[]> {
     .select(withNewCols)
     .eq("user_id", userId);
 
-  let rawData: any[] | null = (primary.data as any[]) || null;
-  let queryError = primary.error;
-
-  if (queryError && /column|schema/i.test(queryError.message || "")) {
-    const fallback = await supabase
-      .from("sessions")
-      .select("id, parent_session_id, created_at, timestamp")
-      .eq("user_id", userId);
-    rawData = (fallback.data as any[]) || null;
-    queryError = fallback.error;
+  if (primary.error) {
+    console.error("❌ fetchChainRows failed:", primary.error.message);
+    throw primary.error;
   }
-
-  if (queryError) {
-    console.error("❌ fetchChainRows failed:", queryError.message);
-    throw queryError;
-  }
-  return (rawData || []) as ChainRow[];
+  return ((primary.data as any[]) || []) as ChainRow[];
 }
 
 
@@ -254,11 +242,7 @@ async function fetchChainRows(userId: number): Promise<ChainRow[]> {
 export async function loadAttemptStates(
   userId: number,
 ): Promise<Map<number, PitchAttemptState>> {
-  try {
-    return computeAttemptStates(await fetchChainRows(userId));
-  } catch {
-    return new Map();
-  }
+  return computeAttemptStates(await fetchChainRows(userId));
 }
 
 export interface AttemptClaim {
@@ -281,10 +265,9 @@ export interface AttemptClaim {
  * always allowed here; the weekly plan quota is a separate gate handled by
  * entitlementService.claimSessionSlot.
  *
- * FAILS OPEN on a database error. A transient Supabase failure must not lock a
- * paying founder out of practising; the same choice entitlementService already
- * makes for the weekly quota. The durable count is unaffected either way, so the
- * next attempt is re-checked against real data.
+ * Database errors propagate to the admission handler. An unavailable count is
+ * not evidence that capacity remains, so this security and billing gate fails
+ * closed with a retryable service error.
  */
 export async function claimPitchAttempt(
   userId: number | null,
@@ -301,15 +284,12 @@ export async function claimPitchAttempt(
 
   if (!userId || !parentSessionId) return fresh;
 
-  let states: Map<number, PitchAttemptState>;
-  try {
-    states = computeAttemptStates(await fetchChainRows(userId));
-  } catch {
-    return fresh; // fail open — see the doc comment.
-  }
+  const states = computeAttemptStates(await fetchChainRows(userId));
 
   const parentState = states.get(Number(parentSessionId));
-  if (!parentState) return fresh; // parent not in this user's rows: treat as new.
+  if (!parentState) {
+    throw new Error("PITCH_PARENT_NOT_OWNED");
+  }
 
   const rootId = parentState.pitchRootId;
   // Count live sessions already admitted for this chain, so two tabs opened at

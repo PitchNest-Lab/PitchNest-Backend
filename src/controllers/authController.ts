@@ -1,19 +1,79 @@
 import { Request, Response } from "express";
 import crypto from "crypto";
 import bcrypt from "bcryptjs";
+import jwt from "jsonwebtoken";
 import { supabase } from "../config/supabase.ts";
-import { signOrgToken, signUserToken } from "../services/tokenService.ts";
 import { config } from "../config/env.ts";
 import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
-import { storagePathFromUrl } from "../utils/storagePath.ts";
-import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
+import { safeAvatarUrl, storagePathFromUrl } from "../utils/storagePath.ts";
+import { uploadDir } from "../services/storageService.ts";
+import fs from "fs";
+import path from "path";
+import {
+  hashAuthToken,
+  isEmailCode,
+  isLongAuthToken,
+  safeEqualText,
+} from "../utils/authTokens.ts";
+import { withTimeout } from "../utils/withTimeout.ts";
+import { revokeUserSockets } from "../sockets/restSocket.ts";
+import {
+  ACCESS_TOKEN_AUDIENCE,
+  ACCESS_TOKEN_ISSUER,
+  ACCESS_TOKEN_KIND,
+} from "../utils/accessToken.ts";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend =
+  config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
+    ? new Resend(config.resendApiKey)
+    : null;
 
 const BCRYPT_ROUNDS = 12;
+const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$.{53}$/;
+const DUMMY_PASSWORD_HASH = "$2b$12$kFlQPn/NVygvSVn3YgGLfOEaKPwEO0Ls5BRjKBpQIZqO7aCSazdia";
+const PASSWORD_MIN_LENGTH = 10;
+const PASSWORD_MAX_LENGTH = 72;
+const REFERRAL_CODE_PATTERN = /^\d{1,18}$/;
 const googleClient = new OAuth2Client(config.googleClientId);
+
+async function enrollInOrganization(
+  userId: number,
+  referralCode?: string | null,
+): Promise<string | null> {
+  const { data, error } = await supabase.rpc("enroll_user_in_organization", {
+    p_user_id: userId,
+    p_org_code: referralCode || null,
+  });
+  if (error) {
+    console.error("Organization enrollment failed:", error.message);
+    return null;
+  }
+  return typeof data === "string" && data ? data : null;
+}
+
+async function verifyGoogleCredential(credential: unknown): Promise<any | null> {
+  if (
+    !config.googleClientId ||
+    typeof credential !== "string" ||
+    !credential ||
+    credential.length > 16_384
+  ) {
+    return null;
+  }
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: config.googleClientId,
+    });
+    const payload = ticket.getPayload();
+    if (!payload?.email || payload.email_verified === false) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
 
 // The only roles a user record may hold. Kept in one place so signup, the PATCH
 // endpoint, and any future caller validate against the same source of truth.
@@ -31,35 +91,21 @@ const ALLOWED_SECTORS = [
 
 // ── Sign-in method lock ──────────────────────────────────────────────────────
 // An account belongs to the method that created it (users.auth_provider:
-// 'form' | 'google'). Rows created before the column exists hold NULL — the
-// first successful sign-in after this change records and locks their method.
-const GOOGLE_ONLY_ERROR =
-  "This email is registered with Google Sign-In. Please continue with Google instead.";
-const FORM_ONLY_ERROR =
-  "This email was registered with a password. Please log in with your email and password instead.";
-
-/** Best-effort: lock a legacy (NULL-provider) row to the method just used. */
-function lockAuthProvider(userId: number, provider: "form" | "google") {
-  supabase
-    .from("users")
-    .update({ auth_provider: provider })
-    .eq("id", userId)
-    .is("auth_provider", null)
-    .then(({ error }) => {
-      if (error)
-        console.warn("auth_provider lock failed (non-fatal):", error.message);
-    });
-}
+// 'form' | 'google'). Migration 0030 backfills all older password accounts to
+// `form` and makes the column non-null, so no OAuth request can claim a legacy
+// password account merely by presenting the same email address.
 
 import {
   isTrialActive,
   FREE_TRIAL_DAYS,
 } from "../services/entitlementService.ts";
+import { isSupportedSttLocale } from "../utils/transcriptionLocales.ts";
+import { stopRenewalsForDeletion } from "../services/subscriptionService.ts";
 
 export function toPublicUser(u: any) {
-  const expiry = u?.validity ? new Date(u.validity) : null;
+  const expiry = u?.plan_expires_at ? new Date(u.plan_expires_at) : null;
   const isPaidActive =
-    (u?.plan === "pro" || u?.plan === "prep" || u?.plan === "founder") &&
+    ["pro", "prep", "founder", "enterprise"].includes(u?.plan) &&
     (!expiry || expiry > new Date());
   const trial = isTrialActive(
     u?.trial_expires_at,
@@ -76,15 +122,57 @@ export function toPublicUser(u: any) {
 
   return {
     id: u?.id,
-    name: u?.org_name,
+    name: u?.name,
     email: u?.email,
+    role: u?.role,
+    bio: u?.bio ?? "",
+    avatarUrl: safeAvatarUrl(u?.avatar_url),
+    onboardingCompleted: u?.onboardingCompleted === true,
+    orgCode: u?.orgCode ?? null,
+    accountType: "user" as const,
+    authProvider: u?.auth_provider === "google" ? "google" : "form",
     plan: effectivePlan,
     planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
     isTrial: trial.active,
     trialDaysRemaining: trial.daysRemaining,
     trialExpiresAt: u?.trial_expires_at
       ? new Date(u.trial_expires_at).toISOString()
-      : new Date(Date.now() + FREE_TRIAL_DAYS * 86400000).toISOString(),
+      : null,
+    // The app-preferences bag (notification toggles, AI toughness, sector, the
+    // chosen recognition locale). This was previously omitted from the payload
+    // entirely, so every client silently reverted to hardcoded defaults on a
+    // fresh login and a setting only LOOKED persistent for as long as that one
+    // browser's localStorage survived. Always the owner's own bag: sanitizeSettings
+    // is the sole writer, so the shape is bounded and nothing raw lands here.
+    settings: u?.settings && typeof u.settings === "object" ? u.settings : {},
+  };
+}
+
+/** Public login/session contract for the temporary organization credential. */
+export function toPublicOrganization(org: any) {
+  const expiry = org?.validity ? new Date(org.validity) : null;
+  const isPaidActive =
+    ["pro", "prep", "founder", "enterprise"].includes(org?.plan) &&
+    (!expiry || expiry > new Date());
+  const trial = isTrialActive(
+    org?.trial_expires_at,
+    org?.trial_status,
+    org?.trial_started_at,
+  );
+
+  return {
+    id: org?.id,
+    name: org?.org_name ?? "Organization",
+    email: org?.email,
+    orgCode: org?.org_code != null ? String(org.org_code) : null,
+    accountType: "organization" as const,
+    plan: isPaidActive ? org.plan : trial.active ? "pro" : "free",
+    planExpiresAt: isPaidActive && expiry ? expiry.toISOString() : null,
+    isTrial: trial.active,
+    trialDaysRemaining: trial.daysRemaining,
+    trialExpiresAt: org?.trial_expires_at
+      ? new Date(org.trial_expires_at).toISOString()
+      : null,
   };
 }
 
@@ -95,9 +183,34 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
 
   if (s.notifications && typeof s.notifications === "object") {
     out.notifications = {
-      pitchAlerts: !!s.notifications.pitchAlerts,
-      weeklyReport: !!s.notifications.weeklyReport,
-      investorInquiries: !!s.notifications.investorInquiries,
+      ...(typeof s.notifications.pitchAlerts === "boolean"
+        ? { pitchAlerts: s.notifications.pitchAlerts }
+        : {}),
+      ...(typeof s.notifications.weeklyReport === "boolean"
+        ? { weeklyReport: s.notifications.weeklyReport }
+        : {}),
+      ...(typeof s.notifications.investorInquiries === "boolean"
+        ? { investorInquiries: s.notifications.investorInquiries }
+        : {}),
+      ...(typeof s.notifications.trialLifecycle === "boolean"
+        ? { trialLifecycle: s.notifications.trialLifecycle }
+        : {}),
+      // Ecosystem in-app notifications (migration 0022 triggers read these).
+      // Kept only when the client sends a boolean: a missing key means "on",
+      // so an older client saving the other switches never silently opts out.
+      ...(typeof s.notifications.businessActivity === "boolean"
+        ? { businessActivity: s.notifications.businessActivity }
+        : {}),
+      ...(typeof s.notifications.followedUpdates === "boolean"
+        ? { followedUpdates: s.notifications.followedUpdates }
+        : {}),
+      ...(typeof s.notifications.communityReplies === "boolean"
+        ? { communityReplies: s.notifications.communityReplies }
+        : {}),
+      // Founder follows (migration 0029).
+      ...(typeof s.notifications.followedFounders === "boolean"
+        ? { followedFounders: s.notifications.followedFounders }
+        : {}),
     };
   }
   if (s.aiToughness !== undefined) {
@@ -121,6 +234,19 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
       )
       .slice(0, 50);
   }
+  // Recognition language for live sessions. Allowlist-only: the value is handed
+  // straight to the Azure Speech SDK when the recognizer is built, so an
+  // arbitrary string here would be an invalid recognition config at the start of
+  // every session. An unsupported value is DROPPED rather than coerced, so the
+  // stored preference can only ever be something we can actually honour.
+  if (isSupportedSttLocale(s.sttLocale)) {
+    out.sttLocale = s.sttLocale;
+  } else if (s.sttLocale === "auto") {
+    // Back to automatic: the session infers the locale (inferSttLocale). Saved
+    // as null because settings are merged, so omitting the key would keep the
+    // old choice.
+    out.sttLocale = null;
+  }
   return out;
 }
 
@@ -130,11 +256,32 @@ export function sanitizeSettings(input: unknown): Record<string, unknown> {
  * is active); "Keep me logged in" extends the lifetime to 30 days.
  */
 function signToken(
-  user: { id: number; email: string },
+  user: {
+    id: number;
+    email: string;
+    accountType?: "user" | "organization";
+    orgCode?: string;
+    authVersion?: number;
+  },
   rememberMe = false,
 ): string {
-  // Typed founder token (typ:"user") — see tokenService for why the type exists.
-  return signUserToken(user, rememberMe);
+  return jwt.sign(
+    {
+      kind: ACCESS_TOKEN_KIND,
+      id: user.id,
+      rememberMe,
+      accountType: user.accountType ?? "user",
+      authVersion: user.authVersion ?? 0,
+      ...(user.orgCode ? { orgCode: user.orgCode } : {}),
+    },
+    config.jwtSecret,
+    {
+      algorithm: "HS256",
+      audience: ACCESS_TOKEN_AUDIENCE,
+      issuer: ACCESS_TOKEN_ISSUER,
+      expiresIn: rememberMe ? "30d" : "24h",
+    },
+  );
 }
 
 /**
@@ -145,57 +292,101 @@ export const refreshToken = (req: Request, res: Response) => {
   const user = req.user!;
   res.status(200).json({
     token: signToken(
-      { id: user.id, email: user.email },
+      {
+        id: user.id,
+        email: user.email,
+        accountType: user.accountType,
+        orgCode: user.orgCode,
+        authVersion: user.authVersion,
+      },
       user.rememberMe === true,
     ),
   });
 };
 
+/** Invalidates every bearer token and live pitch connection for this user. */
+export const logout = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.id;
+    const isOrganization = req.user!.accountType === "organization";
+    const { error } = await supabase.rpc(
+      isOrganization ? "revoke_organization_sessions" : "revoke_user_sessions",
+      isOrganization ? { p_org_id: userId } : { p_user_id: userId },
+    );
+    if (error) throw error;
+    if (!isOrganization) revokeUserSockets(userId, "Logged out");
+    return res.status(204).send();
+  } catch (error) {
+    console.error("Logout failed:", error);
+    return res.status(500).json({ error: "Could not log out securely. Please retry." });
+  }
+};
+
 export const signup = async (req: Request, res: Response) => {
   try {
-    const { name, email, password, referralCode } = req.body;
-    if (!name || !email || !password) {
+    const genericSignup = {
+      requiresVerification: true,
+      message: "If this address can be registered, check your email for the verification link.",
+    };
+    const { name, email, password, role, referralCode } = req.body;
+    if (
+      typeof name !== "string" ||
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !name.trim() ||
+      !email.trim()
+    ) {
       return res
         .status(400)
         .json({ error: "Name, email, and password are required." });
     }
 
-    if (name.trim().length < 2) {
+    if (name.trim().length < 2 || name.trim().length > 120) {
       return res
         .status(400)
-        .json({ error: "Name must be at least 2 characters." });
+        .json({ error: "Name must be 2-120 characters." });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
+    if (email.length > 254 || !emailRegex.test(email)) {
       return res
         .status(400)
         .json({ error: "Please enter a valid email address." });
     }
 
-    if (password.length < 6) {
+    if (
+      typeof password !== "string" ||
+      password.length < PASSWORD_MIN_LENGTH ||
+      password.length > PASSWORD_MAX_LENGTH ||
+      Buffer.byteLength(password, "utf8") > 72
+    ) {
       return res
         .status(400)
-        .json({ error: "Password must be at least 6 characters." });
+        .json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
     }
-    const cleanEmail = email.toLowerCase().trim();
-   
+    if (role !== undefined && !isValidRole(role)) {
+      return res.status(400).json({ error: "Please select a valid role." });
+    }
 
-    const { data: existingUser } = await supabase
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanReferralCode =
+      typeof referralCode === "string" ? referralCode.trim() : "";
+    if (cleanReferralCode && !REFERRAL_CODE_PATTERN.test(cleanReferralCode)) {
+      return res.status(400).json({ error: "That organization invitation is invalid." });
+    }
+
+    const { data: existingUser, error: existingUserError } = await supabase
       .from("users")
       .select("*")
       .eq("email", cleanEmail)
       .maybeSingle();
+    if (existingUserError) {
+      console.error("Signup user lookup failed:", existingUserError.message);
+      return res.status(503).json({ error: "Signup is temporarily unavailable." });
+    }
 
     const is_verified = existingUser?.isEmailVerified;
 
-    // Uniform, non-enumerating response for every existing-account case
-    // (already-verified OR exists-but-unverified). CRITICAL: we NEVER return a
-    // session token here. The previous code handed back a valid JWT for an
-    // existing *unverified* account without checking the password — anyone who
-    // knew a target's email could obtain a working login for that account. The
-    // response body is identical in both branches so it also does not reveal
-    // whether the email is registered/verified (user enumeration).
     if (existingUser) {
       if (!is_verified) {
         // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
@@ -205,12 +396,12 @@ export const signup = async (req: Request, res: Response) => {
             err,
           );
         });
+        return res.status(200).json(genericSignup);
       }
-      return res.status(200).json({
-        requiresVerification: true,
-        email: cleanEmail,
-        message: "Check your email to verify your account.",
-      });
+
+      // If the account is already verified, provide honest and actionable feedback:
+      // do not redirect them to /verify waiting for a phantom email that was never sent.
+      return res.status(200).json(genericSignup);
     }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -219,35 +410,33 @@ export const signup = async (req: Request, res: Response) => {
       now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
     );
 
-    let { data: newUser, error } = await supabase
+    const newUserPayload = {
+      name: name.trim(),
+      email: cleanEmail,
+      password: hashedPassword,
+      role: role || "Founder",
+      auth_provider: "form",
+      trial_started_at: now.toISOString(),
+      trial_expires_at: trialEnd.toISOString(),
+      trial_status: "active",
+      enrolled_at: null,
+      ...(cleanReferralCode ? { pending_org_code: cleanReferralCode } : {}),
+    };
+
+    const { data: newUser, error } = await supabase
       .from("users")
-      .insert([
-        {
-          name,
-          email: cleanEmail,
-          password: hashedPassword,
-          auth_provider: "form",
-          trial_started_at: now.toISOString(),
-          trial_expires_at: trialEnd.toISOString(),
-          trial_status: "active",
-          orgCode: referralCode,
-          enrolled_at: now.toISOString(),
-        },
-      ])
+      .insert([newUserPayload])
       .select()
       .single();
 
-    // Rollout safety: if new columns haven't been added in Supabase yet, retry without them
-    if (error && /column|schema/i.test(error.message || "")) {
-      ({ data: newUser, error } = await supabase
-        .from("users")
-        .insert([{ name, email: cleanEmail, password: hashedPassword }])
-        .select()
-        .single());
+    if (error || !newUser) {
+      console.error("Signup user insert failed:", error || "No user returned");
+      const message =
+        config.nodeEnv === "production"
+          ? "Signup failed"
+          : `Signup failed: ${error?.message || "database returned no user"}`;
+      return res.status(500).json({ error: message });
     }
-
-    if (error || !newUser)
-      return res.status(500).json({ error: "Signup failed" });
 
     // Send verification email; do NOT issue a session token. The account cannot
     // be used until its email is verified (authMiddleware + the WS both enforce
@@ -258,24 +447,10 @@ export const signup = async (req: Request, res: Response) => {
       console.error("Failed to send verification email:", err);
     });
 
-    if (referralCode) {
-      const { error } = await supabase.rpc("increment_enroll_count", {
-        ref_code: referralCode,
-      });
-
-      if (error) {
-        console.error("Failed to increment enroll count:", error);
-      }
-    }
-
     // 200 (not 201) to match the existing-account branch above: a different
     // status would let an attacker distinguish a new email from a registered
     // one, defeating the identical-body anti-enumeration measure.
-    res.status(200).json({
-      requiresVerification: true,
-      email: cleanEmail,
-      message: "Check your email to verify your account.",
-    });
+    res.status(200).json(genericSignup);
   } catch (error) {
     console.error("Signup error:", error);
     res.status(500).json({ error: "Signup failed" });
@@ -283,12 +458,18 @@ export const signup = async (req: Request, res: Response) => {
 };
 
 const MAX_FAILED_LOGINS = 5;
-const LOCKOUT_DURATION_MS = 15 * 60 * 1000; // 15 minutes
 
 export const login = async (req: Request, res: Response) => {
   try {
     const { email, password, rememberMe } = req.body;
-    if (!email || !password) {
+    if (
+      typeof email !== "string" ||
+      typeof password !== "string" ||
+      !email.trim() ||
+      !password ||
+      email.length > 254 ||
+      password.length > PASSWORD_MAX_LENGTH
+    ) {
       return res
         .status(400)
         .json({ error: "Email and password are required." });
@@ -301,7 +482,13 @@ export const login = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    if (error || !user) {
+    if (error) {
+      console.error("Login user lookup failed:", error.message);
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(503).json({ error: "Login is temporarily unavailable." });
+    }
+    if (!user) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
@@ -318,33 +505,26 @@ export const login = async (req: Request, res: Response) => {
 
     // Method lock: Google-created accounts can't sign in with a password.
     if (user.auth_provider === "google") {
-      return res.status(401).json({ error: GOOGLE_ONLY_ERROR });
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(401).json({ error: "Invalid credentials." });
     }
 
     // Compare hashed password
-    const isValidPassword = await bcrypt.compare(password, user.password);
+    const isValidPassword =
+      typeof user.password === "string" && BCRYPT_HASH_PATTERN.test(user.password)
+        ? await bcrypt.compare(password, user.password)
+        : await bcrypt.compare(password, DUMMY_PASSWORD_HASH).then(() => false);
     if (!isValidPassword) {
-      // Increment failed attempts; lock after MAX_FAILED_LOGINS.
-      const attempts = (user.failed_login_attempts || 0) + 1;
-      const lockUpdate: Record<string, unknown> = {
-        failed_login_attempts: attempts,
-      };
-      if (attempts >= MAX_FAILED_LOGINS) {
-        lockUpdate.locked_until = new Date(
-          Date.now() + LOCKOUT_DURATION_MS,
-        ).toISOString();
+      const { data: failedState, error: failedError } = await supabase.rpc(
+        "record_failed_login",
+        { p_user_id: user.id },
+      );
+      if (failedError) {
+        console.error("Failed-login counter could not be updated:", failedError.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
       }
-      // Best-effort update — don't block the response on this.
-      supabase
-        .from("users")
-        .update(lockUpdate)
-        .eq("id", user.id)
-        .then(({ error: lockErr }) => {
-          if (lockErr)
-            console.warn("lockout update failed (non-fatal):", lockErr.message);
-        });
-
-      if (attempts >= MAX_FAILED_LOGINS) {
+      const state = Array.isArray(failedState) ? failedState[0] : failedState;
+      if ((state?.failed_attempts ?? 0) >= MAX_FAILED_LOGINS || state?.lock_expires_at) {
         return res.status(429).json({
           error: "Too many failed attempts. Account locked for 15 minutes.",
         });
@@ -358,21 +538,18 @@ export const login = async (req: Request, res: Response) => {
 
     // ── Successful login — reset lockout counters ───────────────────────────
     if (user.failed_login_attempts > 0 || user.locked_until) {
-      supabase
+      const { error: resetErr } = await supabase
         .from("users")
         .update({ failed_login_attempts: 0, locked_until: null })
-        .eq("id", user.id)
-        .then(({ error: resetErr }) => {
-          if (resetErr)
-            console.warn("lockout reset failed (non-fatal):", resetErr.message);
-        });
+        .eq("id", user.id);
+      if (resetErr) {
+        console.error("Lockout reset failed:", resetErr.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
     }
 
-    // First successful password login on a legacy row locks it to 'form'.
-    if (!user.auth_provider) lockAuthProvider(user.id, "form");
-
     const token = signToken(
-      { id: user.id, email: user.email },
+      { id: user.id, email: user.email, authVersion: user.auth_version ?? 0 },
       rememberMe === true,
     );
 
@@ -386,33 +563,16 @@ export const login = async (req: Request, res: Response) => {
   }
 };
 
-/**
- * A real bcrypt hash ($2a$/$2b$/$2y$ + cost + 53 chars). Anything else — NULL,
- * empty, plaintext, a placeholder — is treated as "no usable password" and the
- * login is refused. We never compare against, upgrade, or create a password
- * here: an organization without a hash must go through an explicit, out-of-band
- * password-setup flow (see docs/security/phase-0-remediation.md).
- */
-const BCRYPT_HASH_RE = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
-
-// Compared against when the email is unknown or the row has no usable hash, so
-// "no such org" and "wrong password" take the same time. A hash of a random
-// value that is never stored anywhere; built on first use so it adds nothing
-// to cold start.
-let dummyBcryptHash: string | null = null;
-function getDummyBcryptHash(): string {
-  dummyBcryptHash ??= bcrypt.hashSync(crypto.randomBytes(16).toString("hex"), 10);
-  return dummyBcryptHash;
-}
-
 export const orgLogin = async (req: Request, res: Response) => {
   try {
-    const { email, password, rememberMe } = req.body ?? {};
+    const { email, password, rememberMe } = req.body;
     if (
       typeof email !== "string" ||
       typeof password !== "string" ||
-      !email ||
-      !password
+      !email.trim() ||
+      !password ||
+      email.length > 254 ||
+      password.length > PASSWORD_MAX_LENGTH
     ) {
       return res
         .status(400)
@@ -420,52 +580,78 @@ export const orgLogin = async (req: Request, res: Response) => {
     }
     const cleanEmail = email.toLowerCase().trim();
 
-    // select("*") because toPublicUser reads plan/trial columns whose presence
-    // on Organizations is not recorded in migrations. The row is never logged.
-    const { data: org, error } = await supabase
+    const { data: user, error } = await supabase
       .from("Organizations")
       .select("*")
       .eq("email", cleanEmail)
       .maybeSingle();
+    if (error || !user) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
 
-    const storedHash: unknown = org?.password;
-    const hasUsableHash =
-      typeof storedHash === "string" && BCRYPT_HASH_RE.test(storedHash);
+    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+      return res.status(429).json({ error: "Too many failed attempts. Try again later." });
+    }
 
-    const passwordOk = await bcrypt.compare(
-      password,
-      hasUsableHash ? (storedHash as string) : getDummyBcryptHash(),
-    );
+    if (
+      typeof user.password !== "string" ||
+      !BCRYPT_HASH_PATTERN.test(user.password)
+    ) {
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(401).json({ error: "Invalid credentials." });
+    }
 
-    if (error || !org || !hasUsableHash || !passwordOk) {
-      if (org && !hasUsableHash) {
-        // Operator signal only — id, never the row, email or hash.
-        console.warn(
-          `⚠️ Organization login refused: org ${org.id} has no usable password hash (password setup required).`,
-        );
+    const isValidPassword = await bcrypt.compare(password, user.password);
+    if (!isValidPassword) {
+      const { data: failedState, error: failedError } = await supabase.rpc(
+        "record_failed_org_login",
+        { p_org_id: user.id },
+      );
+      if (failedError) {
+        console.error("Organization lockout update failed:", failedError.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
+      const state = Array.isArray(failedState) ? failedState[0] : failedState;
+      if ((state?.failed_attempts ?? 0) >= MAX_FAILED_LOGINS || state?.lock_expires_at) {
+        return res.status(429).json({ error: "Too many failed attempts. Try again later." });
       }
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    const orgCode = Number(org.org_code);
-    if (!Number.isFinite(orgCode)) {
-      console.error(`❌ Organization login refused: org ${org.id} has no valid org_code.`);
-      return res.status(401).json({ error: "Invalid credentials." });
+    if (user.failed_login_attempts > 0 || user.locked_until) {
+      const { error: resetErr } = await supabase
+        .from("Organizations")
+        .update({ failed_login_attempts: 0, locked_until: null })
+        .eq("id", user.id);
+      if (resetErr) {
+        console.error("Organization lockout reset failed:", resetErr.message);
+        return res.status(503).json({ error: "Login is temporarily unavailable." });
+      }
     }
 
-    const token = signOrgToken(
-      { id: Number(org.id), orgCode, email: org.email },
+    if (user.org_code == null) {
+      console.error(`Organization ${user.id} has no org_code and cannot sign in.`);
+      return res.status(503).json({ error: "Organization account is not configured." });
+    }
+
+    const token = signToken(
+      {
+        id: user.id,
+        email: user.email,
+        accountType: "organization",
+        orgCode: String(user.org_code),
+        authVersion: user.auth_version ?? 0,
+      },
       rememberMe === true,
     );
 
-    // Same `user` shape the (unreleased) dashboard already stores, plus two
-    // additive fields so a client can tell an org session from a founder one.
     res.status(200).json({
-      user: { ...toPublicUser(org), principal: "org", orgCode },
+      user: toPublicOrganization(user),
       token,
     });
   } catch (error) {
-    console.error("Organization login error:", (error as any)?.message || error);
+    console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
   }
 };
@@ -543,13 +729,24 @@ export const updateSettings = async (req: Request, res: Response) => {
       return res.status(400).json({ error: "No valid settings to update." });
     }
 
-    const { data: existing } = await supabase
+    const { data: existing, error: readError } = await supabase
       .from("users")
       .select("settings")
       .eq("id", userId)
       .maybeSingle();
 
+    if (readError || !existing) {
+      console.error("Settings lookup failed:", readError?.message || "user not found");
+      return res.status(readError ? 503 : 404).json({ error: "Failed to load settings." });
+    }
+
     const merged = { ...(existing?.settings || {}), ...clean };
+    if (clean.notifications && typeof clean.notifications === "object") {
+      merged.notifications = {
+        ...(existing.settings?.notifications || {}),
+        ...(clean.notifications as Record<string, boolean>),
+      };
+    }
 
     // toursSeen is a set that only grows: union with what's already stored so
     // two devices can't clobber each other's completions.
@@ -597,19 +794,17 @@ export const googleAuth = async (req: Request, res: Response) => {
         .json({ error: "Google sign-in is not configured on the server." });
     }
 
-    const { credential, rememberMe } = req.body;
-    if (!credential || typeof credential !== "string") {
+    const { credential, rememberMe, referralCode } = req.body;
+    if (!credential || typeof credential !== "string" || credential.length > 16_384) {
       return res.status(400).json({ error: "Missing Google credential." });
     }
+    const cleanReferralCode = typeof referralCode === "string" ? referralCode.trim() : "";
+    if (cleanReferralCode && !REFERRAL_CODE_PATTERN.test(cleanReferralCode)) {
+      return res.status(400).json({ error: "That organization invitation is invalid." });
+    }
 
-    let payload;
-    try {
-      const ticket = await googleClient.verifyIdToken({
-        idToken: credential,
-        audience: config.googleClientId,
-      });
-      payload = ticket.getPayload();
-    } catch {
+    const payload = await verifyGoogleCredential(credential);
+    if (!payload) {
       return res.status(401).json({ error: "Invalid Google credential." });
     }
 
@@ -620,14 +815,19 @@ export const googleAuth = async (req: Request, res: Response) => {
     }
 
     const email = payload.email.toLowerCase().trim();
-    const name =
-      payload.name || payload.given_name || email.split("@")[0] || "Founder";
+    const name = String(
+      payload.name || payload.given_name || email.split("@")[0] || "Founder",
+    ).trim().slice(0, 120) || "Founder";
 
-    let { data: user } = await supabase
+    let { data: user, error: userLookupError } = await supabase
       .from("users")
       .select("*")
       .eq("email", email)
       .maybeSingle();
+    if (userLookupError) {
+      console.error("Google user lookup failed:", userLookupError.message);
+      return res.status(503).json({ error: "Google sign-in is temporarily unavailable." });
+    }
 
     if (!user) {
       // Random unusable password — Google is the auth method for this account.
@@ -643,7 +843,7 @@ export const googleAuth = async (req: Request, res: Response) => {
         now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
       );
 
-      let { data: created, error } = await supabase
+      const { data: created, error } = await supabase
         .from("users")
         .insert([
           {
@@ -661,23 +861,6 @@ export const googleAuth = async (req: Request, res: Response) => {
         .select()
         .single();
 
-      // Rollout safety: retry without auth_provider if the column is missing.
-      if (error && /column|schema/i.test(error.message || "")) {
-        ({ data: created, error } = await supabase
-          .from("users")
-          .insert([
-            {
-              name,
-              email,
-              password: randomPassword,
-              isEmailVerified: true,
-              role: "Founder",
-            },
-          ])
-          .select()
-          .single());
-      }
-
       if (error || !created) {
         console.error("Google signup insert failed:", error);
         return res.status(500).json({ error: "Could not create account." });
@@ -685,14 +868,16 @@ export const googleAuth = async (req: Request, res: Response) => {
       user = created;
     } else if (user.auth_provider === "form") {
       // Method lock: this email was registered with a password.
-      return res.status(401).json({ error: FORM_ONLY_ERROR });
-    } else if (!user.auth_provider) {
-      // First Google sign-in on a legacy row locks it to 'google'.
-      lockAuthProvider(user.id, "google");
+      return res.status(401).json({ error: "Google sign-in could not be completed." });
+    }
+
+    if (cleanReferralCode) {
+      const enrolledCode = await enrollInOrganization(user.id, cleanReferralCode);
+      if (enrolledCode) user = { ...user, orgCode: enrolledCode, enrolled_at: new Date().toISOString() };
     }
 
     const token = signToken(
-      { id: user.id, email: user.email },
+      { id: user.id, email: user.email, authVersion: user.auth_version ?? 0 },
       rememberMe === true,
     );
     res.status(200).json({
@@ -719,60 +904,73 @@ export const googleAuth = async (req: Request, res: Response) => {
 // );
 
 export const forgotPassword = async (req: Request, res: Response) => {
+  const generic = {
+    message: "If an account with that email exists, a reset link has been sent.",
+  };
   try {
     const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email is required." });
+    if (typeof email !== "string" || !email.trim() || email.length > 254) {
+      return res.status(400).json({ error: "A valid email is required." });
+    }
     const cleanEmail = email.toLowerCase().trim();
 
-    const { data: user } = await supabase
+    const { data: user, error: userLookupError } = await supabase
       .from("users")
       .select("id, email, auth_provider")
       .eq("email", cleanEmail)
       .maybeSingle();
+    if (userLookupError) {
+      console.error("Password reset account lookup failed:", userLookupError.message);
+      return res.status(200).json(generic);
+    }
 
     // Always return 200 with the SAME message to prevent email enumeration.
-    if (!user)
-      return res.status(200).json({
-        message:
-          "If an account with that email exists, a reset link has been sent.",
-      });
+    if (!user) return res.status(200).json(generic);
 
     // Google accounts have no usable password — a reset would set one that
     // still can't log in (method lock). Point the user at Google instead.
     if (user.auth_provider === "google") {
-      return res.status(400).json({ error: GOOGLE_ONLY_ERROR });
+      return res.status(200).json(generic);
     }
 
     // Generate a reset token and store it
     const resetToken = crypto.randomBytes(32).toString("hex");
+    const resetDigest = hashAuthToken("password-reset", resetToken);
     const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    await supabase.from("password_resets").insert([
+    const { error: clearError } = await supabase
+      .from("password_resets")
+      .delete()
+      .eq("user_id", user.id);
+    if (clearError) throw clearError;
+
+    const { error: resetInsertError } = await supabase.from("password_resets").insert([
       {
         user_id: user.id,
-        token: resetToken,
+        token: resetDigest,
         expires_at: expiresAt,
         used: false,
       },
     ]);
-    const baseUrl = (config.allowedOrigin || "http://localhost:5174").replace(
-      /\/+$/,
-      "",
-    );
+    if (resetInsertError) throw resetInsertError;
+    const baseUrl = config.clientUrl;
     const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
 
-    if (!process.env.RESEND_API_KEY) {
+    if (!resend) {
       console.error(
-        "❌ Password reset email not sent: RESEND_API_KEY missing.",
+        "❌ Password reset email not sent: RESEND_API_KEY is missing or still set to re_xxxxxxxxx.",
       );
-      return res.status(500).json({ error: "Failed to send email." });
+      await supabase.from("password_resets").delete().eq("token", resetDigest);
+      return res.status(200).json(generic);
     }
 
-    try {
-      const { data, error } = await resend.emails.send({
+    // The response does not wait on the mail provider. This keeps account
+    // existence from being observable through a several-second timing gap.
+    res.status(200).json(generic);
+    void withTimeout(resend.emails.send({
         from: config.emailFrom,
         replyTo: config.emailReplyTo,
-        to: email,
+        to: user.email,
         subject: "Reset your PitchNest password",
         html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px">
@@ -793,26 +991,22 @@ export const forgotPassword = async (req: Request, res: Response) => {
         </p>
       </div>
     `,
+      }, {
+        idempotencyKey: `password-reset/${user.id}/${resetDigest.slice(0, 32)}`,
+      }), 15_000, "Password reset email request")
+      .then(async ({ error }) => {
+        if (!error) return;
+        console.error("❌ Password reset email send failed:", error.message);
+        await supabase.from("password_resets").delete().eq("token", resetDigest);
+      })
+      .catch(async (mailErr: any) => {
+        console.error("❌ Password reset email send failed:", mailErr?.message || mailErr);
+        await supabase.from("password_resets").delete().eq("token", resetDigest);
       });
-
-      if (error) {
-        throw new Error(error.message);
-      }
-    } catch (mailErr: any) {
-      console.error(
-        "❌ Password reset email send failed:",
-        mailErr?.message || mailErr,
-      );
-      return res.status(500).json({ error: "Failed to send email." });
-    }
-
-    res.status(200).json({
-      message:
-        "If an account with that email exists, a reset link has been sent.",
-    });
+    return;
   } catch (error) {
     console.error("Forgot password error:", error);
-    res.status(500).json({ error: "Failed to process request." });
+    res.status(200).json(generic);
   }
 };
 
@@ -820,16 +1014,23 @@ export const verifyEmail = async (req: Request, res: Response) => {
   try {
     const { token } = req.query;
 
-    if (!token) return res.status(400).json({ message: "Token required" });
+    if (!isLongAuthToken(token)) {
+      return res.status(400).json({ message: "Invalid or expired link." });
+    }
+    const tokenDigest = hashAuthToken("email-link", token);
 
     // 1. Find token in Supabase
     const { data: record, error } = await supabase
       .from("email_verification_tokens")
       .select("*")
-      .eq("token", token)
-      .single();
+      .eq("token", tokenDigest)
+      .maybeSingle();
 
-    if (error || !record) {
+    if (error) {
+      console.error("Email verification lookup failed:", error.message);
+      return res.status(503).json({ message: "Verification is temporarily unavailable." });
+    }
+    if (!record) {
       // Token may have already been consumed (double-click). Check if the
       // user is already verified and return success so the UI isn't broken.
       return res.status(400).json({
@@ -844,57 +1045,55 @@ export const verifyEmail = async (req: Request, res: Response) => {
     }
 
     // 3. Check if already verified (idempotent for repeated clicks)
-    const { data: existingUser } = await supabase
+    const { data: existingUser, error: userReadError } = await supabase
       .from("users")
       .select(
-        "id, email, name, onboardingCompleted, role, bio, isEmailVerified",
+        "id, email, name, onboardingCompleted, role, bio, isEmailVerified, auth_version, orgCode, pending_org_code",
       )
       .eq("id", record.user_id)
       .single();
+    if (userReadError || !existingUser) throw userReadError || new Error("Verification user not found");
 
     if (existingUser?.isEmailVerified) {
       // Already verified — clean up the token and return success.
       await supabase
         .from("email_verification_tokens")
         .delete()
-        .eq("token", token);
-
-      const JwtToken = signToken({
-        id: existingUser.id,
-        email: existingUser.email,
-      });
+        .eq("id", record.id);
       return res.json({
-        user: toPublicUser(existingUser),
-        token: JwtToken,
+        alreadyVerified: true,
         message: "Email already verified",
-        redirectTo: existingUser.onboardingCompleted
-          ? "/dashboard"
-          : "/onboarding",
       });
     }
 
     // 4. Mark user as verified
-    await supabase
-      .from("users")
-      .update({ isEmailVerified: true })
-      .eq("id", record.user_id);
+    const { data: consumed, error: consumeError } = await supabase.rpc(
+      "consume_email_verification",
+      { p_token_id: record.id, p_user_id: record.user_id },
+    );
+    if (consumeError) throw consumeError;
+    if (consumed !== true) {
+      return res.status(400).json({ message: "Invalid or expired link." });
+    }
 
-    // 5. Delete token (one-time use)
-    await supabase
-      .from("email_verification_tokens")
-      .delete()
-      .eq("token", token);
+    const enrolledCode = await enrollInOrganization(record.user_id);
+    const verifiedUser = {
+      ...existingUser!,
+      isEmailVerified: true,
+      ...(enrolledCode ? { orgCode: enrolledCode } : {}),
+    };
 
     const JwtToken = signToken({
-      id: existingUser!.id,
-      email: existingUser!.email,
+      id: verifiedUser.id,
+      email: verifiedUser.email,
+      authVersion: verifiedUser.auth_version ?? 0,
     });
 
     res.json({
-      user: toPublicUser(existingUser),
+      user: toPublicUser(verifiedUser),
       token: JwtToken,
       message: "Email verified successfully",
-      redirectTo: existingUser!.onboardingCompleted
+      redirectTo: verifiedUser.onboardingCompleted
         ? "/dashboard"
         : "/onboarding",
     });
@@ -930,13 +1129,17 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     const cleanEmail = String(email).toLowerCase().trim();
     const cleanCode = String(code).trim();
     const GENERIC = "Invalid or expired code.";
+    if (!isEmailCode(cleanCode) || cleanEmail.length > 254) {
+      return res.status(400).json({ message: GENERIC });
+    }
 
-    const { data: user } = await supabase
+    const { data: user, error: userError } = await supabase
       .from("users")
-      .select("id, email, name, onboardingCompleted, isEmailVerified")
+      .select("id, email, name, onboardingCompleted, isEmailVerified, auth_version, orgCode, pending_org_code")
       .eq("email", cleanEmail)
       .maybeSingle();
 
+    if (userError) throw userError;
     if (!user) return res.status(400).json({ message: GENERIC });
 
     // Already verified — there is nothing to verify, and NO valid code exists
@@ -955,11 +1158,13 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
       });
     }
 
-    const { data: record } = await supabase
+    const { data: record, error: recordError } = await supabase
       .from("email_verification_tokens")
       .select("*")
       .eq("user_id", user.id)
       .maybeSingle();
+
+    if (recordError) throw recordError;
 
     // No row, or a legacy row with no `code` column populated (pre-migration
     // link-only token) — cannot verify by code; the user must use the link.
@@ -988,34 +1193,52 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     }
 
     // Constant-time compare so timing can't leak the code digit by digit.
-    const stored = Buffer.from(String(record.code));
-    const given = Buffer.from(cleanCode);
-    const match =
-      stored.length === given.length && crypto.timingSafeEqual(stored, given);
+    const stored = String(record.code);
+    const codeDigest = hashAuthToken("email-code", cleanCode);
+    const match = safeEqualText(stored, codeDigest);
 
     if (!match) {
-      await supabase
+      const attempts = record.attempts ?? 0;
+      const { data: bumped, error: bumpError } = await supabase
         .from("email_verification_tokens")
-        .update({ attempts: (record.attempts ?? 0) + 1 })
-        .eq("user_id", user.id);
+        .update({ attempts: attempts + 1 })
+        .eq("id", record.id)
+        .eq("attempts", attempts)
+        .select("id")
+        .maybeSingle();
+      if (bumpError) throw bumpError;
+      if (!bumped) {
+        return res.status(429).json({ message: "Too many concurrent attempts. Please retry." });
+      }
       return res.status(400).json({ message: GENERIC });
     }
 
-    await supabase
-      .from("users")
-      .update({ isEmailVerified: true })
-      .eq("id", user.id);
-    await supabase
-      .from("email_verification_tokens")
-      .delete()
-      .eq("user_id", user.id);
+    const { data: consumed, error: consumeError } = await supabase.rpc(
+      "consume_email_verification",
+      { p_token_id: record.id, p_user_id: user.id },
+    );
+    if (consumeError) throw consumeError;
+    if (consumed !== true) {
+      return res.status(400).json({ message: GENERIC });
+    }
 
-    const token = signToken({ id: user.id, email: user.email });
+    const enrolledCode = await enrollInOrganization(user.id);
+    const verifiedUser = {
+      ...user,
+      isEmailVerified: true,
+      ...(enrolledCode ? { orgCode: enrolledCode } : {}),
+    };
+
+    const token = signToken({
+      id: verifiedUser.id,
+      email: verifiedUser.email,
+      authVersion: verifiedUser.auth_version ?? 0,
+    });
     return res.json({
-      user: toPublicUser(user),
+      user: toPublicUser(verifiedUser),
       token,
       message: "Email verified successfully",
-      redirectTo: user.onboardingCompleted ? "/dashboard" : "/onboarding",
+      redirectTo: verifiedUser.onboardingCompleted ? "/dashboard" : "/onboarding",
     });
   } catch (error) {
     console.error("verifyEmailOtp error:", error);
@@ -1024,6 +1247,9 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
 };
 
 export const resendEmailVerification = async (req: Request, res: Response) => {
+  const generic = {
+    message: "If an unverified account exists for that email, a verification link has been sent.",
+  };
   try {
     const { email } = req.body;
     // Normalize exactly as signup does (it stores email.toLowerCase().trim()).
@@ -1040,13 +1266,12 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    // Always return success — don't reveal whether the email exists or is
-    // already verified. This prevents user enumeration via this endpoint.
-    if (!user || user?.isEmailVerified) {
-      return res.json({
-        message:
-          "If an unverified account exists for that email, a verification link has been sent.",
-      });
+    // If no user exists, generic success to prevent enumeration
+    if (!user) return res.json(generic);
+
+    // If the account is already verified, give explicit feedback so the user knows to log in
+    if (user.isEmailVerified) {
+      return res.json(generic);
     }
 
     // Don't block the response on email delivery
@@ -1054,42 +1279,186 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       console.error("Failed to resend verification email:", err);
     });
 
-    res.json({ message: "Verification email resent" });
+    res.json(generic);
   } catch (error) {
     console.error("resend Email verification error:", error);
-    res.status(500).json({ error: "Failed to process request." });
+    res.json(generic);
   }
 };
 
 /**
- * Permanently delete a user and associated data (App Store 5.1.1(v) / Google Play).
+ * Permanently delete a user and associated data.
  */
 async function purgeUserAccount(userId: number): Promise<void> {
-  const { data: decks } = await supabase
-    .from("decks")
-    .select("file_url")
-    .eq("user_id", userId);
-  const { data: sessions } = await supabase
-    .from("sessions")
-    .select("video_url")
-    .eq("user_id", userId);
+  // Stop renewals first. Once the user row is gone nothing could cancel them,
+  // and Flutterwave would keep charging a card for an account that no longer
+  // exists, so a failed cancel stops the deletion here, before anything is removed.
+  await stopRenewalsForDeletion(userId);
 
-  const { data: userRow } = await supabase
+  const loadOwnedRows = async (table: "decks" | "sessions", columns: string) => {
+    const rows: any[] = [];
+    for (let from = 0; from < 10_000; from += 500) {
+      const { data, error } = await supabase
+        .from(table)
+        .select(columns)
+        .eq("user_id", userId)
+        .order("id", { ascending: true })
+        .range(from, from + 499);
+      if (error) throw error;
+      const page = data || [];
+      rows.push(...page);
+      if (page.length < 500) return rows;
+    }
+    throw new Error(`ACCOUNT_DELETE_TOO_MANY_${table.toUpperCase()}`);
+  };
+
+  let decks: any[];
+  let sessions: any[];
+  try {
+    [decks, sessions] = await Promise.all([
+      loadOwnedRows("decks", "id, file_url"),
+      loadOwnedRows("sessions", "id, video_url"),
+    ]);
+  } catch (error) {
+    console.error("Account deletion media discovery failed:", error);
+    throw new Error("ACCOUNT_DELETE_DISCOVERY_FAILED");
+  }
+
+  const { data: userRow, error: userReadError } = await supabase
     .from("users")
     .select("avatar_url")
     .eq("id", userId)
     .maybeSingle();
 
+  if (userReadError || !userRow) {
+    throw new Error("ACCOUNT_DELETE_DISCOVERY_FAILED");
+  }
+
+  // A shared business survives a member's departure. A business with no other
+  // active member is personal workspace data and must be removed with the
+  // account, including both its private drafts and published image copies.
+  const [membershipResult, createdBusinessResult] = await Promise.all([
+    supabase
+      .from("business_members")
+      .select("business_id")
+      .eq("user_id", userId)
+      .neq("status", "removed"),
+    supabase.from("businesses").select("id").eq("created_by", userId),
+  ]);
+  if (membershipResult.error || createdBusinessResult.error) {
+    throw new Error("ACCOUNT_DELETE_BUSINESS_DISCOVERY_FAILED");
+  }
+  const relatedBusinessIds = [...new Set([
+    ...(membershipResult.data ?? []).map((row: any) => String(row.business_id)),
+    ...(createdBusinessResult.data ?? []).map((row: any) => String(row.id)),
+  ].filter(Boolean))];
+  if (relatedBusinessIds.length > 500) {
+    throw new Error("ACCOUNT_DELETE_TOO_MANY_BUSINESSES");
+  }
+  let sharedBusinessIds = new Set<string>();
+  if (relatedBusinessIds.length) {
+    const { data: otherMembers, error: memberError } = await supabase
+      .from("business_members")
+      .select("business_id")
+      .in("business_id", relatedBusinessIds)
+      .neq("user_id", userId)
+      .eq("status", "active");
+    if (memberError) throw new Error("ACCOUNT_DELETE_BUSINESS_DISCOVERY_FAILED");
+    sharedBusinessIds = new Set((otherMembers ?? []).map((row: any) => String(row.business_id)));
+  }
+  const soleBusinessIds = relatedBusinessIds.filter((id) => !sharedBusinessIds.has(id));
+
   const mediaPaths = new Set<string>();
+  const publicMediaPaths = new Set<string>();
+  const localPaths = new Set<string>();
   for (const deck of decks || []) {
-    const path = storagePathFromUrl(deck.file_url); // main media bucket
-    if (path) mediaPaths.add(path);
+    if (typeof deck.file_url === "string" && deck.file_url.startsWith("/uploads/")) {
+      const name = deck.file_url.slice("/uploads/".length);
+      if (name && name === path.basename(name)) localPaths.add(path.join(uploadDir, name));
+      continue;
+    }
+    const objectPath = storagePathFromUrl(deck.file_url);
+    if (objectPath?.startsWith("decks/") && !objectPath.includes("..")) {
+      mediaPaths.add(objectPath);
+    }
   }
   for (const session of sessions || []) {
-    // video_url used to be client-supplied, so it is only deleted when it
-    // resolves to a recording this user owns — never another user's object.
-    const target = await authorizedRecordingTarget(session.video_url, userId);
-    if (target?.kind === "storage") mediaPaths.add(target.path);
+    if (typeof session.video_url === "string" && session.video_url.startsWith("/uploads/")) {
+      const name = session.video_url.slice("/uploads/".length);
+      if (
+        name.startsWith(`rec_${userId}_`) &&
+        name === path.basename(name)
+      ) localPaths.add(path.join(uploadDir, name));
+      continue;
+    }
+    const objectPath = storagePathFromUrl(session.video_url);
+    if (objectPath?.startsWith("pitches/") && !objectPath.includes("..")) {
+      mediaPaths.add(objectPath);
+    }
+  }
+
+  // Recordings are uploaded before the final session row is updated. A tab
+  // closing in that small window leaves a legitimate but unreferenced object;
+  // enumerate the user's scoped prefix so erasure catches those too.
+  for (let offset = 0; offset < 10_000; offset += 100) {
+    const { data: objects, error: listError } = await supabase.storage
+      .from(config.storageBucket)
+      .list(`pitches/${userId}`, { limit: 100, offset });
+    if (listError) throw new Error(`ACCOUNT_DELETE_RECORDING_DISCOVERY_FAILED:${listError.message}`);
+    for (const object of objects ?? []) {
+      if (object.name) mediaPaths.add(`pitches/${userId}/${object.name}`);
+    }
+    if ((objects ?? []).length < 100) break;
+    if (offset === 9_900) throw new Error("ACCOUNT_DELETE_TOO_MANY_RECORDINGS");
+  }
+
+  // New deck keys are scoped exactly like recordings. This also catches an
+  // upload whose object was created but whose owning row was never committed.
+  for (let offset = 0; offset < 10_000; offset += 100) {
+    const { data: objects, error: listError } = await supabase.storage
+      .from(config.storageBucket)
+      .list(`decks/${userId}`, { limit: 100, offset });
+    if (listError) throw new Error(`ACCOUNT_DELETE_DECK_DISCOVERY_FAILED:${listError.message}`);
+    for (const object of objects ?? []) {
+      if (object.name) mediaPaths.add(`decks/${userId}/${object.name}`);
+    }
+    if ((objects ?? []).length < 100) break;
+    if (offset === 9_900) throw new Error("ACCOUNT_DELETE_TOO_MANY_DECK_OBJECTS");
+  }
+
+  const collectStoragePrefix = async (
+    bucket: string,
+    prefix: string,
+    target: Set<string>,
+  ) => {
+    for (let offset = 0; offset < 1_000; offset += 100) {
+      const { data: objects, error } = await supabase.storage
+        .from(bucket)
+        .list(prefix, { limit: 100, offset });
+      if (error) throw new Error(`ACCOUNT_DELETE_BUSINESS_MEDIA_DISCOVERY_FAILED:${error.message}`);
+      for (const object of objects ?? []) {
+        if (object.name) target.add(`${prefix}/${object.name}`);
+      }
+      if ((objects ?? []).length < 100) return;
+    }
+    throw new Error("ACCOUNT_DELETE_TOO_MANY_BUSINESS_MEDIA_OBJECTS");
+  };
+  for (const businessId of soleBusinessIds) {
+    const prefix = `business-media/${businessId}`;
+    await Promise.all([
+      collectStoragePrefix(config.storageBucket, prefix, mediaPaths),
+      collectStoragePrefix(config.publicMediaBucket, prefix, publicMediaPaths),
+    ]);
+  }
+
+  try {
+    for (const name of await fs.promises.readdir(uploadDir)) {
+      if (name.startsWith(`rec_${userId}_`) && name === path.basename(name)) {
+        localPaths.add(path.join(uploadDir, name));
+      }
+    }
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
   }
 
   // Avatars live in a SEPARATE public bucket — extract with that bucket's marker
@@ -1098,17 +1467,17 @@ async function purgeUserAccount(userId: number): Promise<void> {
     userRow?.avatar_url,
     config.avatarBucket,
   );
-  const avatarPaths = avatarPath ? [avatarPath] : [];
+  const avatarPaths = [...new Set([avatarPath, `avatars/${userId}/profile`].filter(Boolean) as string[])];
 
   if (mediaPaths.size > 0) {
-    const { error: storageError } = await supabase.storage
-      .from(config.storageBucket)
-      .remove([...mediaPaths]);
-    if (storageError) {
-      console.warn(
-        "⚠️ Media storage cleanup partial failure:",
-        storageError.message,
-      );
+    const paths = [...mediaPaths];
+    for (let index = 0; index < paths.length; index += 100) {
+      const { error: storageError } = await supabase.storage
+        .from(config.storageBucket)
+        .remove(paths.slice(index, index + 100));
+      if (storageError) {
+        throw new Error(`ACCOUNT_DELETE_MEDIA_FAILED:${storageError.message}`);
+      }
     }
   }
   if (avatarPaths.length > 0) {
@@ -1116,92 +1485,68 @@ async function purgeUserAccount(userId: number): Promise<void> {
       .from(config.avatarBucket)
       .remove(avatarPaths);
     if (avatarError) {
-      console.warn(
-        "⚠️ Avatar storage cleanup partial failure:",
-        avatarError.message,
-      );
+      throw new Error(`ACCOUNT_DELETE_AVATAR_FAILED:${avatarError.message}`);
+    }
+  }
+  if (publicMediaPaths.size > 0) {
+    const paths = [...publicMediaPaths];
+    for (let index = 0; index < paths.length; index += 100) {
+      const { error: publicMediaError } = await supabase.storage
+        .from(config.publicMediaBucket)
+        .remove(paths.slice(index, index + 100));
+      if (publicMediaError) {
+        throw new Error(`ACCOUNT_DELETE_PUBLIC_BUSINESS_MEDIA_FAILED:${publicMediaError.message}`);
+      }
     }
   }
 
-  // Deck audits hang off decks but carry their OWN user_id and the full AI
-  // report, so deleting decks alone can strand them. Collect the ids first —
-  // after the decks row is gone there is no way to find them by deck_id.
-  const { data: deckRows } = await supabase
-    .from("decks")
-    .select("id")
-    .eq("user_id", userId);
-  const deckIds = (deckRows || []).map((d: any) => d.id).filter(Boolean);
-
-  // session_pdfs is keyed on session_id only — no user_id column — so it is
-  // unreachable once the sessions rows are deleted. Same ordering problem.
-  const { data: sessionRows } = await supabase
-    .from("sessions")
-    .select("id")
-    .eq("user_id", userId);
-  const sessionIds = (sessionRows || []).map((s: any) => s.id).filter(Boolean);
-
-  /**
-   * Every delete, in dependency order. Children first so a mid-sequence failure
-   * can never orphan a row whose only route back to the user has already gone.
-   *
-   * Failures are COLLECTED, not swallowed. The previous version ignored every
-   * error and still returned 200, so a user could be told their data was erased
-   * while it was all still there — the worst possible outcome for a GDPR
-   * erasure request.
-   */
-  const failures: string[] = [];
-  const purge = async (
-    table: string,
-    apply: (q: any) => any,
-  ): Promise<void> => {
-    const { error } = await apply(supabase.from(table).delete());
-    if (error) {
-      console.error(
-        `❌ Account deletion: failed to purge ${table} for user ${userId}:`,
-        error.message,
-      );
-      failures.push(table);
+  for (const localPath of localPaths) {
+    try {
+      await fs.promises.rm(localPath, { force: true });
+    } catch (error) {
+      throw new Error(`ACCOUNT_DELETE_LOCAL_MEDIA_FAILED:${String(error)}`);
     }
-  };
-
-  if (deckIds.length) {
-    await purge("deck_audits", (q: any) => q.in("deck_id", deckIds));
-  }
-  // Belt and braces: audits recorded against the user but not against a deck we
-  // still know about (e.g. a deck row deleted earlier by hand).
-  await purge("deck_audits", (q: any) => q.eq("user_id", userId));
-
-  if (sessionIds.length) {
-    await purge("session_pdfs", (q: any) => q.in("session_id", sessionIds));
   }
 
-  await purge("email_verification_tokens", (q: any) => q.eq("user_id", userId));
-  await purge("password_resets", (q: any) => q.eq("user_id", userId));
-  await purge("sessions", (q: any) => q.eq("user_id", userId));
-  await purge("decks", (q: any) => q.eq("user_id", userId));
-  await purge("profiles", (q: any) => q.eq("user_id", userId));
+  // One DELETE statement gives the relational half transaction semantics: all
+  // FK cascades, the orphan-business trigger, and the user row commit together
+  // or PostgreSQL rolls the statement back. This avoids reporting success after
+  // a sequence of partially completed child-table deletes.
+  const { error: deleteError } = await supabase.from("users").delete().eq("id", userId);
+  if (deleteError) throw new Error(`ACCOUNT_DELETE_DATABASE_FAILED:${deleteError.message}`);
 
-  // session_starts and payments carry ON DELETE CASCADE (migrations 0008/0009),
-  // so they go with the users row. Everything above does not.
-  await purge("users", (q: any) => q.eq("id", userId));
-
-  if (failures.length) {
-    // Surfaced to the caller so the UI cannot claim a clean deletion. The user
-    // row may still exist, which means they can retry.
-    throw new Error(`ACCOUNT_DELETE_PARTIAL:${failures.join(",")}`);
+  const { data: remainingUser, error: verifyDeleteError } = await supabase
+    .from("users")
+    .select("id")
+    .eq("id", userId)
+    .maybeSingle();
+  if (verifyDeleteError || remainingUser) {
+    throw new Error("ACCOUNT_DELETE_DATABASE_FAILED:users");
   }
 }
 
-async function verifyUserPassword(
+async function verifyAccountDeletion(
   userId: number,
-  password: string,
+  password: unknown,
+  googleCredential: unknown,
 ): Promise<boolean> {
-  const { data: user } = await supabase
+  const { data: user, error } = await supabase
     .from("users")
-    .select("password")
+    .select("email, password, auth_provider")
     .eq("id", userId)
     .maybeSingle();
-  if (!user?.password) return false;
+  if (error) throw error;
+  if (!user) return false;
+  if (user.auth_provider === "google") {
+    const payload = await verifyGoogleCredential(googleCredential);
+    return payload?.email?.toLowerCase().trim() === user.email.toLowerCase().trim();
+  }
+  if (
+    typeof password !== "string" ||
+    !password ||
+    password.length > PASSWORD_MAX_LENGTH ||
+    !user.password
+  ) return false;
   return bcrypt.compare(password, user.password);
 }
 
@@ -1209,19 +1554,20 @@ async function verifyUserPassword(
 export const deleteAccount = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
-    const { password } = req.body;
-    if (!password) {
+    const { password, googleCredential } = req.body;
+    if (!password && !googleCredential) {
       return res
         .status(400)
-        .json({ error: "Password is required to delete your account." });
+        .json({ error: "Re-authentication is required to delete your account." });
     }
 
-    const valid = await verifyUserPassword(userId, password);
+    const valid = await verifyAccountDeletion(userId, password, googleCredential);
     if (!valid) {
-      return res.status(401).json({ error: "Incorrect password." });
+      return res.status(401).json({ error: "Account confirmation failed." });
     }
 
     await purgeUserAccount(userId);
+    revokeUserSockets(userId, "Account deleted");
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account error:", error);
@@ -1231,23 +1577,23 @@ export const deleteAccount = async (req: Request, res: Response) => {
   }
 };
 
-/** POST /api/auth/delete-account — public web page (Google Play delete URL) */
+/** POST /api/auth/delete-account — credential-confirmed request from the public deletion page. */
 export const deleteAccountByCredentials = async (
   req: Request,
   res: Response,
 ) => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password, googleCredential } = req.body;
+    if (typeof email !== "string" || !email.trim() || (!password && !googleCredential)) {
       return res
         .status(400)
-        .json({ error: "Email and password are required." });
+        .json({ error: "Email and account confirmation are required." });
     }
     const cleanEmail = email.toLowerCase().trim();
 
     const { data: user } = await supabase
       .from("users")
-      .select("id, password")
+      .select("id")
       .eq("email", cleanEmail)
       .maybeSingle();
 
@@ -1255,12 +1601,13 @@ export const deleteAccountByCredentials = async (
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    const valid = await bcrypt.compare(password, user.password);
+    const valid = await verifyAccountDeletion(user.id, password, googleCredential);
     if (!valid) {
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
     await purgeUserAccount(user.id);
+    revokeUserSockets(user.id, "Account deleted");
     res.status(200).json({ message: "Account deleted successfully." });
   } catch (error) {
     console.error("Delete account (public) error:", error);
@@ -1273,37 +1620,48 @@ export const deleteAccountByCredentials = async (
 export const resetPassword = async (req: Request, res: Response) => {
   try {
     const { token, password } = req.body;
-    if (!token || !password)
+    if (!isLongAuthToken(token) || typeof password !== "string")
       return res
         .status(400)
         .json({ error: "Token and new password are required." });
-    if (password.length < 6)
+    if (
+      password.length < PASSWORD_MIN_LENGTH ||
+      password.length > PASSWORD_MAX_LENGTH ||
+      Buffer.byteLength(password, "utf8") > 72
+    )
       return res
         .status(400)
-        .json({ error: "Password must be at least 6 characters." });
+        .json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
 
-    const { data: resetRecord } = await supabase
+    const { data: resetRecord, error: resetReadError } = await supabase
       .from("password_resets")
       .select("*")
-      .eq("token", token)
+      .eq("token", hashAuthToken("password-reset", token))
       .eq("used", false)
       .maybeSingle();
+
+    if (resetReadError) throw resetReadError;
 
     if (!resetRecord)
       return res.status(400).json({ error: "Invalid or expired reset token." });
     if (new Date(resetRecord.expires_at) < new Date())
       return res.status(400).json({ error: "Reset token has expired." });
 
-    const hashedPassword = await bcrypt.hash(password, 12);
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
 
-    await supabase
-      .from("users")
-      .update({ password: hashedPassword })
-      .eq("id", resetRecord.user_id);
-    await supabase
-      .from("password_resets")
-      .update({ used: true })
-      .eq("id", resetRecord.id);
+    const { data: nextAuthVersion, error: consumeError } = await supabase.rpc(
+      "consume_password_reset",
+      {
+        p_reset_id: resetRecord.id,
+        p_user_id: resetRecord.user_id,
+        p_password_hash: hashedPassword,
+      },
+    );
+    if (consumeError) throw consumeError;
+    if (!Number.isInteger(nextAuthVersion)) {
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    }
+    revokeUserSockets(resetRecord.user_id, "Password changed");
 
     res.status(200).json({ message: "Password updated successfully." });
   } catch (error) {

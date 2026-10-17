@@ -1,17 +1,33 @@
 import express from "express";
+import rateLimit from "express-rate-limit";
 import cors from "cors";
 import helmet from "helmet";
 import path from "path";
 import fs from "fs";
 import { config } from "./config/env.ts";
+import { isAllowedBrowserOrigin } from "./config/origins.ts";
 import authRoutes from "./routes/authRoutes.ts";
 import deckRoutes from "./routes/deckRoutes.ts";
 import uploadRoutes from "./routes/uploadRoutes.ts";
 import fileRoutes from "./routes/fileRoutes.ts";
 import sessionRoutes from "./routes/sessionRoutes.ts";
+import publicRoutes from "./routes/publicRoutes.ts";
+import { publicReadLimiter } from "./routes/publicRoutes.ts";
+import {
+  getPublicBusinessSitemap,
+  publicSiteOrigin,
+  readPublicBusinessProfile,
+} from "./controllers/publicBusinessController.ts";
+import { injectPublicBusinessMetadata } from "./utils/publicBusinessMetadata.ts";
 import profileRoutes from "./routes/profileRoutes.ts";
 import adminRoutes from "./routes/adminRoutes.ts";
 import billingRoutes from "./routes/billingRoutes.ts";
+import businessRoutes from "./routes/businessRoutes.ts";
+import discoverRoutes from "./routes/discoverRoutes.ts";
+import staffRoutes from "./routes/staffRoutes.ts";
+import practiceRoutes from "./routes/practiceRoutes.ts";
+import notificationRoutes from "./routes/notificationRoutes.ts";
+import communityRoutes from "./routes/communityRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 import router from "./routes/organization/organizationRoutes.ts";
 
@@ -24,21 +40,14 @@ app.set("trust proxy", 1);
 // Global Middlewares — CORS restricted to allowed origins
 const isProduction = config.nodeEnv === "production";
 
-// In production, only the real frontend domain(s) are allowed. Localhost dev
-// origins are permitted only outside production.
-const allowedOrigins = [
-  config.allowedOrigin,
-  'https://pitchnestapp.vercel.app',
-  'https://www.pitchnest.app',
-  'https://pitchnest.app',
-  ...config.corsExtraOrigins,
-  ...(isProduction ? [] : ['http://localhost:5173', 'http://localhost:3000']),
-].filter(Boolean);
-
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (curl, server-to-server, native clients).
-    if (!origin || allowedOrigins.includes(origin)) {
+    // Requests without Origin are non-browser/native/server clients. Browser
+    // origins must be explicitly configured; preview domains are no longer
+    // trusted by suffix alone.
+    const isAllowed = !origin || isAllowedBrowserOrigin(origin);
+
+    if (isAllowed) {
       callback(null, true);
     } else if (isProduction) {
       console.warn(`⚠️ CORS blocked origin: ${origin}`);
@@ -57,12 +66,35 @@ app.use(cors({
 // Strict-Transport-Security, Referrer-Policy, X-DNS-Prefetch-Control, etc.
 app.use(
   helmet({
-    // CSP is relaxed because the backend may serve the frontend SPA.
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'self'"],
+        formAction: ["'self'"],
+        scriptSrc: ["'self'", "https://accounts.google.com"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "data:", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "blob:", "https:"],
+        connectSrc: ["'self'", "https:", "wss:"],
+        frameSrc: ["'self'", "blob:", "https:"],
+        mediaSrc: ["'self'", "blob:", "https:"],
+        workerSrc: ["'self'", "blob:"],
+        manifestSrc: ["'self'"],
+        // Do not make local HTTP development unusable.
+        upgradeInsecureRequests: isProduction ? [] : null,
+      },
+    },
     // Allow framing from same origin (needed for embedded previews).
     frameguard: { action: "sameorigin" },
+    referrerPolicy: { policy: "no-referrer" },
   }),
 );
+app.use((_req, res, next) => {
+  res.set("Permissions-Policy", "camera=(), microphone=(self), geolocation=(), payment=()");
+  next();
+});
 
 /**
  * ⚠️ MUST STAY ABOVE express.json — the payment webhook needs the raw bytes.
@@ -77,8 +109,15 @@ app.use(
  */
 app.use("/api/billing/webhook", express.raw({ type: "application/json", limit: "1mb" }));
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ limit: "256kb", extended: true }));
+
+// Sensitive API payloads are private unless a public controller explicitly
+// replaces this with a cache policy after validating its publication state.
+app.use("/api", (_req, res, next) => {
+  res.set("Cache-Control", "private, no-store");
+  next();
+});
 
 // Local-fallback files are delivered ONLY via the token-gated /api/files route
 // (S7) — the previous unauthenticated static mount let anyone who knew a
@@ -88,16 +127,33 @@ app.use("/api/files", fileRoutes);
 // API Routers
 app.use("/api/auth", authRoutes);
 app.use("/api/organization", router);
+app.use("/api/businesses", businessRoutes);
+app.use("/api/discover", discoverRoutes);
+app.use("/api/staff", staffRoutes);
+app.use("/api/practice", practiceRoutes);
+app.use("/api/notifications", notificationRoutes);
+app.use("/api/community", communityRoutes);
 app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);
+// The public share read — unauthenticated by definition, and the only route in
+// the app a stranger can reach without a token. See routes/publicRoutes.ts.
+app.use("/api/public", publicRoutes);
 app.use("/api/profile", profileRoutes);
-// Internal admin surface (Item C) — gated by ADMIN_API_KEY, 404 when unset.
+// Internal transcript review surface — authenticated and staff-role gated.
 app.use("/api/admin", adminRoutes);
 // Billing: checkout + the webhook that grants paid access.
 app.use("/api/billing", billingRoutes);
-app.post("/api/waitlist", handleWaitlist);
-app.post("/api/survey", handleSurvey);
+const publicSubmissionLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many submissions. Try again later." },
+});
+app.post("/api/waitlist", publicSubmissionLimiter, handleWaitlist);
+app.post("/api/survey", publicSubmissionLimiter, handleSurvey);
+app.get("/sitemap.xml", publicReadLimiter, getPublicBusinessSitemap);
 
 // Health check endpoints — kept dependency-free so they return instantly and can
 // be used to pre-warm the Render service (which spins down on the free tier).
@@ -115,6 +171,29 @@ const hasFrontendBuild = fs.existsSync(path.join(distPath, "index.html"));
 
 if (hasFrontendBuild) {
   console.log(`🟢 Frontend static assets found at: ${distPath}. Serving single-page application.`);
+  const indexTemplate = fs.readFileSync(path.join(distPath, "index.html"), "utf8");
+
+  // Social crawlers generally do not execute the React bundle. Render profile
+  // metadata into the initial HTML, and emit a noindex shell for every slug that
+  // does not currently resolve to an active approved publication.
+  app.get("/businesses/:slug", async (req, res) => {
+    const requestedSlug = String(req.params.slug || "").trim().toLowerCase().slice(0, 80);
+    let business: Awaited<ReturnType<typeof readPublicBusinessProfile>> = null;
+    try {
+      business = await readPublicBusinessProfile(requestedSlug);
+    } catch (error) {
+      console.error("Business profile metadata lookup failed:", error);
+    }
+    const html = injectPublicBusinessMetadata(
+      indexTemplate,
+      business,
+      publicSiteOrigin(),
+      requestedSlug,
+    );
+    res.set("Cache-Control", "public, max-age=0, must-revalidate");
+    res.status(200).type("html").send(html);
+  });
+
   app.use(express.static(distPath));
   app.get("*", (req, res) => {
     res.sendFile(path.join(distPath, "index.html"));

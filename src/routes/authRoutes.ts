@@ -1,5 +1,5 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
+import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import {
   signup,
   login,
@@ -8,6 +8,7 @@ import {
   updateMe,
   updateSettings,
   toPublicUser,
+  toPublicOrganization,
   forgotPassword,
   resetPassword,
   deleteAccount,
@@ -16,10 +17,14 @@ import {
   verifyEmailOtp,
   resendEmailVerification,
   refreshToken,
+  logout,
 } from "../controllers/authController.ts";
 import { config } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
-import { authMiddleware } from "../middleware/authMiddleware.ts";
+import {
+  accountAuthMiddleware,
+  authMiddleware,
+} from "../middleware/authMiddleware.ts";
 
 const router = Router();
 
@@ -28,6 +33,19 @@ const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { error: "Too many attempts. Please try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const sessionMaintenanceLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 120,
+  // Keyed by account; the IP fallback goes through ipKeyGenerator so IPv6
+  // clients are grouped by subnet and cannot dodge the limit by rotating
+  // addresses within their own range.
+  keyGenerator: (req) =>
+    String(req.user?.accountType ?? "account") + ":" + String(req.user?.id ?? ipKeyGenerator(req.ip ?? "")),
+  message: { error: "Too many session requests. Please try again later." },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -45,16 +63,40 @@ router.get("/verify-email", authLimiter, verifyEmail);
 router.post("/verify-email-otp", authLimiter, verifyEmailOtp);
 router.post("/resend-verification", authLimiter, resendEmailVerification);
 
-router.get("/me", authMiddleware, async (req, res) => {
-  // Fetch the live row so a refetch keeps role (and name/email) fresh. If the
-  // lookup fails transiently, fall back to the JWT identity so a healthy token
-  // is never treated as logged-out — same liveness semantics as before.
+router.get("/me", accountAuthMiddleware, async (req, res) => {
+  // Fetch the live row so a refetch keeps role, plan and profile data fresh.
+  // Fail closed: a token snapshot is not a substitute for the authoritative
+  // account row and could show stale entitlements or deleted profile data.
   try {
-    const { data: user } = await supabase
+    if (req.user!.accountType === "organization") {
+      const { data: organization, error } = await supabase
+        .from("Organizations")
+        .select("*")
+        .eq("id", req.user!.id)
+        .maybeSingle();
+
+      if (error) {
+        console.error("GET /me organization lookup failed:", error.message);
+        return res.status(503).json({ error: "Unable to load organization account." });
+      }
+
+      if (organization) {
+        return res.json(toPublicOrganization(organization));
+      }
+
+      return res.status(401).json({ error: "Organization account no longer exists." });
+    }
+
+    const { data: user, error } = await supabase
       .from("users")
       .select("*")
       .eq("id", req.user!.id)
       .maybeSingle();
+
+    if (error) {
+      console.error("GET /me user lookup failed:", error.message);
+      return res.status(503).json({ error: "Unable to load account." });
+    }
 
     if (user) {
       return res.json({
@@ -62,15 +104,17 @@ router.get("/me", authMiddleware, async (req, res) => {
         isEmailVerified: user.isEmailVerified,
       });
     }
+    return res.status(401).json({ error: "Account no longer exists." });
   } catch (err) {
-    console.warn("GET /me lookup failed, falling back to token identity:", err);
+    console.error("GET /me lookup threw:", err);
+    return res.status(503).json({ error: "Unable to load account." });
   }
-  res.json({ id: req.user!.id, email: req.user!.email, isEmailVerified: false });
 });
 
 // Deliberately not behind authLimiter — it fires on a timer for every active
 // user, and the shared 20-per-15-min cap would starve real logins.
-router.post("/refresh", authMiddleware, refreshToken);
+router.post("/refresh", accountAuthMiddleware, sessionMaintenanceLimiter, refreshToken);
+router.post("/logout", accountAuthMiddleware, sessionMaintenanceLimiter, logout);
 
 router.patch("/me", authMiddleware, updateMe);
 router.patch("/settings", authMiddleware, updateSettings);

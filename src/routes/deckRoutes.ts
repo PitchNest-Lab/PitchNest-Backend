@@ -10,7 +10,6 @@ import {
   downloadDeckAuditPDF,
   getDeckSignedUrl,
 } from "../controllers/deckController.ts";
-import { upload } from "../services/storageService.ts";
 
 const router = Router();
 

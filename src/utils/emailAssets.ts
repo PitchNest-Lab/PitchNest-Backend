@@ -5,7 +5,7 @@ import { config } from "../config/env.ts";
  * Guarantees that images embedded in HTML emails are hosted on your primary domain.
  */
 export function getEmailAssetUrl(assetName: string): string {
-  const baseUrl = (process.env.CLIENT_URL || config.allowedOrigin || "https://pitchnest.app").replace(/\/+$/, "");
+  const baseUrl = config.clientUrl;
   const cleanName = assetName.startsWith("/") ? assetName : `/${assetName}`;
   return `${baseUrl}/email-assets${cleanName}`;
 }
