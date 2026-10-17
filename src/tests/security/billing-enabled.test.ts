@@ -4,7 +4,7 @@ import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { FakeSupabase } from "../helpers/fakeSupabase.ts";
 import { startApp, call } from "../helpers/httpServer.ts";
-import { signUserToken } from "../../services/tokenService.ts";
+import { signUserToken } from "../helpers/tokens.ts";
 
 /**
  * FUTURE posture (switch explicitly "true"): checkout may only ever sell
@@ -24,10 +24,14 @@ before(async () => {
     const url = String(input?.url ?? input);
     if (url.includes("flutterwave.com")) {
       flutterwaveRequests.push({ url, body: init?.body ? JSON.parse(String(init.body)) : null });
-      return new Response(
-        JSON.stringify({ status: "success", data: { link: "https://checkout.example.test/pay/mock" } }),
-        { status: 200, headers: { "content-type": "application/json" } },
-      );
+      // Checkout subscribes the card to a payment plan, created once per SKU.
+      const data = url.endsWith("/payment-plans")
+        ? { id: 8000 }
+        : { link: "https://checkout.flutterwave.com/v3/hosted/pay/mock" };
+      return new Response(JSON.stringify({ status: "success", data }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
     return realFetch(input, init);
   }) as typeof fetch;
@@ -61,10 +65,11 @@ for (const [label, body] of [
   ["no body (what the web client sends)", undefined],
   ["explicit pro/monthly", { plan: "pro", term: "monthly" }],
 ] as const) {
-  test(`checkout sells Pro monthly at USD 10 for 30 days — ${label}`, async () => {
+  test(`checkout sells Pro monthly at USD 10 for one monthly term — ${label}`, async () => {
+    const { initialGrantDays } = await import("../../services/subscriptionService.ts");
     const r = await call(base, "POST", "/api/billing/checkout", { token: signUserToken(USER), body });
     assert.equal(r.status, 200);
-    assert.equal(r.json.paymentLink, "https://checkout.example.test/pay/mock");
+    assert.equal(r.json.paymentLink, "https://checkout.flutterwave.com/v3/hosted/pay/mock");
 
     const rows = db.rows("payments");
     assert.equal(rows.length, 1);
@@ -72,32 +77,36 @@ for (const [label, body] of [
     assert.equal(rows[0].term, "monthly");
     assert.equal(rows[0].amount, 10);
     assert.equal(rows[0].currency, "USD");
-    assert.equal(rows[0].granted_days, 30);
+    // One calendar month plus the renewal grace, and no free-month bonus.
+    assert.equal(rows[0].granted_days, initialGrantDays("monthly", 0));
+    assert.equal(rows[0].bonus_days, 0);
     assert.equal(rows[0].status, "pending");
 
-    assert.equal(flutterwaveRequests.length, 1);
-    assert.equal(flutterwaveRequests[0].body.amount, 10);
-    assert.equal(flutterwaveRequests[0].body.currency, "USD");
-    assert.equal(flutterwaveRequests[0].body.meta.plan, "pro");
-    assert.equal(flutterwaveRequests[0].body.meta.term, "monthly");
+    const payments = flutterwaveRequests.filter((req) => req.url.endsWith("/payments"));
+    assert.equal(payments.length, 1);
+    assert.equal(payments[0].body.amount, 10);
+    assert.equal(payments[0].body.currency, "USD");
+    assert.equal(payments[0].body.payment_plan, 8000);
+    assert.equal(payments[0].body.meta.plan, "pro");
+    assert.equal(payments[0].body.meta.term, "monthly");
   });
 }
 
-const REFUSED_BODIES = [
+// Real SKUs that are simply not on sale yet, and values that are no SKU at all.
+const UNSOLD_BODIES = [
   { plan: "pro", term: "annual" },
   { plan: "prep", term: "monthly" },
   { plan: "prep", term: "annual" },
   { plan: "prep" },
   { term: "annual" },
-  { plan: "enterprise" },
-  { plan: "pro", term: "weekly" },
 ];
-REFUSED_BODIES.forEach((body, i) => {
+const INVALID_BODIES = [{ plan: "enterprise" }, { plan: "pro", term: "weekly" }];
+[...UNSOLD_BODIES, ...INVALID_BODIES].forEach((body, i) => {
   test(`checkout refuses non-Pro-monthly SKU ${JSON.stringify(body)} with 400 and no charge`, async () => {
     const buyer = { id: 900 + i, email: `refused${i}@x.test` };
     const r = await call(base, "POST", "/api/billing/checkout", { token: signUserToken(buyer), body });
     assert.equal(r.status, 400);
-    assert.equal(r.json.error, "plan_not_available");
+    if (UNSOLD_BODIES.includes(body)) assert.equal(r.json.error, "plan_not_available");
     assert.equal(db.rows("payments").length, 0);
     assert.equal(flutterwaveRequests.length, 0);
   });
@@ -106,7 +115,11 @@ REFUSED_BODIES.forEach((body, i) => {
 test("createCheckout itself refuses other SKUs (defence in depth)", async () => {
   const { createCheckout } = await import("../../services/flutterwaveService.ts");
   await assert.rejects(
-    createCheckout({ id: USER.id, email: USER.email }, { plan: "pro", term: "annual" }),
+    createCheckout(
+      { id: USER.id, email: USER.email },
+      { plan: "pro", term: "annual" },
+      { paymentPlanId: 8000, grantedDays: 365, bonusDays: 0 },
+    ),
     (e: any) => e.code === "PLAN_NOT_AVAILABLE",
   );
   assert.equal(db.rows("payments").length, 0);

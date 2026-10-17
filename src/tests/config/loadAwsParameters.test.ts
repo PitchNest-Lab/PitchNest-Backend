@@ -70,7 +70,8 @@ test("loads all nine parameters, including Azure OpenAI, in one decrypted call",
 
 test("Azure values are visible to config/env.ts when it is imported after loading", async () => {
   await loadAwsParameters(new FakeSsm(fullStore()) as any);
-  process.env.JWT_SECRET = "test-only-secret";
+  // config/env.ts refuses a JWT secret under 32 bytes.
+  process.env.JWT_SECRET = "test-only-secret-padded-to-32-bytes-minimum";
   const { config, hasAzureOpenAiConfig } = await import("../../config/env.ts");
   assert.equal(config.azureOpenAiEndpoint, dummy("AZURE_OPENAI_ENDPOINT"));
   assert.equal(config.azureOpenAiApiKey, dummy("AZURE_OPENAI_API_KEY"));

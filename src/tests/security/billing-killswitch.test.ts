@@ -4,7 +4,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { FakeSupabase } from "../helpers/fakeSupabase.ts";
 import { startApp, call } from "../helpers/httpServer.ts";
-import { signUserToken } from "../../services/tokenService.ts";
+import { signUserToken } from "../helpers/tokens.ts";
 import { DUMMY_FLW_HASH } from "../helpers/billingEnv.ts";
 
 /**
@@ -53,7 +53,9 @@ test("public price: billingEnabled=false and Pro monthly is USD 10 for 30 days",
   assert.equal(r.json.billingEnabled, false, "keys alone must not enable billing");
   assert.deepEqual(r.json.price, { amount: 10, currency: "USD", days: 30 });
   const proMonthly = r.json.catalog.find((c: any) => c.plan === "pro" && c.term === "monthly");
-  assert.deepEqual(proMonthly, { plan: "pro", term: "monthly", amount: 10, currency: "USD", days: 30 });
+  assert.deepEqual(proMonthly, { plan: "pro", term: "monthly", amount: 10, currency: "USD", days: 30, purchasable: true });
+  const unsold = r.json.catalog.filter((c: any) => !(c.plan === "pro" && c.term === "monthly"));
+  assert.ok(unsold.length > 0 && unsold.every((c: any) => c.purchasable === false), "only Pro monthly is on sale by default");
 });
 
 test("checkout is refused with 503 even though both Flutterwave keys are present", async () => {

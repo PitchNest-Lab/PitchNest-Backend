@@ -16,6 +16,9 @@ export function applyBillingEnv(checkoutSwitch: string | undefined): void {
   process.env.PRO_PLAN_AMOUNT = "10";
   process.env.PRO_PLAN_CURRENCY = "USD";
   process.env.PRO_PLAN_DAYS = "30";
+  // No first-subscription bonus here, so a checkout grants exactly one period.
+  // The free-month offer has its own coverage in subscription_billing_test.ts.
+  process.env.FIRST_SUBSCRIPTION_FREE_MONTHS = "0";
   if (checkoutSwitch === undefined) delete process.env.BILLING_CHECKOUT_ENABLED;
   else process.env.BILLING_CHECKOUT_ENABLED = checkoutSwitch;
 }
