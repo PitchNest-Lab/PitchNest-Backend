@@ -206,5 +206,47 @@ check("nothing changed after the refusal", d5.onlyA.length === 0 && d5.onlyB.len
 const gapReport = await report(gapDb);
 check("check script reports the gap", gapReport.prerequisites?.status === "partial" && /sessions\.pitch_root_id/.test(gapReport.prerequisites?.missing_items ?? ""), gapReport.prerequisites?.missing_items);
 
+// ── 6. An older schema_migrations table (no description column) ───────────
+// The shape found on the team's DEV and PROD databases before the upgrade.
+const LEGACY_LEDGER = `
+  CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+  ALTER TABLE schema_migrations ENABLE ROW LEVEL SECURITY;
+  CREATE POLICY "schema_migrations_deny_anon" ON schema_migrations
+    FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+`;
+const ledgerDb = await base();
+await run(ledgerDb, "legacy ledger", LEGACY_LEDGER + `INSERT INTO schema_migrations (version) VALUES ('0007');`);
+const ledgerReport = await report(ledgerDb);
+check("check script shows 0018 partial (5 / 8), as on the team databases",
+  ledgerReport["0018"]?.status === "partial" && ledgerReport["0018"]?.objects === "5 / 8", JSON.stringify(ledgerReport["0018"]));
+await run(ledgerDb, "combined on legacy ledger", UPGRADE);
+const d6 = diff(seqSnap, await snapshot(ledgerDb));
+check("upgrade brings a database with the older ledger to the same schema", d6.onlyA.length === 0 && d6.onlyB.length === 0,
+  d6.onlyA.length || d6.onlyB.length ? `\n${show(d6.onlyA)}\n${show(d6.onlyB)}` : "");
+const ledgerRows = (await ledgerDb.query(`SELECT version, description FROM schema_migrations ORDER BY version`)).rows;
+check("the older row is kept and labelled; 0015-0031 are recorded",
+  ledgerRows.find((r) => r.version === "0007")?.description === "Recorded before the ledger had descriptions" &&
+    VERSIONS.every((v) => ledgerRows.some((r) => r.version === v)),
+  ledgerRows.map((r) => r.version).join(","));
+await run(ledgerDb, "combined on legacy ledger (second run)", UPGRADE);
+const d6b = diff(seqSnap, await snapshot(ledgerDb));
+check("a second run on it is a no-op", d6b.onlyA.length === 0 && d6b.onlyB.length === 0);
+
+// ── 7. An older ledger that already claims a version this upgrade applies ──
+const claimDb = await base();
+await run(claimDb, "legacy ledger claiming 0019", LEGACY_LEDGER + `INSERT INTO schema_migrations (version) VALUES ('0019');`);
+const claimBefore = await snapshot(claimDb);
+let claimError = null;
+try {
+  await run(claimDb, "combined on claimed ledger", UPGRADE);
+} catch (error) {
+  claimError = error;
+}
+await claimDb.exec("ROLLBACK").catch(() => {});
+check("upgrade refuses an older ledger that records 0015+ versions", !!claimError && /records version\(s\) 0019/.test(claimError.message),
+  claimError ? claimError.message.split("\n")[0].slice(0, 200) : "no error");
+const d7 = diff(claimBefore, await snapshot(claimDb));
+check("nothing changed after that refusal", d7.onlyA.length === 0 && d7.onlyB.length === 0, `${d7.onlyA.length + d7.onlyB.length} differences`);
+
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll combined-migration checks passed.");
 process.exit(failures ? 1 : 0);

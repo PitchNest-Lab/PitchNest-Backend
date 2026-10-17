@@ -45,6 +45,7 @@ DO $preflight$
 DECLARE
   missing TEXT[] := ARRAY[]::TEXT[];
   item RECORD;
+  foreign_versions TEXT;
 BEGIN
   FOR item IN
     SELECT * FROM (VALUES
@@ -212,6 +213,21 @@ BEGIN
       (SELECT count(*) FROM users WHERE failed_login_attempts < 0)
       USING HINT = 'Reset them with: UPDATE users SET failed_login_attempts = 0 WHERE failed_login_attempts < 0; then run this file again.';
   END IF;
+
+  -- A schema_migrations table without a description column was not created by
+  -- migration 0018. Its rows decide which migrations this upgrade skips, so any
+  -- it holds from 0015 on must be looked at before going further.
+  IF to_regclass('public.schema_migrations') IS NOT NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM information_schema.columns
+       WHERE table_schema = 'public' AND table_name = 'schema_migrations' AND column_name = 'description') THEN
+    EXECUTE 'SELECT string_agg(version::text, '', '' ORDER BY version::text) FROM public.schema_migrations WHERE version::text >= ''0015'''
+      INTO foreign_versions;
+    IF foreign_versions IS NOT NULL THEN
+      RAISE EXCEPTION 'PitchNest upgrade stopped before changing anything. An existing schema_migrations table (not created by migration 0018) already records version(s) %, which this upgrade would skip as applied.', foreign_versions
+        USING HINT = 'Check what those rows record. If those migrations were never applied, delete the rows, then run this file again.';
+    END IF;
+  END IF;
 END
 $preflight$;
 
@@ -239,6 +255,34 @@ BEGIN
   END IF;
 END
 $org_credentials$;
+
+-- ── Migration ledger ────────────────────────────────────────────────────────
+-- Some databases already have a schema_migrations table without 0018's
+-- description column. Bring it to 0018's shape so the ledger rows written below
+-- fit. Rows already there are kept and labelled.
+DO $ledger$
+BEGIN
+  IF to_regclass('public.schema_migrations') IS NULL THEN
+    RETURN;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'schema_migrations' AND column_name = 'description') THEN
+    ALTER TABLE public.schema_migrations ADD COLUMN description TEXT;
+    UPDATE public.schema_migrations
+       SET description = 'Recorded before the ledger had descriptions'
+     WHERE description IS NULL;
+    ALTER TABLE public.schema_migrations ALTER COLUMN description SET NOT NULL;
+    RAISE NOTICE 'PitchNest upgrade: added the description column to the existing schema_migrations table.';
+  END IF;
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'schema_migrations'
+      AND column_name = 'applied_at' AND column_default IS NULL) THEN
+    ALTER TABLE public.schema_migrations ALTER COLUMN applied_at SET DEFAULT NOW();
+  END IF;
+END
+$ledger$;
 
 
 -- ════════════════════════════════════════════════════════════════════════════
