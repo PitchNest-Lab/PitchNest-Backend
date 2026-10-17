@@ -35,7 +35,9 @@
     "job:trial-lifecycle": "tsx src/jobs/runTrialLifecycle.ts",
     "build:lambda": "bash build-lambda.sh",
     "build:lambda:prod": "node scripts/build-lambda-prod.mjs",
-    "verify:lambda:prod": "node scripts/verify-lambda-artifact.mjs"
+    "verify:lambda:prod": "node scripts/verify-lambda-artifact.mjs",
+    "migrations:combined": "node scripts/migrations/build-combined.mjs",
+    "test:migrations": "node scripts/migrations/test-combined.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ssm": "^3.1147.0",
@@ -62,6 +64,7 @@
     "ws": "^8.22.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.21",
     "@types/jsonwebtoken": "^9.0.10",

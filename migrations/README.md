@@ -50,7 +50,63 @@ UPDATE users SET is_staff = TRUE WHERE email = 'moderator@example.com';
 The staff queue lives at `/staff/moderation`. Revoking the flag takes effect on
 the next request.
 
+## Organization credentials
+
 Organization credentials created or updated after `0018` must contain bcrypt
 hashes. Existing non-bcrypt credentials are deliberately not auto-converted:
-their plaintext values must not be exported or re-saved. Reset those credentials
-through an approved one-time administrative process before enabling login.
+their plaintext values must not be exported or re-saved.
+
+`0030` updates every organization row, and each update re-checks the bcrypt
+rule, so a database still holding a non-bcrypt value cannot apply `0030`.
+Clear those values first; the combined upgrade below does this for you:
+
+```sql
+UPDATE "Organizations" SET password = NULL
+WHERE password IS NOT NULL AND password !~ '^\$2[aby]\$[0-9]{2}\$.{53}$';
+```
+
+To give an organization a new password without the plain text reaching the SQL
+editor's saved history, hash it on your own machine from the backend folder:
+
+```bash
+node -e "const b=require('bcryptjs');process.stdin.once('data',d=>console.log(b.hashSync(d.toString().trim(),12)))"
+```
+
+Type the password, press Enter and copy the printed hash. Then run, with the
+organization's address:
+
+```sql
+UPDATE "Organizations"
+SET password = '<hash>', auth_version = auth_version + 1,
+    failed_login_attempts = 0, locked_until = NULL
+WHERE email = 'organization@example.com';
+```
+
+## Upgrading an existing database from 0014
+
+A database at the `0014` schema (one that predates migration `0015`) can be
+brought to `0031` with the two files in `combined/` instead of applying each
+migration by hand.
+
+| File | What it does |
+|---|---|
+| `combined/check_schema_state.sql` | Read-only. Reports the 0014 prerequisites, which of 0015–0031 are applied, and data the upgrade will act on. |
+| `combined/upgrade_0014_to_0031.sql` | Applies 0015–0031 in one transaction and skips any already applied. Before changing anything it stops, with a list, if part of the 0014 schema is missing or 0030 would reject existing data. Clears non-bcrypt organization passwords (above). |
+
+1. Take a backup or restorable snapshot.
+2. Run `check_schema_state.sql` in the Supabase SQL editor. The `prerequisites`
+   row must say `ok`, and no `data:` row may say `blocks upgrade`.
+3. Run `upgrade_0014_to_0031.sql`: DEV first, then PROD. Any error rolls the
+   whole run back; fix what the message names and run the file again.
+4. Run `check_schema_state.sql` again. Every migration should say `applied`,
+   with the ledger `recorded` for 0018 onward.
+5. Then deploy the backend that expects this schema, to Render and Lambda
+   together.
+
+Both files are generated from the numbered migrations. After changing or adding
+a migration, run `npm run migrations:combined` and `npm run test:migrations` in
+the backend. The test applies everything to an in-memory Postgres (PGlite) with
+stand-ins for Supabase's roles and storage, and checks that the combined script
+matches the numbered migrations, re-runs as a no-op, completes partly upgraded
+databases, keeps existing rows and refuses bad prerequisites without changing
+anything. It needs no network or real database.
