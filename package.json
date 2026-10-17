@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "engines": {
-    "node": ">=22"
+    "node": ">=22 <25"
   },
   "scripts": {
     "start": "node --max-old-space-size=384 ./node_modules/tsx/dist/cli.mjs server.ts",
