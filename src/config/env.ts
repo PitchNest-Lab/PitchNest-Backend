@@ -35,6 +35,16 @@ function wholeNumberEnv(name: string, fallback: number, max: number): number {
   return Number.isInteger(value) && value >= 0 && value <= max ? value : fallback;
 }
 
+const SKU_PATTERN = /^(prep|pro):(monthly|annual)$/;
+
+function purchasableSkusEnv(name: string): string[] {
+  const skus = String(process.env[name] || "")
+    .split(",")
+    .map((sku) => sku.trim().toLowerCase())
+    .filter((sku) => SKU_PATTERN.test(sku));
+  return skus.length > 0 ? [...new Set(skus)] : ["pro:monthly"];
+}
+
 function currencyEnv(name: string, fallback: string): string {
   const value = String(process.env[name] || "").trim().toUpperCase();
   return /^[A-Z]{3}$/.test(value) ? value : fallback;
@@ -133,6 +143,11 @@ export const config = {
   // present — so loading the keys (e.g. granting the Lambda SSM access) can
   // never turn checkout on by itself. Anything else, including unset, is off.
   billingCheckoutEnabled: process.env.BILLING_CHECKOUT_ENABLED === "true",
+  // Which "plan:term" SKUs checkout may sell. Unset means Pro monthly only, the
+  // launch default. Widening the list is a config change (for example
+  // "pro:monthly,pro:annual,prep:monthly,prep:annual"); unknown entries are
+  // ignored, and an empty result falls back to the default.
+  purchasableSkus: purchasableSkusEnv("BILLING_PURCHASABLE_SKUS"),
   // Price is config, not code, so a currency or amount change is a deploy env
   // change. Amount is MAJOR units (15 = $15.00 USD).
   proPlanAmount: positiveMoneyEnv("PRO_PLAN_AMOUNT", 15),
@@ -221,18 +236,13 @@ export function isPaidPlan(v: unknown): v is PaidPlan {
 }
 
 /**
- * The ONLY (plan, term) combination checkout may sell: Pro, monthly.
- * The wider catalog above stays for display compatibility, but annual terms
- * and the Prep level are not purchasable. Checked by both the controller and
- * createCheckout, so no caller can charge for another SKU.
+ * Whether checkout may sell this (plan, term). Only the SKUs in
+ * config.purchasableSkus qualify (Pro monthly unless configured otherwise). The
+ * full catalog stays visible for pricing pages, flagged per SKU. Checked by
+ * both the controller and createCheckout, so no caller can charge for another SKU.
  */
-export const PURCHASABLE_SKU: Readonly<{ plan: PaidPlan; term: BillingTerm }> = Object.freeze({
-  plan: "pro",
-  term: "monthly",
-});
-
 export function isPurchasable(plan: unknown, term: unknown): boolean {
-  return plan === PURCHASABLE_SKU.plan && term === PURCHASABLE_SKU.term;
+  return config.purchasableSkus.includes(`${plan}:${term}`);
 }
 
 export function isBillingTerm(v: unknown): v is BillingTerm {
@@ -251,10 +261,12 @@ export function resolvePlanPrice(plan: PaidPlan, term: BillingTerm): ResolvedPri
 }
 
 /** Every purchasable SKU, for the pricing UI. */
-export function listBillingCatalog(): ResolvedPrice[] {
+export function listBillingCatalog(): Array<ResolvedPrice & { purchasable: boolean }> {
   const plans: PaidPlan[] = ["prep", "pro"];
   const terms: BillingTerm[] = ["monthly", "annual"];
-  return plans.flatMap((p) => terms.map((t) => resolvePlanPrice(p, t)));
+  return plans.flatMap((p) =>
+    terms.map((t) => ({ ...resolvePlanPrice(p, t), purchasable: isPurchasable(p, t) })),
+  );
 }
 
 

@@ -211,6 +211,8 @@ const mutableConfig = config as any;
 const originalConfig = {
   key: mutableConfig.flutterwaveSecretKey,
   hash: mutableConfig.flutterwaveWebhookHash,
+  checkoutEnabled: mutableConfig.billingCheckoutEnabled,
+  purchasableSkus: mutableConfig.purchasableSkus,
   nodeEnv: mutableConfig.nodeEnv,
 };
 mutableSupabase.from = fakeFrom;
@@ -218,6 +220,7 @@ mutableSupabase.rpc = fakeRpc;
 globalThis.fetch = fakeFetch as typeof fetch;
 mutableConfig.flutterwaveSecretKey = "FLWSECK_TEST-fake";
 mutableConfig.flutterwaveWebhookHash = "test-webhook-hash";
+mutableConfig.billingCheckoutEnabled = true;
 mutableConfig.nodeEnv = "test";
 
 function recorder() {
@@ -237,6 +240,15 @@ const webhook = (payload: Row) =>
 
 try {
   const proMonthly = resolvePlanPrice("pro", "monthly");
+
+  // ── Launch default: only Pro monthly is sellable ──────────────────────────
+  mutableConfig.purchasableSkus = ["pro:monthly"];
+  const refused = recorder();
+  await startCheckout(asUser(10, { plan: "pro", term: "annual" }), refused);
+  assert.equal(refused.statusCode, 400, JSON.stringify(refused.body));
+  assert.equal(refused.body.error, "plan_not_available");
+  assert.equal(calls.length, 0, "a refused SKU never reaches Flutterwave");
+  mutableConfig.purchasableSkus = ["prep:monthly", "prep:annual", "pro:monthly", "pro:annual"];
 
   // ── Checkout: first subscription gets the free month ──────────────────────
   let res = recorder();
@@ -446,5 +458,7 @@ try {
   globalThis.fetch = originalFetch;
   mutableConfig.flutterwaveSecretKey = originalConfig.key;
   mutableConfig.flutterwaveWebhookHash = originalConfig.hash;
+  mutableConfig.billingCheckoutEnabled = originalConfig.checkoutEnabled;
+  mutableConfig.purchasableSkus = originalConfig.purchasableSkus;
   mutableConfig.nodeEnv = originalConfig.nodeEnv;
 }

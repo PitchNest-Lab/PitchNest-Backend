@@ -6,6 +6,7 @@ import {
   listBillingCatalog,
   isPaidPlan,
   isBillingTerm,
+  isPurchasable,
   type PaidPlan,
   type BillingTerm,
 } from "../config/env.ts";
@@ -241,6 +242,12 @@ export const startCheckout = async (req: Request, res: Response) => {
     if (!selection) {
       return res.status(400).json({ error: "Please choose a valid plan and billing term." });
     }
+    if (!isPurchasable(selection.plan, selection.term)) {
+      return res.status(400).json({
+        error: "plan_not_available",
+        message: "That plan isn't available to buy yet.",
+      });
+    }
 
     let current: Awaited<ReturnType<typeof getActiveSubscription>>;
     let offer: Awaited<ReturnType<typeof offerFor>>;
@@ -295,6 +302,7 @@ export const startCheckout = async (req: Request, res: Response) => {
     const code: string = err?.code ?? "UNKNOWN";
     const status =
       code === "BILLING_NOT_CONFIGURED" ? 503 :
+      code === "PLAN_NOT_AVAILABLE" ? 400 :
       code === "PAYMENT_RECORD_FAILED" ? 500 :
       502; // CHECKOUT_INIT_FAILED and anything unexpected: upstream/transient.
 
@@ -302,6 +310,7 @@ export const startCheckout = async (req: Request, res: Response) => {
     // the same friendly text. Neither carries `err.detail`, which is log-only.
     const reason =
       code === "BILLING_NOT_CONFIGURED" ? "billing_unavailable" :
+      code === "PLAN_NOT_AVAILABLE" ? "plan_not_available" :
       code === "PAYMENT_RECORD_FAILED" ? "record_failed" :
       code === "CHECKOUT_INIT_FAILED" ? "provider_rejected" :
       "unknown";
