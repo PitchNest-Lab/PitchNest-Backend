@@ -271,5 +271,108 @@ if (!orgNnError) {
   check("schema matches the numbered migrations", d8.onlyA.length === 0 && d8.onlyB.length === 0, `${d8.onlyA.length + d8.onlyB.length} differences`);
 }
 
+// ── 9. A dashboard-built database that differs from 0000 ───────────────────
+// The differences found on the team's DEV and PROD databases, rebuilt on 0000.
+const HASH = "$2b$10$abcdefghijklmnopqrstuuJ0Tz2c8rVb6Xy8ZQm1fQ4Q8VxQd1W6S";
+const teamDb = await base();
+await run(teamDb, "dashboard-built differences", `
+  ALTER TABLE "Organizations" DROP CONSTRAINT "Organizations_pkey";
+  ALTER TABLE "Organizations" DROP CONSTRAINT "Organizations_email_key";
+  ALTER TABLE "Organizations" DROP CONSTRAINT "Organizations_org_code_key";
+  INSERT INTO "Organizations" (id, org_code, org_name, org_users_capacity, email, password, validity, plan)
+  VALUES (1, 12345, 'test', 10, 'test@gmail.com', 'plaintext-secret', now() + interval '30 days', 'ADVANCE');
+  ALTER TABLE "Organizations"
+    ALTER COLUMN password SET DEFAULT '', ALTER COLUMN password SET NOT NULL,
+    ALTER COLUMN email SET NOT NULL, ALTER COLUMN validity SET NOT NULL, ALTER COLUMN org_code SET NOT NULL;
+  ALTER TABLE "Organizations" ADD CONSTRAINT "Organizations_pkey" PRIMARY KEY (id, org_code, validity, email, password);
+
+  ALTER TABLE users ALTER COLUMN "orgCode" SET DEFAULT '';
+  INSERT INTO users (id, name, email, password, "isEmailVerified", "orgCode") VALUES
+    (1, 'Member', 'member@x.test', '${HASH}', true, '12345'),
+    (2, 'Joiner', 'joiner@x.test', '${HASH}', true, ''),
+    (3, 'Leaver', 'leaver@x.test', '${HASH}', true, '');
+  ALTER TABLE users ALTER COLUMN password SET NOT NULL;
+
+  CREATE TABLE organizations (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name TEXT NOT NULL);
+  ALTER TABLE sessions ALTER COLUMN org_id TYPE UUID USING NULL;
+  ALTER TABLE sessions ADD CONSTRAINT sessions_org_id_fkey FOREIGN KEY (org_id) REFERENCES organizations(id) ON DELETE SET NULL;
+  ALTER TABLE sessions ADD CONSTRAINT sessions_visibility_check CHECK (visibility IN ('private', 'org'));
+  ALTER TABLE sessions ALTER COLUMN visibility SET NOT NULL;
+
+  ALTER TABLE sessions DROP CONSTRAINT sessions_user_id_fkey;
+  ALTER TABLE decks DROP CONSTRAINT decks_user_id_fkey;
+  ALTER TABLE profiles DROP CONSTRAINT profiles_user_id_fkey;
+  INSERT INTO sessions (id, user_id, visibility) VALUES (1, 3, 'private'), (2, 999, 'private');
+  INSERT INTO decks (id, user_id, name, file_url) VALUES (1, 3, 'Deck', 'decks/1_x.pdf');
+  INSERT INTO profiles (user_id, startup_name) VALUES (3, 'Leaver Co');
+  SELECT setval(pg_get_serial_sequence('users', 'id'), 100);
+  SELECT setval(pg_get_serial_sequence('sessions', 'id'), 100);
+  SELECT setval(pg_get_serial_sequence('decks', 'id'), 100);
+
+  CREATE POLICY "Allow all access for authenticated users" ON session_pdfs FOR ALL TO public USING (true) WITH CHECK (true);
+  CREATE POLICY "Allow anon waitlist select" ON waitlist FOR SELECT TO public USING (true);
+  CREATE POLICY "Allow anon waitlist updates" ON waitlist FOR UPDATE TO public USING (true) WITH CHECK (true);
+  CREATE POLICY "Allow anon waitlist inserts" ON waitlist FOR INSERT TO anon WITH CHECK (true);
+`);
+const teamBefore = await report(teamDb);
+check("check script lists the differences to align",
+  teamBefore.alignment?.status === "will be aligned" && teamBefore.alignment?.objects === "8 difference(s)",
+  `${teamBefore.alignment?.objects}: ${teamBefore.alignment?.missing_items}`);
+let teamError = null;
+try {
+  await run(teamDb, "combined on a dashboard-built database", UPGRADE);
+} catch (error) {
+  teamError = error;
+}
+await teamDb.exec("ROLLBACK").catch(() => {});
+check("upgrade succeeds on a dashboard-built database", !teamError, teamError?.message?.split("\n")[0]?.slice(0, 220));
+if (!teamError) {
+  const teamAfter = await report(teamDb);
+  check("check script after: aligned, every migration applied",
+    teamAfter.alignment?.status === "ok" && VERSIONS.every((v) => teamAfter[v]?.status === "applied"),
+    `${teamAfter.alignment?.missing_items} | ${VERSIONS.filter((v) => teamAfter[v]?.status !== "applied").join(",")}`);
+  const org = (await teamDb.query(`SELECT password FROM "Organizations" WHERE id = 1`)).rows[0];
+  check("the plaintext organization password is cleared", org?.password === null);
+  const blanks = (await teamDb.query(`SELECT count(*)::int AS n FROM users WHERE "orgCode" = ''`)).rows[0].n;
+  check("blank orgCode values are now NULL", blanks === 0);
+
+  // What the backend does with this database afterwards.
+  const ops = [
+    ["an organization member's session saves (org code, visibility organization)",
+      `INSERT INTO sessions (user_id, org_id, visibility) VALUES (1, '12345', 'organization')`],
+    ["a user with a blank orgCode can join an organization",
+      `DO $$ BEGIN IF enroll_user_in_organization(2, '12345') IS DISTINCT FROM '12345' THEN RAISE EXCEPTION 'not enrolled'; END IF; END $$`],
+    ["Google sign-up without a password is accepted",
+      `INSERT INTO users (name, email, password, auth_provider, "isEmailVerified") VALUES ('G', 'g@x.test', NULL, 'google', true)`],
+  ];
+  for (const [label, sql] of ops) {
+    let opError = null;
+    try {
+      await teamDb.exec(sql);
+    } catch (error) {
+      opError = error;
+    }
+    check(label, !opError, opError?.message?.slice(0, 200));
+  }
+  await teamDb.exec(`DELETE FROM users WHERE id = 3`);
+  const left = (await teamDb.query(`
+    SELECT (SELECT count(*)::int FROM sessions WHERE user_id = 3) AS sessions,
+           (SELECT count(*)::int FROM decks WHERE user_id = 3) AS decks,
+           (SELECT count(*)::int FROM profiles WHERE user_id = 3) AS profiles,
+           (SELECT count(*)::int FROM sessions WHERE user_id = 999) AS orphans`)).rows[0];
+  check("deleting a user removes their sessions, decks and profile; an older orphan row is left alone",
+    left.sessions === 0 && left.decks === 0 && left.profiles === 0 && left.orphans === 1, JSON.stringify(left));
+  const openPolicies = (await teamDb.query(`
+    SELECT count(*)::int AS n FROM pg_policies
+     WHERE schemaname = 'public' AND policyname IN (
+       'Allow all access for authenticated users', 'Allow anon waitlist select',
+       'Allow anon waitlist updates', 'Allow anon waitlist inserts')`)).rows[0].n;
+  check("the open-access policies are gone", openPolicies === 0);
+  const beforeSecond = await snapshot(teamDb);
+  await run(teamDb, "combined on the aligned database (second run)", UPGRADE);
+  const d9 = diff(beforeSecond, await snapshot(teamDb));
+  check("a second run on it is a no-op", d9.onlyA.length === 0 && d9.onlyB.length === 0, `${d9.onlyA.length + d9.onlyB.length} differences`);
+}
+
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll combined-migration checks passed.");
 process.exit(failures ? 1 : 0);

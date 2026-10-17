@@ -13,6 +13,12 @@
 --   Migrations already applied (by ledger row, or for 0015-0017 by their
 --   objects) are skipped, so a partly upgraded database is completed safely.
 --
+--   SCHEMA ALIGNMENT: before 0015, the parts of a dashboard-built database that
+--   differ from 0000 in ways the backend depends on are brought in line
+--   (Organizations key and password column, users.password and "orgCode",
+--   sessions.org_id and visibility, user links on sessions/decks/profiles, and
+--   open-access policies on session_pdfs and waitlist). See "Align" below.
+--
 --   DATA CHANGE: organization passwords that are not bcrypt hashes are cleared
 --   (set to NULL). They cannot sign in under the current backend and would
 --   stop migration 0030. Affected organizations need a new password afterwards.
@@ -231,6 +237,112 @@ BEGIN
 END
 $preflight$;
 
+-- ── Align the 0014 schema with 0000 where the backend depends on it ─────────
+-- Databases built through the dashboard differ from 0000_complete_fresh_setup
+-- in ways the backend cannot work around. Each step is skipped when the
+-- database already matches 0000.
+DO $align$
+DECLARE
+  pk_name TEXT;
+  pk_cols TEXT[];
+  org_id_type TEXT;
+  child RECORD;
+  fk RECORD;
+  orphans BIGINT;
+BEGIN
+  -- Organizations is keyed on id alone. A key over several columns (some
+  -- databases include password in it) would stop the password being cleared.
+  SELECT k.conname, array_agg(a.attname::TEXT ORDER BY a.attnum)
+    INTO pk_name, pk_cols
+    FROM pg_constraint k
+    JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
+   WHERE k.conrelid = '"Organizations"'::regclass AND k.contype = 'p'
+   GROUP BY k.conname;
+  IF pk_cols IS DISTINCT FROM ARRAY['id'] THEN
+    IF pk_name IS NOT NULL THEN
+      EXECUTE format('ALTER TABLE "Organizations" DROP CONSTRAINT %I', pk_name);
+    END IF;
+    ALTER TABLE "Organizations" ADD CONSTRAINT "Organizations_pkey" PRIMARY KEY (id);
+    RAISE NOTICE 'PitchNest upgrade: Organizations is now keyed on id.';
+  END IF;
+
+  -- Organization login and enrolment look a row up by email and by org_code.
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+    WHERE i.indrelid = '"Organizations"'::regclass AND i.indisunique AND i.indnatts = 1 AND a.attname = 'email') THEN
+    ALTER TABLE "Organizations" ADD CONSTRAINT "Organizations_email_key" UNIQUE (email);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
+    WHERE i.indrelid = '"Organizations"'::regclass AND i.indisunique AND i.indnatts = 1 AND a.attname = 'org_code') THEN
+    ALTER TABLE "Organizations" ADD CONSTRAINT "Organizations_org_code_key" UNIQUE (org_code);
+  END IF;
+
+  -- NULL is how the backend represents "no password set", for organizations
+  -- (the step below clears unusable ones) and for users.
+  ALTER TABLE "Organizations" ALTER COLUMN password DROP NOT NULL;
+  ALTER TABLE "Organizations" ALTER COLUMN password DROP DEFAULT;
+  ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
+
+  -- NULL "orgCode" means "not in an organization"; 0030's enrolment treats
+  -- any other value, including '', as already enrolled.
+  ALTER TABLE users ALTER COLUMN "orgCode" DROP DEFAULT;
+  UPDATE users SET "orgCode" = NULL WHERE "orgCode" = '';
+
+  -- sessions.org_id carries an organization code and visibility may be
+  -- 'organization', which is what the backend writes for an organization
+  -- member's session. A uuid column tied to another table, or a check that
+  -- predates 'organization', would refuse those rows.
+  SELECT data_type INTO org_id_type
+    FROM information_schema.columns
+   WHERE table_schema = 'public' AND table_name = 'sessions' AND column_name = 'org_id';
+  IF org_id_type IS DISTINCT FROM 'text' THEN
+    FOR fk IN
+      SELECT conname FROM pg_constraint
+       WHERE conrelid = 'sessions'::regclass AND contype = 'f'
+         AND conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = 'sessions'::regclass AND attname = 'org_id')]::int2[]
+    LOOP
+      EXECUTE format('ALTER TABLE sessions DROP CONSTRAINT %I', fk.conname);
+    END LOOP;
+    ALTER TABLE sessions ALTER COLUMN org_id TYPE TEXT USING org_id::TEXT;
+    RAISE NOTICE 'PitchNest upgrade: sessions.org_id is now text.';
+  END IF;
+  ALTER TABLE sessions DROP CONSTRAINT IF EXISTS sessions_visibility_check;
+  ALTER TABLE sessions ALTER COLUMN visibility DROP NOT NULL;
+
+  -- Deleting an account deletes the user row and relies on these cascading.
+  -- Rows already pointing at a missing user would fail a checked constraint,
+  -- so then it is added NOT VALID: still enforced for every later change.
+  FOR child IN SELECT * FROM (VALUES ('sessions'), ('decks'), ('profiles')) AS t(name) LOOP
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+       WHERE conrelid = to_regclass(child.name) AND contype = 'f'
+         AND confrelid = 'users'::regclass
+         AND conkey = ARRAY[(SELECT attnum FROM pg_attribute WHERE attrelid = to_regclass(child.name) AND attname = 'user_id')]::int2[]) THEN
+      EXECUTE format(
+        'SELECT count(*) FROM %I c WHERE c.user_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = c.user_id)',
+        child.name) INTO orphans;
+      EXECUTE format(
+        'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE%s',
+        child.name, child.name || '_user_id_fkey', CASE WHEN orphans > 0 THEN ' NOT VALID' ELSE '' END);
+      IF orphans > 0 THEN
+        RAISE NOTICE 'PitchNest upgrade: % has % row(s) for users that no longer exist; % now cascades, unvalidated for those rows.', child.name, orphans, child.name || '_user_id_fkey';
+      END IF;
+    END IF;
+  END LOOP;
+
+  -- Pitch-report PDFs and the waitlist are read and written by the backend's
+  -- service role only. These policies opened them to anyone holding the
+  -- public anon key.
+  DROP POLICY IF EXISTS "Allow all access for authenticated users" ON session_pdfs;
+  DROP POLICY IF EXISTS "Allow anon waitlist select" ON waitlist;
+  DROP POLICY IF EXISTS "Allow anon waitlist updates" ON waitlist;
+  DROP POLICY IF EXISTS "Allow anon waitlist inserts" ON waitlist;
+END
+$align$;
+
 -- ── Organization credentials ────────────────────────────────────────────────
 -- 0018 only accepts bcrypt hashes for organization passwords (NOT VALID, so it
 -- left existing values alone), and 0030 then updates every organization row,
@@ -245,9 +357,6 @@ DO $org_credentials$
 DECLARE
   cleared INTEGER;
 BEGIN
-  -- Some databases created this column NOT NULL. 0000 leaves it nullable, and
-  -- NULL is how the backend represents an organization with no password set.
-  ALTER TABLE "Organizations" ALTER COLUMN password DROP NOT NULL;
   UPDATE "Organizations"
      SET password = NULL
    WHERE password IS NOT NULL

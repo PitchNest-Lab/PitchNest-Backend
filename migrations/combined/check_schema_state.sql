@@ -11,8 +11,9 @@
 -- 0015-0017 are recorded by the combined upgrade). "missing_items" lists up to
 -- 25 absent objects so a partial state can be repaired precisely.
 --
--- The last rows count data the upgrade acts on: organization passwords it will
--- clear, and any values that would stop it.
+-- The "alignment" row lists differences from 0000 that the upgrade fixes before
+-- 0015. The last rows count data the upgrade acts on: organization passwords it
+-- will clear, and any values that would stop it.
 
 WITH expected(section, kind, name) AS (
   VALUES
@@ -788,6 +789,45 @@ data_rows AS (
     CASE WHEN negative_attempts > 0 THEN 'reset them to 0 before upgrading' ELSE '' END
   FROM data_counts
 ),
+-- Differences from 0000 that the upgrade aligns before 0015.
+alignment AS (
+  SELECT array_remove(ARRAY[
+    CASE WHEN to_regclass('public."Organizations"') IS NOT NULL AND (
+      SELECT array_agg(a.attname::TEXT ORDER BY a.attnum)
+        FROM pg_constraint k
+        JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = ANY (k.conkey)
+       WHERE k.conrelid = to_regclass('public."Organizations"') AND k.contype = 'p'
+    ) IS DISTINCT FROM ARRAY['id'] THEN 'Organizations primary key is not (id)' END,
+    CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'Organizations' AND column_name = 'password' AND (is_nullable = 'NO' OR column_default IS NOT NULL))
+      THEN 'Organizations.password is not null or has a default' END,
+    CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'password' AND is_nullable = 'NO')
+      THEN 'users.password is not null' END,
+    CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'orgCode' AND column_default IS NOT NULL)
+      THEN 'users.orgCode has a default' END,
+    CASE WHEN EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'sessions' AND column_name = 'org_id' AND data_type <> 'text')
+      THEN 'sessions.org_id is not text' END,
+    CASE WHEN EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = to_regclass('public.sessions') AND conname = 'sessions_visibility_check')
+      THEN 'sessions.visibility check predates organization' END,
+    CASE WHEN EXISTS (
+      SELECT 1 FROM (VALUES ('sessions'), ('decks'), ('profiles')) AS t(name)
+       WHERE to_regclass('public.' || t.name) IS NOT NULL AND NOT EXISTS (
+         SELECT 1 FROM pg_constraint k
+          WHERE k.conrelid = to_regclass('public.' || t.name) AND k.contype = 'f'
+            AND k.confrelid = to_regclass('public.users')))
+      THEN 'sessions, decks or profiles not linked to users' END,
+    CASE WHEN EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND (
+      (tablename = 'session_pdfs' AND policyname = 'Allow all access for authenticated users') OR
+      (tablename = 'waitlist' AND policyname IN ('Allow anon waitlist select', 'Allow anon waitlist updates', 'Allow anon waitlist inserts'))))
+      THEN 'open-access policies on session_pdfs or waitlist' END
+  ], NULL) AS items
+),
+alignment_rows AS (
+  SELECT 'alignment' AS section,
+    CASE WHEN cardinality(items) = 0 THEN 'ok' ELSE 'will be aligned' END AS status,
+    cardinality(items) || ' difference(s)' AS objects, '-' AS ledger,
+    array_to_string(items, ', ') AS missing_items
+  FROM alignment
+),
 schema_rows AS (
 SELECT
   sec.section,
@@ -815,6 +855,8 @@ SELECT section, status, objects, ledger, missing_items
 FROM (
   SELECT 0 AS block, * FROM schema_rows
   UNION ALL
-  SELECT 1, * FROM data_rows
+  SELECT 1, * FROM alignment_rows
+  UNION ALL
+  SELECT 2, * FROM data_rows
 ) report
 ORDER BY block, section = 'prerequisites' DESC, section;
