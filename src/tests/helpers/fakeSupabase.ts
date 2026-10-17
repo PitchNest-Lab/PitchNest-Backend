@@ -63,6 +63,8 @@ export class FakeSupabase {
         this.storageCalls.push({ op: "download", bucket, paths: [path] });
         return { data: null, error: { message: "not found" } };
       },
+      // Prefix listings are empty: the tests seed rows, not stored objects.
+      list: async (_prefix?: string, _opts?: unknown) => ({ data: [], error: null }),
     }),
   };
 

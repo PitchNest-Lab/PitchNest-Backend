@@ -8,6 +8,7 @@ import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
 import { sendVerificationEmail } from "../utils/sendVerificationEmail.ts";
 import { safeAvatarUrl, storagePathFromUrl } from "../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 import { uploadDir } from "../services/storageService.ts";
 import fs from "fs";
 import path from "path";
@@ -1383,18 +1384,12 @@ async function purgeUserAccount(userId: number): Promise<void> {
     }
   }
   for (const session of sessions || []) {
-    if (typeof session.video_url === "string" && session.video_url.startsWith("/uploads/")) {
-      const name = session.video_url.slice("/uploads/".length);
-      if (
-        name.startsWith(`rec_${userId}_`) &&
-        name === path.basename(name)
-      ) localPaths.add(path.join(uploadDir, name));
-      continue;
-    }
-    const objectPath = storagePathFromUrl(session.video_url);
-    if (objectPath?.startsWith("pitches/") && !objectPath.includes("..")) {
-      mediaPaths.add(objectPath);
-    }
+    // Only this user's own recordings are erased. A row written before
+    // set_video_url was validated may point at another user's object, which
+    // must survive this account's deletion.
+    const target = await authorizedRecordingTarget(session.video_url, userId);
+    if (target?.kind === "local") localPaths.add(path.join(uploadDir, target.name));
+    else if (target?.kind === "storage") mediaPaths.add(target.path);
   }
 
   // Recordings are uploaded before the final session row is updated. A tab

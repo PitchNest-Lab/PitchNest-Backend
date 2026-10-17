@@ -5,6 +5,7 @@ import { supabase } from "../config/supabase.ts";
 import { uploadDir, verifyLocalFileToken } from "../services/storageService.ts";
 import { config } from "../config/env.ts";
 import { allowedBrowserOrigins } from "../config/origins.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 
 function allowedFrameAncestors(): string {
   const values = new Set(["'self'"]);
@@ -107,6 +108,14 @@ export const getLocalFile = async (req: Request, res: Response) => {
         return res.status(503).json({ error: "File access could not be verified" });
       }
       if (deckOwner) owned = false;
+    }
+
+    // A session row pointing at the file is not proof the file is this user's
+    // recording either: an unvalidated row could name another user's
+    // rec_<id>_ file or a legacy name someone else also references.
+    if (owned) {
+      const target = await authorizedRecordingTarget(storedPath, uid);
+      if (target?.kind !== "local" || target.name !== name) owned = false;
     }
   }
 

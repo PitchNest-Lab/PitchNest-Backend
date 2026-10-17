@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import bcrypt from "bcryptjs";
 import { FakeSupabase } from "../helpers/fakeSupabase.ts";
 import { startApp, call } from "../helpers/httpServer.ts";
-import { signUserToken } from "../../services/tokenService.ts";
+import { signUserToken } from "../helpers/tokens.ts";
 import fs from "node:fs";
 import path from "node:path";
 import { signLocalFileUrl, uploadDir } from "../../services/storageService.ts";
@@ -112,6 +112,37 @@ test("H6: a local-file token cannot read another user's file via a poisoned sess
     const r = await call(base, "GET", url);
     assert.equal(r.status, 404);
     assert.ok(!String(r.json).includes("victim secret"));
+  } finally {
+    fs.rmSync(victimFile, { force: true });
+  }
+});
+
+test("H6: deleting a poisoned session row never deletes the object it points at", async () => {
+  for (const id of [802, 803]) {
+    const r = await call(base, "DELETE", `/api/sessions/${id}`, { token: attackerToken });
+    assert.equal(r.status, 200, `session ${id} → ${r.status}`);
+  }
+  const removed = db.storageCalls.filter((c) => c.op === "remove").flatMap((c) => c.paths);
+  assert.deepEqual(removed, [], "victim objects stay in place");
+  assert.ok(!db.rows("sessions").some((s) => s.id === 802 || s.id === 803), "the attacker's rows are gone");
+
+  const own = await call(base, "DELETE", "/api/sessions/806", { token: attackerToken });
+  assert.equal(own.status, 200);
+  assert.deepEqual(
+    db.storageCalls.filter((c) => c.op === "remove").flatMap((c) => c.paths),
+    [`pitches/${ATTACKER.id}/1700000000003_mine.webm`],
+  );
+});
+
+test("H6: a local-file token cannot read another user's rec_ file via a poisoned session row", async () => {
+  const victimName = `rec_${VICTIM.id}_1700000000006_v.webm`;
+  db.rows("sessions").push({ id: 809, user_id: ATTACKER.id, video_url: `/uploads/${victimName}` });
+  const victimFile = path.join(uploadDir, victimName);
+  fs.writeFileSync(victimFile, "victim audio");
+  try {
+    const r = await call(base, "GET", signLocalFileUrl(victimName, ATTACKER.id));
+    assert.equal(r.status, 404);
+    assert.ok(!String(r.json).includes("victim audio"));
   } finally {
     fs.rmSync(victimFile, { force: true });
   }

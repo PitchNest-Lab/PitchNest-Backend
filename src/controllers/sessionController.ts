@@ -11,11 +11,8 @@ import {
   signLocalFileUrl,
   uploadDir,
 } from "../services/storageService.ts";
-import {
-  isOwnRecordingReference,
-  isRecordingObjectPath,
-  storagePathFromUrl,
-} from "../utils/storagePath.ts";
+import { isOwnRecordingReference } from "../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 import {
   computeAttemptStates,
   loadAttemptStates,
@@ -229,33 +226,28 @@ export const getSessionRecording = async (req: Request, res: Response) => {
       return res.json({ url: "", available: false });
     }
 
-    // Local-fallback recording — token-gated through /api/files, which verifies
-    // ownership against the sessions table for this name.
-    if (stored.startsWith("/uploads/")) {
-      const name = stored.slice("/uploads/".length);
+    // Only a recording this user owns is ever signed. Rows written before
+    // set_video_url was validated may point at a deck, another user's
+    // recording or an arbitrary URL; those must never get a service-role
+    // signed URL or be reflected back (see utils/recordingAuth.ts).
+    const target = await authorizedRecordingTarget(stored, userId);
+    if (!target) {
+      console.warn(`⚠️ Refusing to sign an unowned recording reference for session ${session.id}`);
+      return res.json({ url: "", available: false });
+    }
+
+    // Local-fallback recording — token-gated through /api/files, which
+    // re-checks ownership at serve time.
+    if (target.kind === "local") {
       return res.json({
-        url: signLocalFileUrl(name, userId, RECORDING_URL_TTL_SECONDS),
+        url: signLocalFileUrl(target.name, userId, RECORDING_URL_TTL_SECONDS),
         available: true,
       });
     }
 
-    const objectPath = storagePathFromUrl(stored);
-    if (!objectPath) {
-      // Historical rows could contain a client-supplied absolute URL. Never
-      // reflect or load an arbitrary origin from a privileged API response.
-      return res.json({ url: "", available: false });
-    }
-    // Only ever sign recording keys. A row whose video_url was pointed at a
-    // deck or another file (set_video_url is client input; older rows predate
-    // the write-side check) must never get a service-role signed URL.
-    if (!isRecordingObjectPath(objectPath)) {
-      console.warn(`⚠️ Refusing to sign non-recording path for session ${session.id}`);
-      return res.json({ url: "", available: false });
-    }
-
     const { data: signed, error: signErr } = await supabase.storage
       .from(config.storageBucket)
-      .createSignedUrl(objectPath, RECORDING_URL_TTL_SECONDS);
+      .createSignedUrl(target.path, RECORDING_URL_TTL_SECONDS);
 
     if (signErr || !signed?.signedUrl) {
       console.error("❌ createSignedUrl failed in getSessionRecording:", signErr);
@@ -382,30 +374,25 @@ export const deleteSession = async (req: Request, res: Response) => {
     }
     if (!session) return res.status(404).json({ error: "Session not found" });
 
+    // Remove the recording only when this user owns it. A row written before
+    // set_video_url was validated may point at someone else's object; that
+    // reference is dropped with the row and the object is left alone.
     const recording = typeof session.video_url === "string" ? session.video_url.trim() : "";
-    if (recording.startsWith("/uploads/")) {
-      const localName = recording.slice("/uploads/".length);
-      if (
-        localName !== path.basename(localName) ||
-        !localName.startsWith(`rec_${userId}_`) ||
-        localName.includes("..")
-      ) {
-        return res.status(500).json({ error: "Session has an invalid recording reference" });
-      }
+    const target = recording ? await authorizedRecordingTarget(recording, userId) : null;
+    if (recording && !target) {
+      console.warn(`⚠️ Session ${session.id} references a recording it does not own; leaving the object in place.`);
+    }
+    if (target?.kind === "local") {
       try {
-        await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+        await fs.promises.rm(path.join(uploadDir, target.name), { force: true });
       } catch (storageError) {
         console.error("Local session recording cleanup failed:", storageError);
         return res.status(503).json({ error: "Could not remove the recording. Please retry." });
       }
-    } else if (recording) {
-      const objectPath = storagePathFromUrl(recording);
-      if (!isRecordingObjectPath(objectPath)) {
-        return res.status(500).json({ error: "Session has an invalid recording reference" });
-      }
+    } else if (target?.kind === "storage") {
       const { error: storageError } = await supabase.storage
         .from(config.storageBucket)
-        .remove([objectPath!]);
+        .remove([target.path]);
       if (storageError) {
         console.error("Session recording cleanup failed:", storageError);
         return res.status(503).json({ error: "Could not remove the recording. Please retry." });
