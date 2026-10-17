@@ -190,6 +190,9 @@ DO $org_credentials$
 DECLARE
   cleared INTEGER;
 BEGIN
+  -- Some databases created this column NOT NULL. 0000 leaves it nullable, and
+  -- NULL is how the backend represents an organization with no password set.
+  ALTER TABLE "Organizations" ALTER COLUMN password DROP NOT NULL;
   UPDATE "Organizations"
      SET password = NULL
    WHERE password IS NOT NULL

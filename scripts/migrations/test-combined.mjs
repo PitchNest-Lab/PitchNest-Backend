@@ -248,5 +248,28 @@ check("upgrade refuses an older ledger that records 0015+ versions", !!claimErro
 const d7 = diff(claimBefore, await snapshot(claimDb));
 check("nothing changed after that refusal", d7.onlyA.length === 0 && d7.onlyB.length === 0, `${d7.onlyA.length + d7.onlyB.length} differences`);
 
+// ── 8. Organizations.password created NOT NULL, holding a plaintext value ──
+// The organization row found on the team's DEV database.
+const orgNnDb = await base();
+await run(orgNnDb, "NOT NULL organization password", `
+  INSERT INTO "Organizations" (id, org_code, org_name, org_users_capacity, org_users_enrolled, validity, plan, email, password, country, website_url, trial_status)
+  VALUES (1, 12345, 'test', 10, 2, '2026-09-27', 'ADVANCE', 'test@gmail.com', 'plaintext-secret', 'INDIA', '', 'Active');
+  ALTER TABLE "Organizations" ALTER COLUMN password SET NOT NULL;
+`);
+let orgNnError = null;
+try {
+  await run(orgNnDb, "combined with NOT NULL organization password", UPGRADE);
+} catch (error) {
+  orgNnError = error;
+}
+check("upgrade succeeds when Organizations.password was created NOT NULL", !orgNnError, orgNnError?.message?.split("\n")[0]?.slice(0, 200));
+if (!orgNnError) {
+  const orgRow = (await orgNnDb.query(`SELECT password FROM "Organizations" WHERE id = 1`)).rows[0];
+  const orgCol = (await orgNnDb.query(`SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'Organizations' AND column_name = 'password'`)).rows[0];
+  check("the plaintext password is cleared and the column is nullable as in 0000", orgRow?.password === null && orgCol?.is_nullable === "YES");
+  const d8 = diff(seqSnap, await snapshot(orgNnDb));
+  check("schema matches the numbered migrations", d8.onlyA.length === 0 && d8.onlyB.length === 0, `${d8.onlyA.length + d8.onlyB.length} differences`);
+}
+
 console.log(failures ? `\n${failures} check(s) failed` : "\nAll combined-migration checks passed.");
 process.exit(failures ? 1 : 0);
