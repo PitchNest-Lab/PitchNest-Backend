@@ -16,7 +16,10 @@
 //   node_modules/      ONLY packages that break when bundled:
 //                        pdfkit   (reads its AFM font data via __dirname)
 //                        pdf-parse (pdfjs needs real module files/workers)
-//                      plus their dependency closure, pruned.
+//                        sharp    (loads a platform-specific native binary)
+//                      plus their dependency closure, pruned. sharp ships the
+//                      linux-x64 (glibc) binary Lambda runs, fetched for that
+//                      platform whatever the build host is.
 //
 // The DEV build (build-lambda.sh) is intentionally untouched.
 
@@ -24,6 +27,7 @@ import * as esbuild from "esbuild";
 import { execSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
@@ -35,7 +39,11 @@ const ZIP = path.join(DIST, "pitchnest-api-prod.zip");
 const MANIFEST = path.join(DIST, "pitchnest-api-prod.manifest.json");
 
 /** Packages shipped as real node_modules instead of being bundled. */
-const RUNTIME_PACKAGES = ["pdfkit", "pdf-parse"];
+const RUNTIME_PACKAGES = ["pdfkit", "pdf-parse", "sharp"];
+/** sharp's binary for the Lambda runtime (nodejs22.x, x86_64, glibc). */
+const LAMBDA_SHARP_PACKAGES = ["@img/sharp-linux-x64", "@img/sharp-libvips-linux-x64"];
+/** The build host's own sharp binaries (win32, darwin, ...) are never shipped. */
+const isOtherPlatformSharp = (name) => name.startsWith("@img/sharp-") && !LAMBDA_SHARP_PACKAGES.includes(name);
 /** Never shipped: unused native modules / platform-specific binaries. */
 const EXCLUDED_PACKAGES = new Set(["@napi-rs/canvas", "bcrypt", "better-sqlite3"]);
 /** Externals for esbuild: shipped packages + excluded native modules. */
@@ -97,7 +105,7 @@ const shipped = new Map(); // absolute dir -> package name
 const queue = RUNTIME_PACKAGES.map((name) => ({ name, from: ROOT, optional: false }));
 while (queue.length) {
   const { name, from, optional } = queue.shift();
-  if (EXCLUDED_PACKAGES.has(name)) continue;
+  if (EXCLUDED_PACKAGES.has(name) || isOtherPlatformSharp(name)) continue;
   const dir = findPackageDir(name, from);
   if (!dir) {
     if (optional) continue;
@@ -125,6 +133,33 @@ for (const [dir, name] of shipped) {
       return !PRUNE_FILE.test(src);
     },
   });
+}
+
+// ── 4b. sharp's Linux binary ────────────────────────────────────────────────
+// npm installs only the build host's binary. Installing the same sharp version
+// with a linux-x64 (glibc) target into a scratch prefix makes npm resolve the
+// Lambda binaries as sharp's optional dependencies; those are what ship.
+const sharpDir = findPackageDir("sharp", ROOT);
+if (!sharpDir) throw new Error("Required runtime dependency not installed: sharp");
+const sharpVersion = JSON.parse(fs.readFileSync(path.join(sharpDir, "package.json"), "utf8")).version;
+const sharpScratch = fs.mkdtempSync(path.join(os.tmpdir(), "pitchnest-sharp-"));
+try {
+  log(`fetching the linux-x64 binary for sharp@${sharpVersion}`);
+  execSync(
+    `npm install --no-save --no-package-lock --ignore-scripts --no-audit --no-fund --os=linux --cpu=x64 --libc=glibc --prefix "${sharpScratch}" sharp@${sharpVersion}`,
+    { cwd: sharpScratch, stdio: ["ignore", "ignore", "inherit"] },
+  );
+  for (const name of LAMBDA_SHARP_PACKAGES) {
+    const fromDir = path.join(sharpScratch, "node_modules", ...name.split("/"));
+    if (!fs.existsSync(path.join(fromDir, "package.json"))) throw new Error(`sharp binary was not fetched: ${name}`);
+    fs.cpSync(fromDir, path.join(STAGE, "node_modules", ...name.split("/")), {
+      recursive: true,
+      filter: (src) => !PRUNE_FILE.test(src),
+    });
+    shipped.set(fromDir, name);
+  }
+} finally {
+  fs.rmSync(sharpScratch, { recursive: true, force: true });
 }
 
 // ── 5. Deterministic zip (UNIX 0644 entries, fixed timestamp, sorted) ───────

@@ -92,6 +92,15 @@ try {
   check("zip integrity", crcFailures === 0, `${count} entries, extracted outside the repo`);
   check("layout: index.mjs shim + app/ + assets/ fonts", ["index.mjs", "app/index.mjs", "assets/fonts/Inter-Regular.ttf", "assets/fonts/Inter-Bold.ttf", "assets/logo.png"].every((f) => fs.existsSync(path.join(WORK, f))));
   check("no native canvas / unused native modules shipped", !["node_modules/@napi-rs", "node_modules/bcrypt", "node_modules/better-sqlite3"].some((d) => fs.existsSync(path.join(WORK, d))));
+  const imgDir = path.join(WORK, "node_modules", "@img");
+  const sharpBinaries = fs.existsSync(imgDir) ? fs.readdirSync(imgDir).filter((d) => d.startsWith("sharp-")) : [];
+  check(
+    "sharp ships the linux-x64 binary Lambda loads, and no other platform's",
+    ["node_modules/sharp/package.json", "node_modules/@img/sharp-linux-x64/package.json", "node_modules/@img/sharp-libvips-linux-x64/package.json"].every((f) => fs.existsSync(path.join(WORK, f))) &&
+      sharpBinaries.length === 2 &&
+      sharpBinaries.every((d) => d.endsWith("-linux-x64")),
+    sharpBinaries.join(", "),
+  );
 
   // ── 2. Fake SSM + real handler ────────────────────────────────────────────
   const ssmRequests = [];
@@ -140,6 +149,14 @@ await run("cors-allowed", ev("OPTIONS", "/api/auth/login", { origin: "https://ww
 await run("cors-apex", ev("OPTIONS", "/api/auth/login", { origin: "https://pitchnest.app", "access-control-request-method": "POST" }));
 await run("cors-evil", ev("OPTIONS", "/api/auth/login", { origin: "https://evil.example", "access-control-request-method": "POST" }));
 await run("health-warm", ev("GET", "/health"));
+// sharp's binary is linux-x64: it can only be exercised on a matching host.
+if (process.platform === "linux" && process.arch === "x64") {
+  const sharp = (await import("sharp")).default;
+  const out = await sharp({ create: { width: 2, height: 2, channels: 3, background: "#000" } }).webp().toBuffer();
+  console.log("SHARP " + JSON.stringify({ ok: out.length > 0 }));
+} else {
+  console.log("SHARP " + JSON.stringify({ skipped: process.platform + "-" + process.arch }));
+}
 process.exit(0);
 `;
   fs.writeFileSync(path.join(WORK, "verify-runner.mjs"), runner);
@@ -184,7 +201,16 @@ process.exit(0);
   check("protected route without token -> 401", results["me-no-token"]?.status === 401);
   check("checkout without token -> 401", results["checkout-no-token"]?.status === 401);
   check("CORS allows https://www.pitchnest.app", [200, 204].includes(results["cors-allowed"]?.status) && results["cors-allowed"]?.acao === "https://www.pitchnest.app");
-  check("CORS allows https://pitchnest.app", [200, 204].includes(results["cors-apex"]?.status) && results["cors-apex"]?.acao === "https://pitchnest.app");
+  // Browser origins come only from ALLOWED_ORIGIN and CORS_EXTRA_ORIGINS. The
+  // apex redirects to www, so it is refused unless CORS_EXTRA_ORIGINS lists it.
+  check("CORS refuses https://pitchnest.app unless configured", !results["cors-apex"]?.acao);
+  const sharpLine = child.stdout.split("\n").find((l) => l.startsWith("SHARP "));
+  const sharpResult = sharpLine ? JSON.parse(sharpLine.slice(6)) : null;
+  if (sharpResult?.skipped) {
+    console.log(`SKIP  sharp image round-trip (needs a linux-x64 host; this is ${sharpResult.skipped})`);
+  } else {
+    check("sharp loads and encodes an image inside the package", sharpResult?.ok === true);
+  }
   check("CORS refuses unlisted origin (production mode)", results["cors-evil"]?.status === 403 && !results["cors-evil"]?.acao);
   const names = ssmRequests.flatMap((r) => r.names);
   check("SSM: exactly one GetParameters call across cold + warm invocations", ssmRequests.length === 1 && ssmRequests[0].target === "AmazonSSM.GetParameters");

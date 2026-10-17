@@ -1,5 +1,4 @@
 import crypto from "node:crypto";
-import sharp from "sharp";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { safeAvatarUrl } from "../utils/storagePath.ts";
@@ -69,6 +68,25 @@ export class MediaError extends Error {
   }
 }
 
+type Sharp = typeof import("sharp").default;
+let sharpLoad: Promise<Sharp> | null = null;
+
+/**
+ * sharp ships a platform-specific native binary. Loading it on first use means
+ * a host without a matching binary loses image processing (a 503 on upload)
+ * instead of failing to start, which on Lambda would take down every route.
+ */
+async function loadSharp(): Promise<Sharp> {
+  sharpLoad ??= import("sharp").then((mod) => mod.default);
+  try {
+    return await sharpLoad;
+  } catch (error) {
+    sharpLoad = null;
+    console.error("Image processing is unavailable: sharp failed to load.", error);
+    throw new MediaError("Image uploads are temporarily unavailable. Please try again later.", 503);
+  }
+}
+
 /** Real image bytes; the declared MIME type is only a hint. */
 export function sniffImageType(buffer: Buffer): "png" | "jpeg" | "webp" | "gif" | null {
   if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "png";
@@ -98,6 +116,7 @@ export async function reencodeImage(
   if (!type || (type === "gif" && !target.allowGif)) {
     throw new MediaError(target.allowGif ? "File must be a supported image." : "Use a PNG, JPEG or WebP image.", 415);
   }
+  const sharp = await loadSharp();
   const meta = await sharp(input, { failOn: "error", limitInputPixels: 50_000_000 })
     .metadata()
     .catch(() => {
