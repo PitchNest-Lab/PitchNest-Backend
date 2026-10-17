@@ -55,7 +55,16 @@ const organizationRow = {
 
 const mutableSupabase = supabase as any;
 const originalFrom = mutableSupabase.from;
+const originalRpc = mutableSupabase.rpc;
 let selectedTable = "";
+const rpcCalls: string[] = [];
+
+// A wrong password records a failed attempt through this RPC. Answer it here so
+// the test never reaches a real project.
+mutableSupabase.rpc = async (fn: string) => {
+  rpcCalls.push(fn);
+  return { data: [{ failed_attempts: 1, lock_expires_at: null }], error: null };
+};
 
 mutableSupabase.from = (table: string) => {
   selectedTable = table;
@@ -148,6 +157,7 @@ try {
   );
   assert.equal(wrongPasswordResponse.statusCode, 401);
   assert.equal(wrongPasswordResponse.body?.token, undefined);
+  assert.deepEqual(rpcCalls, ["record_failed_org_login"]);
 
   const loginResponse = responseRecorder();
   await orgLogin(
@@ -186,4 +196,5 @@ try {
   console.log("Organization security tests passed.");
 } finally {
   mutableSupabase.from = originalFrom;
+  mutableSupabase.rpc = originalRpc;
 }
