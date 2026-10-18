@@ -6,6 +6,7 @@ import {
   getPlan,
   startCheckout,
   handleWebhook,
+  cancelSubscription,
 } from "../controllers/billingController.ts";
 
 const router = express.Router();
@@ -37,6 +38,8 @@ router.get("/price", getPrice);
 
 router.get("/plan", authMiddleware, getPlan);
 router.post("/checkout", authMiddleware, checkoutLimiter, startCheckout);
+// Shares the checkout budget: both call out to Flutterwave on the user's behalf.
+router.post("/subscription/cancel", authMiddleware, checkoutLimiter, cancelSubscription);
 
 /**
  * WEBHOOK — deliberately NOT behind authMiddleware. Flutterwave has no user

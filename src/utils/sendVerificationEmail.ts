@@ -2,13 +2,15 @@ import crypto from "crypto";
 import { Resend } from "resend";
 import { supabase } from "../config/supabase"; // your server-side supabase client
 import { config } from "../config/env.ts";
+import { hashAuthToken } from "./authTokens.ts";
+import { withTimeout } from "./withTimeout.ts";
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+const resend =
+  config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
+    ? new Resend(config.resendApiKey)
+    : null;
 
-export async function sendVerificationEmail(
-  userId: string | number,
-  email: string,
-) {
+export async function sendVerificationEmail(userId: string | number, email: string) {
   // Two factors, both cryptographically random:
   //  • token — a long, high-entropy value for the emailed LINK. Because it is
   //    unguessable, the link's global lookup (verifyEmail) is safe.
@@ -19,71 +21,58 @@ export async function sendVerificationEmail(
   const token = crypto.randomBytes(32).toString("hex");
   const code = crypto.randomInt(0, 1_000_000).toString().padStart(6, "0");
   const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
-  console.log("done");
+  const tokenDigest = hashAuthToken("email-link", token);
+  const codeDigest = hashAuthToken("email-code", code);
 
   // 2. Delete any old tokens for this user
   await supabase
     .from("email_verification_tokens")
     .delete()
     .eq("user_id", userId);
-  console.log("done2");
 
   // 3. Save new token to Supabase
-  let { error } = await supabase
+  const { error } = await supabase
     .from("email_verification_tokens")
     .insert({
       user_id: userId,
-      token,
-      code,
+      token: tokenDigest,
+      code: codeDigest,
       expires_at: expiresAt,
       attempts: 0,
     });
-  console.log("done3");
-
-  // Rollout safety: if migration 0012 (code/attempts columns) hasn't run yet,
-  // fall back to storing just the high-entropy link token so signup and the
-  // emailed LINK keep working. Manual 6-digit entry needs the migration.
-  if (error && /column|schema/i.test(error.message || "")) {
-    console.warn(
-      "⚠️ email_verification_tokens is missing the code/attempts columns — run migration 0012. " +
-        "Falling back to link-only verification until then.",
-    );
-    ({ error } = await supabase
-      .from("email_verification_tokens")
-      .insert({ user_id: userId, token, expires_at: expiresAt }));
-  }
 
   if (error) throw new Error("Failed to save token");
 
   // 4. Send email
-  // Normalize the base URL so a trailing slash in CLIENT_URL doesn't produce a
-  // broken double-slash link (e.g. https://app//verify).
-  const env = process.env.NODE_ENV;
-  const baseUrl =
-    env == "development"
-      ? "https://pitchnest-development.vercel.app"
-      : env == "localhost"
-        ? "http://localhost:5174"
-        : "https://www.pitchnest.app";
+  // Compose the link from the configured frontend origin (trailing slashes are
+  // already stripped in config, so this cannot produce a broken double-slash).
+  const verifyUrl = `${config.clientUrl}/verify?token=${token}`;
 
-  const verifyUrl = `${baseUrl}/verify?token=${token}`;
+  // Log OTP in development so local testing never gets blocked by email deliverability / DNS
+  if (config.nodeEnv !== "production") {
+    console.log(`\n======================================================`);
+    // Never print the address or high-entropy link token. The browser already
+    // retains the address on the verification screen; only the local test code
+    // is needed to unblock development.
+    console.log(`🔑 [LOCAL DEV OTP] Verification Code: ${code}`);
+    console.log(`======================================================\n`);
+  }
 
-  console.log("base", baseUrl);
-
-  if (!process.env.RESEND_API_KEY) {
+  if (!resend) {
     throw new Error(
-      "Mail is not configured (RESEND_API_KEY missing). " +
-        "Set this in the backend environment so verification emails can send.",
+      "Mail is not configured (RESEND_API_KEY is missing or still set to re_xxxxxxxxx). " +
+        "Replace the placeholder in the backend environment so verification emails can send.",
     );
   }
 
   try {
-    const { data, error } = await resend.emails.send({
-      from: config.emailFrom,
-      replyTo: config.emailReplyTo,
-      to: email,
-      subject: "Verify your PitchNest account",
-      html: `
+    const { error } = await withTimeout(
+      resend.emails.send({
+        from: config.emailFrom,
+        replyTo: config.emailReplyTo,
+        to: email,
+        subject: "Verify your PitchNest account",
+        html: `
         <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:16px;background:#fff">
           <h2 style="color:#111827;font-size:24px;margin-bottom:8px">Verify your email</h2>
           <p style="color:#4b5563;font-size:16px;line-height:24px;margin-bottom:24px">
@@ -108,17 +97,19 @@ export async function sendVerificationEmail(
             Link and code expire in 24 hours. If you didn't sign up, ignore this.
           </p>
         </div>
-      `,
-    });
-    console.log("done final");
+        `,
+      }, {
+        idempotencyKey: `verification/${userId}/${tokenDigest.slice(0, 32)}`,
+      }),
+      15_000,
+      "Verification email request",
+    );
 
     if (error) {
       throw new Error(error.message);
     }
   } catch (err: any) {
     console.error("❌ Verification email send failed:", err?.message || err);
-    throw new Error(
-      `Failed to send verification email: ${err?.message || err}`,
-    );
+    throw new Error(`Failed to send verification email: ${err?.message || err}`);
   }
 }

@@ -40,6 +40,27 @@ const TOPIC_KEYWORDS: Record<StructuredSlide["topic"], RegExp> = {
 };
 
 /**
+ * The client-supplied deck text for an ad-hoc (no-id) deck, or "" if there is
+ * none usable.
+ *
+ * COERCE BEFORE TESTING, and the reason is not cosmetic. selectedDeck is
+ * unvalidated client JSON — nothing on the WebSocket path checks its type — and
+ * this runs while the session's system prompt is being armed. `extracted_text:
+ * 1234` makes `(1234).trim` undefined, so a bare `.trim()` THROWS; because the
+ * caller is async, that rejects the promise and the live config is never built,
+ * leaving the entire session streaming with an EMPTY system prompt: no panel
+ * identity, no output rules, no personas, no memory — and nothing reported to
+ * the client. The type check costs one line and removes the whole failure mode.
+ *
+ * Extracted from restSocket.ts's resolveDeckText so it can be tested directly;
+ * that module opens sockets and a database client on import.
+ */
+export function pickClientDeckText(deck: unknown): string {
+  const extracted = (deck as { extracted_text?: unknown } | null | undefined)?.extracted_text;
+  return typeof extracted === "string" ? extracted.trim() : "";
+}
+
+/**
  * Parses raw extracted deck text into structured slides.
  */
 export function parseDeckIntoSlides(rawText: string, deckName: string = "Pitch Deck"): DeckIntelligence {

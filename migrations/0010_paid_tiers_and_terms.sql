@@ -63,6 +63,7 @@ CREATE OR REPLACE FUNCTION grant_pro_access(
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = public
 AS $$
 DECLARE
   v_payment        payments;
@@ -133,6 +134,11 @@ BEGIN
   RETURN true;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT)
+  FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION grant_pro_access(TEXT, TEXT, NUMERIC, TEXT)
+  TO service_role;
 
 -- ──────────────────────────────────────────────────────────────────────────────
 -- OPERATOR NOTES

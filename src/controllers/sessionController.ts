@@ -1,10 +1,18 @@
 import { Request, Response } from "express";
+import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { generatePitchReportPDF } from "../services/pdfService.ts";
 import { getEntitlements } from "../services/entitlementService.ts";
-import { signLocalFileUrl } from "../services/storageService.ts";
-import { storagePathFromUrl } from "../utils/storagePath.ts";
+import {
+  removeOwnedRecordingReference,
+  signLocalFileUrl,
+  uploadDir,
+} from "../services/storageService.ts";
+import { isOwnRecordingReference } from "../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../utils/recordingAuth.ts";
 import {
   computeAttemptStates,
   loadAttemptStates,
@@ -76,7 +84,7 @@ export const listSessions = async (req: Request, res: Response) => {
     }
 
     const { data: sessions, error } = await supabase
-      .from("sessions")
+      .from("session_list_safe")
       .select("*")
       .eq("user_id", userId)
       .order("timestamp", { ascending: false });
@@ -93,11 +101,15 @@ export const listSessions = async (req: Request, res: Response) => {
 
     const formatted = (sessions || []).map((s: any) => {
       const state = attemptStates.get(Number(s.id));
+      const parsedReport = safeParseJSON(s.evaluation_report);
+      const { transcript: _privateTranscript, ...listReport } = parsedReport || {};
       return {
         ...s,
         created_at: s.created_at || s.timestamp,
-        evaluation_report: safeParseJSON(s.evaluation_report),
-        has_recording: !!s.video_url,
+        // The database view already removed transcript and recording paths, so
+        // these sensitive fields never travel to Node on bulk archive reads.
+        evaluation_report: listReport,
+        has_recording: s.has_recording === true,
         attempts: state ? serializeAttemptState(state) : fallbackAttemptState(),
       };
     });
@@ -108,30 +120,32 @@ export const listSessions = async (req: Request, res: Response) => {
   }
 };
 
+/**
+ * One session, owner-only.
+ *
+ * This route used to branch on whether the identifier looked like a UUID, and if
+ * so look the row up by share_id for ANY caller — an attempt at public share
+ * links. It never worked (the route sits behind authMiddleware, so an anonymous
+ * visitor got a 401 regardless), and once sharing became real it would have been
+ * the wrong shape entirely: it returned the whole evaluation_report, transcript
+ * and financials included, to any logged-in PitchNest user who came to hold a
+ * share id. Public sharing now goes through GET /api/public/pitch/:shareId,
+ * which returns a deliberately narrow projection, and this route is strictly the
+ * owner's own view.
+ */
 export const getSession = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
-    const identifier = req.params.id;
-
-    // Check if identifier is a valid UUID (if so, treat as a public share link)
-    const isUUID =
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-        identifier,
-      );
-
-    let query = supabase.from("sessions").select("*");
-
-    if (isUUID) {
-      query = query.eq("share_id", identifier);
-    } else {
-      query = query.eq("id", identifier);
-      if (!userId) {
-        return res.status(401).json({ error: "Authentication required" });
-      }
-      query = query.eq("user_id", userId);
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
     }
 
-    const { data: session, error } = await query.maybeSingle();
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("*")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
 
     if (error) {
       console.error("❌ Supabase query error in getSession:", error);
@@ -140,22 +154,19 @@ export const getSession = async (req: Request, res: Response) => {
       return res.status(404).json({ error: "Session not found" });
     }
 
-    // Attempt state is owner-only: a public share link is a read-only view of
-    // one report and has no business exposing how many attempts the founder has
-    // left, or letting a visitor infer the size of their pitch history.
-    const isOwner = !!userId && session.user_id === userId;
-    let attempts: any = null;
-    if (isOwner) {
-      const state = (await loadAttemptStates(userId!)).get(Number(session.id));
-      attempts = state ? serializeAttemptState(state) : fallbackAttemptState();
-    }
+    // Attempt state belongs to the owner viewing their own report. A shared
+    // pitch is a read-only view of one report and has no business exposing how
+    // many attempts the founder has left, or letting a visitor infer the size of
+    // their pitch history.
+    const attemptState = (await loadAttemptStates(userId)).get(Number(session.id));
 
+    const { video_url: _privateRecordingPath, ...safeSession } = session as any;
     const formatted = {
-      ...session,
+      ...safeSession,
       created_at: session.created_at || session.timestamp,
       evaluation_report: safeParseJSON(session.evaluation_report),
       has_recording: !!session.video_url,
-      ...(attempts ? { attempts } : {}),
+      attempts: attemptState ? serializeAttemptState(attemptState) : fallbackAttemptState(),
     };
     res.json(formatted);
   } catch (error: any) {
@@ -215,24 +226,28 @@ export const getSessionRecording = async (req: Request, res: Response) => {
       return res.json({ url: "", available: false });
     }
 
-    // Local-fallback recording — token-gated through /api/files, which verifies
-    // ownership against the sessions table for this name.
-    if (stored.startsWith("/uploads/")) {
-      const name = stored.slice("/uploads/".length);
+    // Only a recording this user owns is ever signed. Rows written before
+    // set_video_url was validated may point at a deck, another user's
+    // recording or an arbitrary URL; those must never get a service-role
+    // signed URL or be reflected back (see utils/recordingAuth.ts).
+    const target = await authorizedRecordingTarget(stored, userId);
+    if (!target) {
+      console.warn(`⚠️ Refusing to sign an unowned recording reference for session ${session.id}`);
+      return res.json({ url: "", available: false });
+    }
+
+    // Local-fallback recording — token-gated through /api/files, which
+    // re-checks ownership at serve time.
+    if (target.kind === "local") {
       return res.json({
-        url: signLocalFileUrl(name, userId, RECORDING_URL_TTL_SECONDS),
+        url: signLocalFileUrl(target.name, userId, RECORDING_URL_TTL_SECONDS),
         available: true,
       });
     }
 
-    const objectPath = storagePathFromUrl(stored);
-    if (!objectPath) {
-      return res.json({ url: stored, available: true });
-    }
-
     const { data: signed, error: signErr } = await supabase.storage
       .from(config.storageBucket)
-      .createSignedUrl(objectPath, RECORDING_URL_TTL_SECONDS);
+      .createSignedUrl(target.path, RECORDING_URL_TTL_SECONDS);
 
     if (signErr || !signed?.signedUrl) {
       console.error("❌ createSignedUrl failed in getSessionRecording:", signErr);
@@ -286,6 +301,59 @@ export const getPitchAttempts = async (req: Request, res: Response) => {
   }
 };
 
+/** Attach an uploaded audio object to its owner session without relying on a live WebSocket. */
+export const attachSessionRecording = async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  const recording = typeof req.body?.recording === "string" ? req.body.recording.trim() : "";
+  if (!userId) return res.status(401).json({ error: "Authentication required" });
+  if (!isOwnRecordingReference(recording, userId)) {
+    return res.status(400).json({ error: "Invalid recording reference" });
+  }
+
+  try {
+    const { data: session, error: readError } = await supabase
+      .from("sessions")
+      .select("id, video_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (readError) throw readError;
+    if (!session) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Unattached recording cleanup failed:", error),
+      );
+      return res.status(404).json({ error: "Session not found" });
+    }
+    if (session.video_url === recording) return res.json({ success: true });
+    if (typeof session.video_url === "string" && session.video_url.trim()) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Duplicate recording cleanup failed:", error),
+      );
+      return res.status(409).json({ error: "This session already has a recording" });
+    }
+
+    const { data: updated, error: updateError } = await supabase
+      .from("sessions")
+      .update({ video_url: recording })
+      .eq("id", session.id)
+      .eq("user_id", userId)
+      .is("video_url", null)
+      .select("id")
+      .maybeSingle();
+    if (updateError || !updated) {
+      await removeOwnedRecordingReference(recording, userId).catch((error) =>
+        console.error("Failed recording rollback cleanup:", error),
+      );
+      if (updateError) throw updateError;
+      return res.status(409).json({ error: "Recording could not be attached" });
+    }
+    return res.json({ success: true });
+  } catch (error) {
+    console.error("Attach session recording failed:", error);
+    return res.status(500).json({ error: "Failed to attach recording" });
+  }
+};
+
 export const deleteSession = async (req: Request, res: Response) => {
   try {
     const userId = req.user?.id;
@@ -293,10 +361,48 @@ export const deleteSession = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
+    const { data: session, error: readError } = await supabase
+      .from("sessions")
+      .select("id, video_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (readError) {
+      console.error("Session lookup failed in deleteSession:", readError);
+      return res.status(500).json({ error: "Failed to delete session" });
+    }
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    // Remove the recording only when this user owns it. A row written before
+    // set_video_url was validated may point at someone else's object; that
+    // reference is dropped with the row and the object is left alone.
+    const recording = typeof session.video_url === "string" ? session.video_url.trim() : "";
+    const target = recording ? await authorizedRecordingTarget(recording, userId) : null;
+    if (recording && !target) {
+      console.warn(`⚠️ Session ${session.id} references a recording it does not own; leaving the object in place.`);
+    }
+    if (target?.kind === "local") {
+      try {
+        await fs.promises.rm(path.join(uploadDir, target.name), { force: true });
+      } catch (storageError) {
+        console.error("Local session recording cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the recording. Please retry." });
+      }
+    } else if (target?.kind === "storage") {
+      const { error: storageError } = await supabase.storage
+        .from(config.storageBucket)
+        .remove([target.path]);
+      if (storageError) {
+        console.error("Session recording cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the recording. Please retry." });
+      }
+    }
+
     const { error } = await supabase
       .from("sessions")
       .delete()
-      .eq("id", req.params.id)
+      .eq("id", session.id)
       .eq("user_id", userId);
 
     if (error) {
@@ -315,6 +421,205 @@ export const deleteSession = async (req: Request, res: Response) => {
 // row directly, bypassing both the WebSocket pitch flow (which is where
 // sessions are actually created, at end_session) and the plan quota. It had no
 // callers in the web app, the mobile app, or the backend.
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC SHARING
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * How many highlights a shared pitch shows. Three is the whole card: enough to
+ * be a credible summary, few enough that the shared page is a calling card for
+ * the full report rather than a replacement for it.
+ */
+const PUBLIC_HIGHLIGHT_LIMIT = 3;
+
+/**
+ * Turn the public link on for one session. Owner-only.
+ *
+ * OPT-IN, AND WHY THAT IS NOT THE OBVIOUS DESIGN. Every session already carries
+ * a share_id, generated at creation, long before anyone asked to share anything.
+ * So "has an id" must never be the thing that makes a report public: a founder
+ * who has never pressed Share cannot end up on the open internet because of a
+ * UUID that was minted on their behalf. share_enabled is the only gate, it
+ * defaults to false, and it did not exist before migration 0015.
+ *
+ * Re-enabling reuses the existing id rather than minting a new one, so a link
+ * already pasted into a deck or an email keeps working. Rotation, if we ever
+ * want it, belongs in its own explicit action.
+ *
+ * Returns the id, not a full URL — the URL is composed by the client from its
+ * own origin, so a preview deployment hands out preview links and the backend
+ * never has to guess which hostname the founder is actually looking at.
+ */
+export const enableSessionShare = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("id, share_id")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in enableSessionShare:", error);
+      return res.status(500).json({ error: "Failed to load session" });
+    }
+    // 404 rather than 403: a 403 would confirm the id exists.
+    if (!session) return res.status(404).json({ error: "Session not found" });
+
+    const shareId = (session as any).share_id || crypto.randomUUID();
+
+    const { error: updateError } = await supabase
+      .from("sessions")
+      .update({ share_id: shareId, share_enabled: true })
+      .eq("id", req.params.id)
+      .eq("user_id", userId);
+
+    if (updateError) {
+      console.error("❌ Supabase update error in enableSessionShare:", updateError);
+      return res.status(500).json({ error: "Failed to enable sharing" });
+    }
+
+    res.json({ shareId, shared: true });
+  } catch (error: any) {
+    console.error("❌ enableSessionShare exception:", error.message || error);
+    res.status(500).json({ error: "Failed to enable sharing" });
+  }
+};
+
+/**
+ * Turn the public link off. Owner-only and idempotent.
+ *
+ * Keeps share_id. Clearing it would mean a founder who revokes and then changes
+ * their mind gets a different URL, silently breaking every copy of the old one
+ * that already exists in someone else's inbox — so the flag is what the public
+ * route reads, and the id is treated as stable for the life of the session.
+ */
+export const disableSessionShare = async (req: Request, res: Response) => {
+  try {
+    const userId = req.user?.id;
+    if (!userId) {
+      return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { error } = await supabase
+      .from("sessions")
+      .update({ share_enabled: false })
+      .eq("id", req.params.id)
+      .eq("user_id", userId);
+
+    if (error) {
+      console.error("❌ Supabase update error in disableSessionShare:", error);
+      return res.status(500).json({ error: "Failed to turn off sharing" });
+    }
+
+    res.json({ shareId: null, shared: false });
+  } catch (error: any) {
+    console.error("❌ disableSessionShare exception:", error.message || error);
+    res.status(500).json({ error: "Failed to turn off sharing" });
+  }
+};
+
+/**
+ * The one unauthenticated read in this file: a shared report, addressed by its
+ * share_id. This is what /share/<shareId> renders.
+ *
+ * ALLOWLIST, NOT DENYLIST — and that distinction is the whole point of this
+ * function. evaluation_report is a JSONB blob with roughly twenty-five keys
+ * holding the founder's transcript, their raise figure, unit economics, the
+ * competitive landscape, market gaps, the panel's verbatim quotes and their
+ * percentile. Spreading that object and deleting the handful of keys we remember
+ * to name would make every field added to the report in future public by
+ * default — and a new report field is precisely the kind of thing that gets
+ * added by someone with no reason to think about this route. So this builds a
+ * new object field by field instead. Anything not named below is not shared, now
+ * or later.
+ *
+ * The cost is deliberate: an investor opening a shared pitch sees the score, the
+ * verdict, the strengths and the fixes — not the founder's financials, unless
+ * the founder chooses to say them out loud.
+ */
+export const getPublicPitch = async (req: Request, res: Response) => {
+  try {
+    const { data: session, error } = await supabase
+      .from("sessions")
+      .select("business_name, created_at, timestamp, mode, evaluation_report")
+      .eq("share_id", req.params.shareId)
+      .eq("share_enabled", true)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ Supabase query error in getPublicPitch:", error);
+      return res.status(500).json({ error: "Failed to load pitch" });
+    }
+
+    // A revoked link and a never-existed link answer identically. "This was
+    // shared once, and then withdrawn" is not something a visitor needs to learn
+    // about the founder who sent it.
+    if (!session) {
+      return res.status(404).json({ error: "This pitch is not available." });
+    }
+
+    const report = safeParseJSON((session as any).evaluation_report);
+    const rawScores = report?.scores || {};
+    const scores = {
+      delivery: Math.round(Number(rawScores.delivery) || 0),
+      clarity: Math.round(Number(rawScores.clarity) || 0),
+      scalability: Math.round(Number(rawScores.scalability) || 0),
+      readiness: Math.round(Number(rawScores.readiness) || 0),
+    };
+    const overall = Math.round(
+      (scores.delivery + scores.clarity + scores.scalability + scores.readiness) / 4,
+    );
+
+    // An unscored pitch (too short, or the evaluation failed) has nothing worth
+    // showing. Refusing it here means the client never has to render a hollow
+    // "score: 0" card as though it were a result.
+    if (report?.evaluationStatus !== "complete" || overall <= 0) {
+      return res.status(404).json({ error: "This pitch is not available." });
+    }
+
+    const strengths = Array.isArray(report.strengths)
+      ? report.strengths
+          .filter((s: any) => typeof s === "string" && s.trim())
+          .slice(0, PUBLIC_HIGHLIGHT_LIMIT)
+          .map((s: string) => s.trim())
+      : [];
+
+    const fixes = Array.isArray(report.next_steps)
+      ? report.next_steps
+          .filter((s: any) => s && typeof s.title === "string" && s.title.trim())
+          .slice(0, PUBLIC_HIGHLIGHT_LIMIT)
+          .map((s: any) => ({
+            title: String(s.title).trim(),
+            desc: typeof s.desc === "string" ? s.desc.trim() : "",
+            priority: typeof s.priority === "string" ? s.priority.trim() : "",
+          }))
+      : [];
+
+    // Revocable links must not sit in a CDN or a proxy cache after revocation.
+    res.set("Cache-Control", "private, no-store, max-age=0");
+    res.set("X-Robots-Tag", "noindex, nofollow");
+    res.json({
+      businessName: (session as any).business_name || "A startup pitch",
+      date: (session as any).created_at || (session as any).timestamp || null,
+      mode: (session as any).mode || report?.mode || "panel",
+      score: overall,
+      scores,
+      strengths,
+      fixes,
+    });
+  } catch (error: any) {
+    console.error("❌ getPublicPitch exception:", error.message || error);
+    res.status(500).json({ error: "Failed to load pitch" });
+  }
+};
+
 
 export const generateSessionPDF = async (req: Request, res: Response) => {
   try {

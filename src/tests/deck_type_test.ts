@@ -1,3 +1,4 @@
+import "./testEnv.ts";
 import { resolveDeckType } from "../controllers/deckController.ts";
 
 const pdf = Buffer.from("%PDF-1.7 rest of file...");

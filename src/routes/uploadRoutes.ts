@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type NextFunction, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
 import { authMiddleware } from "../middleware/authMiddleware.ts";
 import { uploadVideo, uploadAvatar } from "../controllers/uploadController.ts";
@@ -27,9 +27,39 @@ const deckUploadLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-router.post("/upload-video", authMiddleware, uploadLimiter, videoUpload.single("video"), uploadVideo);
-router.post("/upload-deck", authMiddleware, deckUploadLimiter, deckUpload.single("deck"), uploadDeck);
-router.post("/upload-avatar", authMiddleware, uploadLimiter, avatarUpload.single("avatar"), uploadAvatar);
+/**
+ * Bound expensive concurrent uploads process-wide. Per-user hourly limits do
+ * not protect a small 384 MB instance from several accounts parsing 25 MB PDFs
+ * at the same time. This gate runs before multer allocates/buffers the body and
+ * releases on both normal completion and disconnected clients.
+ */
+function concurrencyLimit(max: number) {
+  let active = 0;
+  return (_req: Request, res: Response, next: NextFunction) => {
+    if (active >= max) {
+      res.set("Retry-After", "5");
+      return res.status(503).json({ error: "Uploads are busy. Please retry in a few seconds." });
+    }
+    active += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      active = Math.max(0, active - 1);
+    };
+    res.once("finish", release);
+    res.once("close", release);
+    return next();
+  };
+}
+
+const recordingConcurrency = concurrencyLimit(4);
+const deckConcurrency = concurrencyLimit(2);
+const avatarConcurrency = concurrencyLimit(8);
+
+router.post("/upload-video", authMiddleware, uploadLimiter, recordingConcurrency, videoUpload.single("video"), uploadVideo);
+router.post("/upload-deck", authMiddleware, deckUploadLimiter, deckConcurrency, deckUpload.single("deck"), uploadDeck);
+router.post("/upload-avatar", authMiddleware, uploadLimiter, avatarConcurrency, avatarUpload.single("avatar"), uploadAvatar);
 
 /**
  * Turns multer's rejections into a clean 4xx.

@@ -1,23 +1,85 @@
 import dotenv from "dotenv";
+import { DEFAULT_STT_LOCALE } from "../utils/transcriptionLocales.ts";
 
 dotenv.config();
 
+/**
+ * createClient expects the Supabase project base URL. Dashboard API docs also
+ * display a `/rest/v1` endpoint, which is easy to copy by mistake; the SDK adds
+ * that path itself and a pre-appended value produces `/rest/v1/rest/v1/...`.
+ */
+function normalizeSupabaseProjectUrl(value: string): string {
+  return value
+    .trim()
+    .replace(/\/rest\/v1\/?$/i, "")
+    .replace(/\/+$/, "");
+}
+
+function positiveMoneyEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 && value <= 1_000_000
+    ? Math.round(value * 100) / 100
+    : fallback;
+}
+
+function positiveDaysEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 && value <= 3_650 ? value : fallback;
+}
+
+/** A whole number from 0 to max; anything else (unset, negative, junk) is the fallback. */
+function wholeNumberEnv(name: string, fallback: number, max: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const value = Number(raw);
+  return Number.isInteger(value) && value >= 0 && value <= max ? value : fallback;
+}
+
+const SKU_PATTERN = /^(prep|pro):(monthly|annual)$/;
+
+function purchasableSkusEnv(name: string): string[] {
+  const skus = String(process.env[name] || "")
+    .split(",")
+    .map((sku) => sku.trim().toLowerCase())
+    .filter((sku) => SKU_PATTERN.test(sku));
+  return skus.length > 0 ? [...new Set(skus)] : ["pro:monthly"];
+}
+
+function currencyEnv(name: string, fallback: string): string {
+  const value = String(process.env[name] || "").trim().toUpperCase();
+  return /^[A-Z]{3}$/.test(value) ? value : fallback;
+}
+
 export const config = {
-  supabaseUrl: process.env.SUPABASE_URL || "",
-  supabaseAnonKey: process.env.SUPABASE_ANON_KEY || "",
+  supabaseUrl: normalizeSupabaseProjectUrl(process.env.SUPABASE_URL || ""),
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
   port: process.env.PORT ? parseInt(process.env.PORT, 10) : 3000,
   isGoogleCloud: !!process.env.K_SERVICE,
   jwtSecret: process.env.JWT_SECRET || "pitchnest-dev-secret-change-in-production",
-  allowedOrigin: process.env.ALLOWED_ORIGIN || "http://localhost:5174",
+  allowedOrigin: (process.env.ALLOWED_ORIGIN || "").trim() || "http://localhost:5174",
   azureSpeechKey: process.env.AZURE_SPEECH_KEY || "",
   azureSpeechRegion: process.env.AZURE_SPEECH_REGION || "",
+  // Fallback speech-to-text language for anyone who has not chosen one. en-NG is
+  // the Africa-first default — recognition was previously hardcoded to en-US
+  // while the panel prompts apologised for Nigerian English, so every
+  // mis-transcribed word was scored as though the founder had said it.
+  //
+  // Config rather than a constant so the global default can be moved without a
+  // deploy, and backed out if a Speech region turns out not to serve en-NG.
+  // Validated against the allowlist in utils/transcriptionLocales at use time,
+  // so a bad value here degrades to the default instead of breaking sessions.
+  sttDefaultLocale:
+    (process.env.STT_DEFAULT_LOCALE || "").trim() || DEFAULT_STT_LOCALE,
   openAiApiKey: process.env.OPENAI_API_KEY || "",
   azureOpenAiEndpoint: process.env.AZURE_OPENAI_ENDPOINT || "",
   azureOpenAiDeployment: process.env.AZURE_OPENAI_DEPLOYMENT || "",
   azureOpenAiApiKey: process.env.AZURE_OPENAI_API_KEY || "",
-  azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-02-15-preview",
+  // Used only for classic Azure endpoints. `/openai/v1` endpoints do not use a
+  // dated API version, but keeping a current GA default preserves compatibility
+  // for existing classic-resource deployments.
+  azureOpenAiApiVersion: process.env.AZURE_OPENAI_API_VERSION || "2024-10-21",
   googleClientId: process.env.GOOGLE_CLIENT_ID || "",
+  resendApiKey: (process.env.RESEND_API_KEY || "").trim(),
   // Defaults to "production" so a deploy that FORGETS to set NODE_ENV fails
   // CLOSED. Getting this backwards is silent and severe: `isProduction` gates
   // the CORS allow-list in app.ts, so a "development" default would reflect
@@ -31,14 +93,27 @@ export const config = {
   // so a Gmail address cannot be the sender. Reply-To is the supported way to
   // route replies into that inbox while still sending from pitchnest.app.
   emailReplyTo: process.env.EMAIL_REPLY_TO || "pitchnestapp@gmail.com",
+  // The public origin of the FRONTEND, used to build links inside outbound email.
+  // A verification link or a trial reminder that points at localhost is a dead
+  // end for the recipient and silently unrecoverable, so this is read through
+  // config rather than scattered process.env lookups. Trailing slashes are
+  // tolerated by the consumers, which strip them before composing a path.
+  clientUrl: ((process.env.CLIENT_URL || "").trim() || "http://localhost:5174").replace(/\/+$/, ""),
+  publicSiteUrl: (
+    (process.env.PUBLIC_SITE_URL || "").trim() ||
+    (process.env.CLIENT_URL || "").trim() ||
+    "http://localhost:5174"
+  ).replace(/\/+$/, ""),
   storageBucket: process.env.SUPABASE_STORAGE_BUCKET || "pitchnest-media",
   // Item A: avatars stay PUBLIC (low-sensitivity, shown unsigned on every page)
   // in a SEPARATE bucket, so the main media bucket can be fully private.
   avatarBucket: process.env.SUPABASE_AVATAR_BUCKET || "pitchnest-avatars",
-  // Internal-only admin key for the transcript-review endpoint (Item C). Not a
-  // user role — a single shared secret sent as the x-admin-key header. Empty
-  // disables the admin routes entirely (they 404).
-  adminApiKey: process.env.ADMIN_API_KEY || "",
+  // Approved business logos and covers (business-media/<id>/...). Defaults to
+  // the public avatar bucket; drafts never go here, only published images.
+  publicMediaBucket:
+    process.env.SUPABASE_PUBLIC_MEDIA_BUCKET ||
+    process.env.SUPABASE_AVATAR_BUCKET ||
+    "pitchnest-avatars",
   corsExtraOrigins: (process.env.CORS_EXTRA_ORIGINS || "")
     .split(",")
     .map((o) => o.trim())
@@ -63,14 +138,52 @@ export const config = {
   // so billing is treated as NOT configured until it is set (see
   // hasBillingConfig) — the webhook also independently refuses every request.
   flutterwaveWebhookHash: (process.env.FLW_WEBHOOK_HASH || "").trim(),
+  // Explicit operator kill switch for checkout. Billing is only ever enabled
+  // when this is the exact string "true" AND both Flutterwave values are
+  // present — so loading the keys (e.g. granting the Lambda SSM access) can
+  // never turn checkout on by itself. Anything else, including unset, is off.
+  billingCheckoutEnabled: process.env.BILLING_CHECKOUT_ENABLED === "true",
+  // Which "plan:term" SKUs checkout may sell. Unset means Pro monthly only, the
+  // launch default. Widening the list is a config change (for example
+  // "pro:monthly,pro:annual,prep:monthly,prep:annual"); unknown entries are
+  // ignored, and an empty result falls back to the default.
+  purchasableSkus: purchasableSkusEnv("BILLING_PURCHASABLE_SKUS"),
   // Price is config, not code, so a currency or amount change is a deploy env
   // change. Amount is MAJOR units (15 = $15.00 USD).
-  proPlanAmount: process.env.PRO_PLAN_AMOUNT ? Number(process.env.PRO_PLAN_AMOUNT) : 15.00,
-  proPlanCurrency: process.env.PRO_PLAN_CURRENCY || "USD",
+  proPlanAmount: positiveMoneyEnv("PRO_PLAN_AMOUNT", 15),
+  proPlanCurrency: currencyEnv("PRO_PLAN_CURRENCY", "USD"),
   /** Days of Pro granted per successful payment. */
-  proPlanDays: process.env.PRO_PLAN_DAYS ? Number(process.env.PRO_PLAN_DAYS) : 30,
+  proPlanDays: positiveDaysEnv("PRO_PLAN_DAYS", 30),
+  /**
+   * Free months added to a user's first subscription (pay for one period, get
+   * this many extra months on top). 0 turns the offer off everywhere: the
+   * pricing page, the sidebar and checkout all read this one value.
+   */
+  firstSubscriptionFreeMonths: wholeNumberEnv("FIRST_SUBSCRIPTION_FREE_MONTHS", 1, 12),
   /** Where Flutterwave returns the user after checkout. */
-  appBaseUrl: process.env.APP_BASE_URL || process.env.ALLOWED_ORIGIN || "http://localhost:5174",
+  appBaseUrl:
+    (process.env.APP_BASE_URL || "").trim() ||
+    (process.env.ALLOWED_ORIGIN || "").trim() ||
+    "http://localhost:5174",
+  // ── Ecosystem feature flags ──────────────────────────────────────────────
+  // Public mutation surfaces ship dark. Discover engagement (support, follow,
+  // comments, reports) is on in development and OFF in production until
+  // FEATURE_DISCOVER_ENGAGEMENT=true is set — after migration 0021 is applied
+  // and a moderator has been granted users.is_staff.
+  discoverEngagementEnabled: process.env.FEATURE_DISCOVER_ENGAGEMENT
+    ? process.env.FEATURE_DISCOVER_ENGAGEMENT.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
+  // Community discussions (/community). Separate from Discover engagement so
+  // it can launch on its own once moderation capacity exists. Same default:
+  // on in development, OFF in production until FEATURE_COMMUNITY=true.
+  communityEnabled: process.env.FEATURE_COMMUNITY
+    ? process.env.FEATURE_COMMUNITY.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
+  // Pitch Arena (public text pitches and structured feedback). Same default:
+  // on in development, OFF in production until FEATURE_PITCH_ARENA=true.
+  pitchArenaEnabled: process.env.FEATURE_PITCH_ARENA
+    ? process.env.FEATURE_PITCH_ARENA.trim() === "true"
+    : (process.env.NODE_ENV || "production") !== "production",
 };
 
 // ── Billing catalog: purchasable SKUs (level × term) ─────────────────────────
@@ -92,14 +205,10 @@ export interface ResolvedPrice {
 }
 
 function envAmount(name: string, fallback: number): number {
-  const raw = process.env[name];
-  const n = raw ? Number(raw) : NaN;
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+  return positiveMoneyEnv(name, fallback);
 }
 
-const ANNUAL_DAYS = process.env.PRO_ANNUAL_DAYS
-  ? Number(process.env.PRO_ANNUAL_DAYS)
-  : 365;
+const ANNUAL_DAYS = positiveDaysEnv("PRO_ANNUAL_DAYS", 365);
 
 // Amounts per (plan, term). Founder (Prep) = $9.99/mo, Pro Founder = $15.00/mo
 // (matches the published pricing deck). Annual defaults to 10x the monthly
@@ -126,6 +235,16 @@ export function isPaidPlan(v: unknown): v is PaidPlan {
   return v === "prep" || v === "pro";
 }
 
+/**
+ * Whether checkout may sell this (plan, term). Only the SKUs in
+ * config.purchasableSkus qualify (Pro monthly unless configured otherwise). The
+ * full catalog stays visible for pricing pages, flagged per SKU. Checked by
+ * both the controller and createCheckout, so no caller can charge for another SKU.
+ */
+export function isPurchasable(plan: unknown, term: unknown): boolean {
+  return config.purchasableSkus.includes(`${plan}:${term}`);
+}
+
 export function isBillingTerm(v: unknown): v is BillingTerm {
   return v === "monthly" || v === "annual";
 }
@@ -142,10 +261,12 @@ export function resolvePlanPrice(plan: PaidPlan, term: BillingTerm): ResolvedPri
 }
 
 /** Every purchasable SKU, for the pricing UI. */
-export function listBillingCatalog(): ResolvedPrice[] {
+export function listBillingCatalog(): Array<ResolvedPrice & { purchasable: boolean }> {
   const plans: PaidPlan[] = ["prep", "pro"];
   const terms: BillingTerm[] = ["monthly", "annual"];
-  return plans.flatMap((p) => terms.map((t) => resolvePlanPrice(p, t)));
+  return plans.flatMap((p) =>
+    terms.map((t) => ({ ...resolvePlanPrice(p, t), purchasable: isPurchasable(p, t) })),
+  );
 }
 
 
@@ -175,6 +296,9 @@ if (config.jwtSecret === FALLBACK_JWT_SECRET) {
       "ALLOW_INSECURE_JWT_SECRET=true. Every token is forgeable. Never do this " +
       "on a deployed environment.",
   );
+}
+if (Buffer.byteLength(config.jwtSecret, "utf8") < 32) {
+  throw new Error("FATAL: JWT_SECRET must contain at least 32 bytes of entropy.");
 }
 
 export function hasGoogleAuthConfig(): boolean {
@@ -215,7 +339,20 @@ export function hasResearchConfig(): boolean {
  * missing hash must never take down auth, pitching, and everything else.
  */
 export function hasBillingConfig(): boolean {
-  return !!(config.flutterwaveSecretKey && config.flutterwaveWebhookHash);
+  // Three independent conditions: the explicit kill switch AND both
+  // Flutterwave values. Keys alone never enable checkout.
+  return !!(
+    config.billingCheckoutEnabled &&
+    config.flutterwaveSecretKey &&
+    config.flutterwaveWebhookHash
+  );
+}
+
+// Operator signal (no values): keys are present but checkout is switched off.
+if (config.flutterwaveSecretKey && config.flutterwaveWebhookHash && !config.billingCheckoutEnabled) {
+  console.info(
+    "ℹ️ Billing checkout disabled: Flutterwave keys are present but BILLING_CHECKOUT_ENABLED is not 'true'.",
+  );
 }
 
 // Loud, non-fatal warning when the secret is present but the hash is not: this
@@ -229,10 +366,55 @@ if (config.flutterwaveSecretKey && !config.flutterwaveWebhookHash) {
   );
 }
 
-if (!config.supabaseUrl || !config.supabaseAnonKey || !config.supabaseServiceRoleKey) {
-  console.warn(
-    "⚠️ Warning: SUPABASE_URL, SUPABASE_ANON_KEY, or SUPABASE_SERVICE_ROLE_KEY is missing in your backend environment variables!",
+if (!config.supabaseUrl || !config.supabaseServiceRoleKey) {
+  throw new Error(
+    "FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required by the backend.",
   );
+}
+
+if (config.nodeEnv === "production") {
+  for (const [name, value] of [
+    ["ALLOWED_ORIGIN", config.allowedOrigin],
+    ["CLIENT_URL", config.clientUrl],
+    ["APP_BASE_URL", config.appBaseUrl],
+    ["PUBLIC_SITE_URL", config.publicSiteUrl],
+    ...config.corsExtraOrigins.map((value, index) => [
+      `CORS_EXTRA_ORIGINS entry ${index + 1}`,
+      value,
+    ] as const),
+  ] as const) {
+    const problem = publicOriginProblem(value);
+    if (problem) {
+      // Origins are public, so the value is safe to log — and without it the
+      // operator has to guess which part of the dashboard setting is wrong.
+      throw new Error(
+        `FATAL: ${name} must be a public HTTPS URL in production (${problem}; got ${JSON.stringify(value)}).`,
+      );
+    }
+  }
+}
+
+/**
+ * Why a configured origin is unusable in production, or null when it is fine.
+ * Normalised the way origins.ts consumes it (trimmed, trailing slash dropped,
+ * case-insensitive host), so formatting that works at runtime can't fail boot.
+ */
+function publicOriginProblem(value: string): string | null {
+  const candidate = value.trim().replace(/\/+$/, "");
+  let url: URL;
+  try {
+    url = new URL(candidate);
+  } catch {
+    return "not a URL";
+  }
+  if (url.protocol !== "https:") return "must start with https://";
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    return "points at localhost — is it unset?";
+  }
+  if (url.origin !== candidate.toLowerCase()) {
+    return "must be scheme and host only, with no path, query or comma-separated list";
+  }
+  return null;
 }
 
 if (!hasOpenAiConfig()) {

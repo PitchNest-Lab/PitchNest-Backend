@@ -1,6 +1,8 @@
 import crypto from "crypto";
 import {
   config,
+  hasBillingConfig,
+  isPurchasable,
   resolvePlanPrice,
   type PaidPlan,
   type BillingTerm,
@@ -21,6 +23,18 @@ import { supabase } from "../config/supabase.ts";
  */
 
 const FLW_API = "https://api.flutterwave.com/v3";
+const PROVIDER_TIMEOUT_MS = 15_000;
+
+async function providerFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export interface CheckoutSession {
   txRef: string;
@@ -41,6 +55,7 @@ export class CheckoutError extends Error {
   constructor(
     public code:
       | "BILLING_NOT_CONFIGURED"
+      | "PLAN_NOT_AVAILABLE"
       | "PAYMENT_RECORD_FAILED"
       | "CHECKOUT_INIT_FAILED",
     public detail?: string,
@@ -63,6 +78,10 @@ function mintTxRef(userId: number): string {
  * the (plan, term) catalog and recorded onto the row — the webhook grants from
  * those recorded values, never from client input, so a founder receives exactly
  * the SKU that was priced here.
+ *
+ * The checkout subscribes the card to `paymentPlanId`, so Flutterwave renews it
+ * every period until it is cancelled. `grantedDays` covers the first period
+ * (plus any free months, recorded separately as `bonusDays`).
  */
 export async function createCheckout(
   user: {
@@ -74,16 +93,26 @@ export async function createCheckout(
     plan: PaidPlan;
     term: BillingTerm;
   },
+  subscription: {
+    paymentPlanId: number;
+    grantedDays: number;
+    bonusDays: number;
+  },
 ): Promise<CheckoutSession> {
-  if (!config.flutterwaveSecretKey) {
+  // Same gates as the controller, enforced again here so no other caller can
+  // create a charge: the kill switch + keys, and the single purchasable SKU.
+  if (!hasBillingConfig()) {
     throw new CheckoutError("BILLING_NOT_CONFIGURED");
+  }
+  if (!isPurchasable(selection.plan, selection.term)) {
+    throw new CheckoutError("PLAN_NOT_AVAILABLE");
   }
 
   const txRef = mintTxRef(user.id);
   const price = resolvePlanPrice(selection.plan, selection.term);
-  const { amount, currency, days } = price;
+  const { amount, currency } = price;
 
-  const planLabel = selection.plan === "pro" ? "Pro" : "Prep";
+  const planLabel = selection.plan === "pro" ? "Pro Founder" : "Founder";
   const termLabel = selection.term === "annual" ? "year" : "month";
 
   const { error: insertErr } = await supabase.from("payments").insert([
@@ -97,7 +126,10 @@ export async function createCheckout(
       // The intended grant, read back by grant_pro_access under a row lock.
       plan: selection.plan,
       term: selection.term,
-      granted_days: days,
+      granted_days: subscription.grantedDays,
+      kind: "subscription_initial",
+      provider_plan_id: subscription.paymentPlanId,
+      bonus_days: subscription.bonusDays,
     },
   ]);
   if (insertErr) {
@@ -107,7 +139,7 @@ export async function createCheckout(
 
   let res: Response;
   try {
-    res = await fetch(`${FLW_API}/payments`, {
+    res = await providerFetch(`${FLW_API}/payments`, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${config.flutterwaveSecretKey}`,
@@ -117,6 +149,9 @@ export async function createCheckout(
         tx_ref: txRef,
         amount,
         currency,
+        // Subscribes this card to the plan. Flutterwave fixes the payment
+        // method to card and charges again every period until cancelled.
+        payment_plan: subscription.paymentPlanId,
         redirect_url: `${config.appBaseUrl}/billing/return`,
         customer: {
           email: user.email,
@@ -124,7 +159,9 @@ export async function createCheckout(
         },
         customizations: {
           title: `PitchNest ${planLabel}`,
-          description: `${days} days of PitchNest ${planLabel} (billed per ${termLabel})`,
+          description:
+            `PitchNest ${planLabel}, renews every ${termLabel} until you cancel` +
+            (subscription.bonusDays > 0 ? ". Your free month is added on top." : "."),
         },
         meta: { user_id: user.id, plan: selection.plan, term: selection.term },
       }),
@@ -143,12 +180,44 @@ export async function createCheckout(
   if (!res.ok || body?.status !== "success" || !body?.data?.link) {
     // Flutterwave answered but refused — the message names why (invalid key,
     // currency not enabled on the account, live/test mismatch, ...).
-    const providerMsg = body?.message || `HTTP ${res.status}`;
-    console.error("❌ Flutterwave payment init failed:", res.status, body);
+    const providerMsg = String(body?.message || `HTTP ${res.status}`)
+      .replace(/[\r\n\t]+/g, " ")
+      .slice(0, 300);
+    // Gateway errors may echo customer or checkout fields. Keep logs useful
+    // without copying the complete provider payload into the log stream.
+    console.error("❌ Flutterwave payment init failed:", res.status, providerMsg);
+    await markPaymentFailed(txRef).catch((error: any) => {
+      console.error("❌ Could not finalize rejected checkout:", error?.message || error);
+      throw new CheckoutError("PAYMENT_RECORD_FAILED", "could not mark rejected checkout failed");
+    });
     throw new CheckoutError("CHECKOUT_INIT_FAILED", providerMsg);
   }
 
-  return { txRef, paymentLink: body.data.link };
+  let paymentUrl: URL;
+  try {
+    paymentUrl = new URL(String(body.data.link));
+  } catch {
+    await markPaymentFailed(txRef).catch((error: any) => {
+      console.error("❌ Could not finalize invalid checkout response:", error?.message || error);
+      throw new CheckoutError("PAYMENT_RECORD_FAILED", "could not mark invalid checkout failed");
+    });
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an invalid payment link");
+  }
+  if (
+    paymentUrl.protocol !== "https:" ||
+    paymentUrl.hostname !== "checkout.flutterwave.com" ||
+    paymentUrl.username ||
+    paymentUrl.password ||
+    paymentUrl.toString().length > 2_048
+  ) {
+    await markPaymentFailed(txRef).catch((error: any) => {
+      console.error("❌ Could not finalize unsafe checkout response:", error?.message || error);
+      throw new CheckoutError("PAYMENT_RECORD_FAILED", "could not mark unsafe checkout failed");
+    });
+    throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an unsafe payment link");
+  }
+
+  return { txRef, paymentLink: paymentUrl.toString() };
 }
 
 export interface VerifiedTransaction {
@@ -173,18 +242,49 @@ export interface VerifiedTransaction {
 export async function verifyTransaction(
   transactionIdOrRef: string | number,
 ): Promise<VerifiedTransaction | null> {
+  const details = await verifyTransactionDetails(transactionIdOrRef);
+  if (!details) return null;
+  if (!isCheckoutTxRef(details.txRef)) {
+    console.error("Flutterwave verification returned an invalid transaction shape.");
+    return null;
+  }
+  const { status, txRef, amount, currency, providerRef } = details;
+  return { status, txRef, amount, currency, providerRef };
+}
+
+/** References minted by createCheckout. Renewal charges carry Flutterwave's own. */
+export function isCheckoutTxRef(txRef: string): boolean {
+  return /^pn-\d+-\d{10,16}-[a-f0-9]{16}$/.test(txRef);
+}
+
+export interface VerifiedTransactionDetails extends VerifiedTransaction {
+  /** The payer's email as Flutterwave holds it, lowercased. */
+  customerEmail: string | null;
+  /** The payment plan the charge belongs to, when Flutterwave reports one. */
+  planId: number | null;
+  paymentType: string | null;
+}
+
+/**
+ * The verified transaction with the fields renewals need. Unlike
+ * verifyTransaction it accepts any reference format, because a renewal charge is
+ * raised by Flutterwave rather than by our checkout.
+ */
+export async function verifyTransactionDetails(
+  transactionIdOrRef: string | number,
+): Promise<VerifiedTransactionDetails | null> {
   if (!config.flutterwaveSecretKey) return null;
 
   try {
     const isNumericId =
       typeof transactionIdOrRef === "number" ||
-      (/^\d+$/.test(String(transactionIdOrRef)) && Number(transactionIdOrRef) < 2000000000);
+      /^\d+$/.test(String(transactionIdOrRef));
 
     const url = isNumericId
       ? `${FLW_API}/transactions/${transactionIdOrRef}/verify`
       : `${FLW_API}/transactions/verify_by_reference?tx_ref=${encodeURIComponent(String(transactionIdOrRef))}`;
 
-    const res = await fetch(url, {
+    const res = await providerFetch(url, {
       headers: { Authorization: `Bearer ${config.flutterwaveSecretKey}` },
     });
     const body: any = await res.json().catch(() => null);
@@ -196,17 +296,122 @@ export async function verifyTransaction(
     const data = Array.isArray(body.data) ? body.data[0] : body.data;
     if (!data) return null;
 
+    const txRef = typeof data.tx_ref === "string" ? data.tx_ref.trim() : "";
+    const amount = Number(data.amount);
+    const currency = String(data.currency || "").trim().toUpperCase();
+    const providerRef = String(data.id ?? "").trim();
+    if (
+      !txRef ||
+      txRef.length > 200 ||
+      !Number.isFinite(amount) ||
+      amount <= 0 ||
+      !/^[A-Z]{3}$/.test(currency) ||
+      !/^\d{1,20}$/.test(providerRef)
+    ) {
+      console.error("Flutterwave verification returned an invalid transaction shape.");
+      return null;
+    }
+    const email = typeof data.customer?.email === "string" ? data.customer.email.trim().toLowerCase() : "";
+    const rawPlan = data.plan ?? data.payment_plan;
+    const planId = Number(typeof rawPlan === "object" && rawPlan !== null ? rawPlan.id : rawPlan);
     return {
       status: String(data.status || "").toLowerCase(),
-      txRef: data.tx_ref,
-      amount: Number(data.amount),
-      currency: String(data.currency || ""),
-      providerRef: String(data.id),
+      txRef,
+      amount,
+      currency,
+      providerRef,
+      customerEmail: email && email.length <= 320 ? email : null,
+      planId: Number.isSafeInteger(planId) && planId > 0 ? planId : null,
+      paymentType: typeof data.payment_type === "string" ? data.payment_type.toLowerCase() : null,
     };
   } catch (err: any) {
     console.error("❌ verifyTransaction threw:", err?.message || err);
     return null;
   }
+}
+
+// ── Payment plans and subscriptions ─────────────────────────────────────────
+
+export class ProviderError extends Error {
+  constructor(public detail: string) {
+    super("PROVIDER_ERROR");
+    this.name = "ProviderError";
+  }
+}
+
+async function providerJson(path: string, init: RequestInit = {}): Promise<any> {
+  if (!config.flutterwaveSecretKey) throw new ProviderError("billing not configured");
+  let res: Response;
+  try {
+    res = await providerFetch(`${FLW_API}${path}`, {
+      ...init,
+      headers: {
+        Authorization: `Bearer ${config.flutterwaveSecretKey}`,
+        ...(init.body ? { "Content-Type": "application/json" } : {}),
+      },
+    });
+  } catch (err: any) {
+    throw new ProviderError(`unreachable: ${err?.message || err}`);
+  }
+  const body: any = await res.json().catch(() => null);
+  if (!res.ok || body?.status !== "success") {
+    const message = String(body?.message || `HTTP ${res.status}`).replace(/[\r\n\t]+/g, " ").slice(0, 300);
+    throw new ProviderError(message);
+  }
+  return body;
+}
+
+/** Creates a Flutterwave payment plan and returns its id. */
+export async function createProviderPaymentPlan(input: {
+  name: string;
+  amount: number;
+  currency: string;
+  interval: "monthly" | "yearly";
+}): Promise<number> {
+  const body = await providerJson("/payment-plans", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+  const id = Number(body?.data?.id);
+  if (!Number.isSafeInteger(id) || id <= 0) throw new ProviderError("payment plan response had no id");
+  return id;
+}
+
+export interface ProviderSubscription {
+  id: number;
+  planId: number | null;
+  status: string;
+  email: string | null;
+}
+
+/** Subscriptions Flutterwave holds for this email, optionally for one plan. */
+export async function listProviderSubscriptions(filter: {
+  email: string;
+  planId?: number;
+}): Promise<ProviderSubscription[]> {
+  const params = new URLSearchParams({ email: filter.email });
+  if (filter.planId) params.set("plan", String(filter.planId));
+  const body = await providerJson(`/subscriptions?${params.toString()}`);
+  const rows: any[] = Array.isArray(body?.data) ? body.data : [];
+  return rows
+    .map((row) => ({
+      id: Number(row?.id),
+      planId: Number.isSafeInteger(Number(row?.plan)) ? Number(row.plan) : null,
+      status: String(row?.status || "").toLowerCase(),
+      email:
+        typeof row?.customer?.customer_email === "string"
+          ? row.customer.customer_email.trim().toLowerCase()
+          : null,
+    }))
+    .filter((row) => Number.isSafeInteger(row.id) && row.id > 0)
+    // The filter is ours to enforce too, not only the provider's.
+    .filter((row) => !filter.planId || row.planId === filter.planId)
+    .filter((row) => !row.email || row.email === filter.email.trim().toLowerCase());
+}
+
+/** Stops future renewals. Access already paid for is untouched. */
+export async function cancelProviderSubscription(subscriptionId: number): Promise<void> {
+  await providerJson(`/subscriptions/${subscriptionId}/cancel`, { method: "PUT" });
 }
 
 /**
@@ -262,15 +467,12 @@ export async function grantAccess(tx: VerifiedTransaction): Promise<boolean> {
   return data === true;
 }
 
-/** Marks a checkout attempt failed. Best-effort — never throws. */
+/** Marks a checkout attempt failed so webhook acknowledgement is durable. */
 export async function markPaymentFailed(txRef: string): Promise<void> {
-  try {
-    await supabase
-      .from("payments")
-      .update({ status: "failed", completed_at: new Date().toISOString() })
-      .eq("tx_ref", txRef)
-      .eq("status", "pending");
-  } catch (err: any) {
-    console.warn("⚠️ markPaymentFailed:", err?.message || err);
-  }
+  const { error } = await supabase
+    .from("payments")
+    .update({ status: "failed", completed_at: new Date().toISOString() })
+    .eq("tx_ref", txRef)
+    .eq("status", "pending");
+  if (error) throw error;
 }

@@ -30,9 +30,6 @@ const MIN_AUDITABLE_TEXT_CHARS = 200;
  *   • anything else (e.g. a renamed .pptx = `PK…`)  → null → 415
  */
 export function resolveDeckType(buffer: Buffer, mimetype: string | undefined): string | null {
-  if (mimetype === "application/pdf" || mimetype === "text/plain" || mimetype === "text/markdown") {
-    return mimetype;
-  }
   const head = buffer.subarray(0, Math.min(buffer.length, 1024));
   // Known NON-deck binary containers, rejected before any text heuristic can
   // misfire on them: PK = zip (pptx/docx/xlsx), the OLE compound header = legacy
@@ -49,10 +46,18 @@ export function resolveDeckType(buffer: Buffer, mimetype: string | undefined): s
   if (head.length >= 5 && head.subarray(0, 5).toString("latin1") === "%PDF-") {
     return "application/pdf";
   }
-  if (head.length > 0 && !head.includes(0)) {
-    const decoded = head.toString("utf-8");
-    // � appears when Buffer.toString hits invalid UTF-8 — binary content.
-    if (!decoded.includes("�")) return "text/plain";
+  if (buffer.length > 0 && !head.includes(0)) {
+    try {
+      // Fatal decoding rejects invalid byte sequences instead of silently
+      // replacing them. Reject control-heavy data that only looks textual.
+      const decoded = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      const controls = decoded.match(/[\u0001-\u0008\u000B\u000C\u000E-\u001F]/g)?.length ?? 0;
+      if (controls <= Math.max(4, decoded.length * 0.001)) {
+        return mimetype === "text/markdown" ? "text/markdown" : "text/plain";
+      }
+    } catch {
+      return null;
+    }
   }
   return null;
 }
@@ -73,8 +78,13 @@ export const uploadDeck = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     const originalName = sanitizeUploadName(req.file.originalname);
     const sizeMB = parseFloat((req.file.size / (1024 * 1024)).toFixed(2));
-    const deckName = req.file.originalname.replace(/\.[^/.]+$/, "");
-    const filePath = `decks/${Date.now()}_${originalName}`;
+    const deckName = path
+      .basename(req.file.originalname.replace(/\\/g, "/"))
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[\u0000-\u001f\u007f]/g, "")
+      .trim()
+      .slice(0, 120) || "Pitch deck";
+    const filePath = `decks/${userId}/${Date.now()}_${originalName}`;
 
     let extractedText = "";
     let pageCount = 0;
@@ -113,11 +123,16 @@ export const uploadDeck = async (req: Request, res: Response) => {
 
     let publicUrl = "";
     if (error) {
-      console.warn("⚠️ Supabase storage upload failed, using local fallback. Storage Error:", error);
-      // Local fallback
+      console.error("❌ Supabase deck storage upload failed:", error.message);
+      if (config.nodeEnv === "production") {
+        return res.status(503).json({
+          error: "Deck storage is temporarily unavailable. Please retry.",
+        });
+      }
+      console.warn("⚠️ Development-only local deck fallback is in use.");
       const localFileName = `${Date.now()}_${originalName}`;
       fs.writeFileSync(path.join(uploadDir, localFileName), req.file.buffer);
-     
+      publicUrl = `/uploads/${localFileName}`;
     } else {
       // Item A: the bucket is private, so store the BARE object path (not a
       // public URL). Deck rendering goes through GET /:id/signed-url, which
@@ -135,30 +150,24 @@ export const uploadDeck = async (req: Request, res: Response) => {
       user_id: userId
     };
 
-    let { data: dbData, error: dbError } = await supabase
+    const { data: dbData, error: dbError } = await supabase
       .from("decks")
       .insert([insertData])
       .select()
       .single();
 
-    // Rollout safety: page_count arrives with migration 0014. If it isn't there
-    // yet, save the deck without it rather than failing the upload — the read
-    // path treats a missing count as "not measured yet".
-    if (dbError && /column|schema/i.test(dbError.message || "")) {
-      console.warn(
-        "⚠️ Deck insert failed (possibly missing page_count column) — retrying without it:",
-        dbError.message,
-      );
-      const { page_count, ...legacyInsert } = insertData;
-      ({ data: dbData, error: dbError } = await supabase
-        .from("decks")
-        .insert([legacyInsert])
-        .select()
-        .single());
-    }
-
     if (dbError) {
       console.error("❌ Supabase insertion failed in uploadDeck:", dbError);
+      // The object was created before its owning row. Roll it back so a DB
+      // outage cannot accumulate private, untracked files.
+      if (publicUrl.startsWith("/uploads/")) {
+        const localName = publicUrl.slice("/uploads/".length);
+        if (localName === path.basename(localName)) {
+          await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+        }
+      } else {
+        await supabase.storage.from(config.storageBucket).remove([filePath]);
+      }
       return res.status(500).json({ error: "Failed to save deck to database" });
     }
 
@@ -169,7 +178,6 @@ export const uploadDeck = async (req: Request, res: Response) => {
       size: dbData.size,
       status: dbData.status,
       page_count: dbData.page_count ?? pageCount ?? null,
-      extracted_text: extractedText
     });
   } catch (error) { 
     console.error("❌ Fatal error in uploadDeck controller:", error);
@@ -186,7 +194,7 @@ export const listDecks = async (req: Request, res: Response) => {
 
     const { data: decks, error } = await supabase
       .from("decks")
-      .select("*")
+      .select("id, name, file_url, size, status, page_count, created_at")
       .eq("user_id", userId)
       .order("created_at", { ascending: false });
 
@@ -207,8 +215,7 @@ export const listDecks = async (req: Request, res: Response) => {
 // Ownership is enforced by the user_id match — a signed URL is never issued for
 // a deck the caller does not own. Local-fallback decks ("/uploads/..") are
 // served through the token-gated /api/files route (S7) — the raw path itself is
-// no longer publicly reachable. Any other non-storage value is returned as-is
-// so dev and legacy rows still render.
+// no longer publicly reachable. Unrecognized legacy references are rejected.
 const SIGNED_URL_TTL_SECONDS = 300; // 5 min — long enough for a pitch to load it
 
 /**
@@ -296,23 +303,12 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Authentication required" });
     }
 
-    // page_count arrives with migration 0014 — degrade to the legacy column set
-    // if it isn't deployed yet rather than failing the deck open.
-    let { data: deck, error } = await supabase
+    const { data: deck, error } = await supabase
       .from("decks")
       .select("file_url, page_count, extracted_text")
       .eq("id", req.params.id)
       .eq("user_id", userId)
       .maybeSingle();
-
-    if (error && /column|schema/i.test(error.message || "")) {
-      ({ data: deck, error } = await supabase
-        .from("decks")
-        .select("file_url, extracted_text")
-        .eq("id", req.params.id)
-        .eq("user_id", userId)
-        .maybeSingle());
-    }
 
     if (error) {
       console.error("❌ Supabase query error in getDeckSignedUrl:", error);
@@ -343,9 +339,8 @@ export const getDeckSignedUrl = async (req: Request, res: Response) => {
 
     const objectPath = storagePathFromUrl(stored);
     if (!objectPath) {
-      // Unrecognized (e.g. an external URL we didn't store) — return as-is
-      // rather than 500, so an odd legacy row still renders.
-      return res.json({ url: stored, pageCount });
+      console.error(`Deck ${req.params.id} has an untrusted storage reference.`);
+      return res.status(500).json({ error: "Deck has an invalid storage reference" });
     }
 
     const { data: signed, error: signErr } = await supabase.storage
@@ -490,6 +485,47 @@ export const deleteDeck = async (req: Request, res: Response) => {
     const userId = req.user?.id;
     if (!userId) {
       return res.status(401).json({ error: "Authentication required" });
+    }
+
+    const { data: deck, error: readError } = await supabase
+      .from("decks")
+      .select("id, file_url")
+      .eq("id", req.params.id)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (readError) {
+      console.error("❌ Supabase query error in deleteDeck:", readError);
+      return res.status(500).json({ error: "Failed to delete deck" });
+    }
+    if (!deck) return res.status(404).json({ error: "Deck not found" });
+
+    const stored = typeof deck.file_url === "string" ? deck.file_url : "";
+    if (stored.startsWith("/uploads/")) {
+      const localName = stored.slice("/uploads/".length);
+      if (!localName || localName !== path.basename(localName)) {
+        return res.status(500).json({ error: "Deck has an invalid storage reference" });
+      }
+      try {
+        await fs.promises.rm(path.join(uploadDir, localName), { force: true });
+      } catch (storageError) {
+        console.error("❌ Local deck cleanup failed:", storageError);
+        return res.status(503).json({ error: "Could not remove the deck file. Please retry." });
+      }
+    } else {
+      const objectPath = storagePathFromUrl(stored);
+      if (objectPath) {
+        if (!objectPath.startsWith("decks/") || objectPath.includes("..")) {
+          return res.status(500).json({ error: "Deck has an invalid storage reference" });
+        }
+        const { error: storageError } = await supabase.storage
+          .from(config.storageBucket)
+          .remove([objectPath]);
+        if (storageError) {
+          console.error("❌ Deck object cleanup failed:", storageError);
+          return res.status(503).json({ error: "Could not remove the deck file. Please retry." });
+        }
+      }
     }
 
     const { error } = await supabase
