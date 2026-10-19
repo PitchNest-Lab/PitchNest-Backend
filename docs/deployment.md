@@ -1,83 +1,118 @@
 # Deployment
 
-Merging to `main` releases to production. Nobody needs to open the AWS console to ship code.
+Two environments, two branches. Nobody needs the AWS console to ship code.
 
-| Part | Host | Deploys when |
-|---|---|---|
-| Website | Vercel project `pitchnestapp` | Automatically, on every push to `main` of PitchNest-Frontend |
-| REST API | AWS Lambda `pitchnest-prod-api`, alias `live` | Automatically, on every push to `main` of this repository (`.github/workflows/deploy-api.yml`) |
-| Live-pitch server | Render "PitchNest-Backend" | Triggered by the same workflow once the API release succeeds. Render's own auto-deploy stays **off**, so it never deploys a commit that failed. |
-| Database | Supabase | **Never automatically.** Apply new migrations in Supabase before merging code that needs them. |
+| Branch | Environment | API (Lambda) | Live-pitch server (Render) | Website (Vercel) | Database (Supabase) |
+|---|---|---|---|---|---|
+| `dev` | **DEV**, for testing | `pitchnest-dev-api` in account `639324724698`, at `https://l5isutzx18.execute-api.eu-west-2.amazonaws.com` | DEV service on branch `dev` | `dev` branch preview: `https://pitchnestapp-git-dev-immanexs-projects.vercel.app` | `ueqwulsbbcvnduhepimh` |
+| `main` | **PROD**, live | `pitchnest-prod-api` alias `live` in account `415081251151`, at `https://mkrkiditq5.execute-api.eu-west-2.amazonaws.com` | PROD service "PitchNest-Backend" on branch `main` | `https://www.pitchnest.app` | `oyztdulmyuklorbudcgb` |
 
-## What the workflow does
-1. Type-checks, runs the tests and the migration checks, then builds and verifies the Lambda package. Pull requests stop here.
-2. Uploads the package and publishes an immutable Lambda version.
-3. Smoke-tests that version directly (`/api/health`, `/api/public/businesses`) before any user reaches it. If either check fails, `live` doesn't move.
-4. Moves `live` to the new version, then checks the public API. If that check fails, it moves `live` back.
-5. Calls Render's deploy hook for the same commit.
+## Day to day
+1. Branch from `dev`, open a pull request into `dev`, merge. DEV updates by itself: API, live-pitch server and website.
+2. Test on the DEV website.
+3. Open a pull request from `dev` into `main`, and merge it. PROD updates by itself.
 
-The run summary names the new version and the one it replaced.
+**Database changes are never automatic.** Apply a migration to DEV Supabase before merging into `dev`, and to PROD Supabase before merging into `main`.
 
-**A change that needs both repos:** merge the backend first, wait for its run to finish, then merge the frontend.
+**A change that touches both repos:** merge the backend first and wait for its run to finish, then merge the frontend.
 
-## Rolling back
-- **API:** Actions → **Roll back API** → **Run workflow** (branch `main`), and enter the previous version from the deploy run's summary. It takes effect in seconds.
-- **Everything:** use **Revert** on the merged pull request and merge the revert. The workflow redeploys the API and Render from it.
+## What `.github/workflows/deploy-api.yml` does
+Every push to `dev` or `main` (and every pull request into them):
+1. Type-checks, lints the release script, runs the tests and the migration checks, then builds and verifies one Lambda package. Pull requests stop here.
+2. Ships that exact package with `scripts/release-lambda.sh`:
+   - **PROD:** publishes an immutable version and smoke-tests it directly (`/api/health`, `/api/public/businesses`). It moves `live` only if both pass, then checks the public API, and moves `live` back if that check fails.
+   - **DEV:** the DEV API invokes `$LATEST`, so the upload is live immediately. It's smoke-tested and checked the same way; a failure fails the run, and you fix it by pushing a corrected commit.
+3. Calls that environment's Render deploy hook for the same commit. Render's own auto-deploy stays **off**, so it never deploys a commit that failed.
+
+AWS access uses GitHub OIDC; no AWS keys are stored anywhere. The DEV role trusts only branch `dev` of this repository, and the PROD role only `main`.
+
+## Rolling back PROD
+- **API:** Actions → **Roll back API** → **Run workflow** on `main`, and enter the version from the PROD run's summary. It takes effect in seconds.
+- **Everything:** use **Revert** on the merged pull request into `main` and merge the revert. The workflow redeploys the API and Render.
 - **Render only:** dashboard → **Events** → previous deploy → **Rollback**.
-- **Website:** Vercel → **Deployments** → previous deployment → **Instant Rollback**.
+- **Website:** Vercel → **Deployments** → previous production deployment → **Instant Rollback**.
 
 ## One-time setup
-### AWS (PROD account `415081251151`, region eu-west-2)
-1. **IAM → Identity providers → Add provider:** OpenID Connect, provider URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+### AWS: in each account
+Do this once in DEV (`639324724698`, branch `dev`, function `pitchnest-dev-api`) and once in PROD (`415081251151`, branch `main`, function `pitchnest-prod-api`).
+
+1. **IAM → Identity providers → Add provider:** OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
 2. **IAM → Roles → Create role → Web identity:**
    - provider `token.actions.githubusercontent.com`, audience `sts.amazonaws.com`
-   - GitHub organization `PitchNest-Lab`, repository `PitchNest-Backend`, branch `main`
-   - no managed policies; role name `pitchnest-prod-api-deploy`
+   - organization `PitchNest-Lab`, repository `PitchNest-Backend`, branch `dev` or `main`
+   - no managed policies
+   - name it `pitchnest-dev-api-deploy` or `pitchnest-prod-api-deploy`
 
-   Its trust policy must be:
+   Its trust policy must end up as:
    ```json
    {
      "Version": "2012-10-17",
      "Statement": [{
        "Effect": "Allow",
-       "Principal": { "Federated": "arn:aws:iam::415081251151:oidc-provider/token.actions.githubusercontent.com" },
+       "Principal": { "Federated": "arn:aws:iam::<ACCOUNT>:oidc-provider/token.actions.githubusercontent.com" },
        "Action": "sts:AssumeRoleWithWebIdentity",
        "Condition": {
          "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-         "StringLike": { "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab/PitchNest-Backend:ref:refs/heads/main" }
+         "StringLike": { "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab/PitchNest-Backend:ref:refs/heads/<BRANCH>" }
        }
      }]
    }
    ```
-   Only workflows running on `main` of this repository can use the role. Pull requests, forks and other branches can't.
-3. **Inline policy** `deploy-pitchnest-prod-api` on that role:
+3. **Inline policy** on the role:
    ```json
    {
      "Version": "2012-10-17",
      "Statement": [{
-       "Sid": "ReleasePitchnestProdApi",
        "Effect": "Allow",
        "Action": [
-         "lambda:GetFunction",
-         "lambda:GetFunctionConfiguration",
-         "lambda:UpdateFunctionCode",
-         "lambda:PublishVersion",
-         "lambda:InvokeFunction",
-         "lambda:GetAlias",
-         "lambda:UpdateAlias"
+         "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode",
+         "lambda:PublishVersion", "lambda:InvokeFunction", "lambda:GetAlias", "lambda:UpdateAlias"
        ],
        "Resource": [
-         "arn:aws:lambda:eu-west-2:415081251151:function:pitchnest-prod-api",
-         "arn:aws:lambda:eu-west-2:415081251151:function:pitchnest-prod-api:*"
+         "arn:aws:lambda:eu-west-2:<ACCOUNT>:function:<FUNCTION>",
+         "arn:aws:lambda:eu-west-2:<ACCOUNT>:function:<FUNCTION>:*"
        ]
      }]
    }
    ```
-   It can only ship code to this one function and move its alias. It can't change configuration, secrets or any other resource.
+   It can only ship code to that one function and move its alias.
 
-### GitHub (this repository → Settings → Secrets and variables → Actions → New repository secret)
-- `AWS_DEPLOY_ROLE_ARN`: the role's ARN, `arn:aws:iam::415081251151:role/pitchnest-prod-api-deploy`.
-- `RENDER_DEPLOY_HOOK_URL`: Render → PitchNest-Backend → **Settings** → **Deploy Hook**. Treat it as a secret: anyone who has it can trigger a deploy.
+**DEV only:**
+- The DEV function reads nine secrets from `/pitchnest/dev/`:
+  - `JWT_SECRET`
+  - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
+  - `RESEND_API_KEY`
+  - `GOOGLE_CLIENT_ID`
+  - `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`
+
+  Its execution role (`PitchNest-Dev-LambdaExecutionRole`) must be allowed `ssm:GetParameters` on all nine.
+- `JWT_SECRET` must be at least 32 bytes, and the same value as the DEV Render service's `JWT_SECRET`.
+- The function's environment variables:
+  - `NODE_ENV=development`, `PITCHNEST_ENV=dev`
+  - `ALLOWED_ORIGIN`, `CLIENT_URL` and `APP_BASE_URL` set to the DEV website.
+
+### Render
+- **PROD:** service "PitchNest-Backend" (branch `main`).
+- **DEV:** a second web service on branch `dev`, with DEV values. Use the same build (`npm install; npm run build`) and start (`npm start`) commands as PROD. Its `JWT_SECRET` must equal `/pitchnest/dev/JWT_SECRET`.
+- **On both:** keep **Auto-Deploy** off, and copy the **Deploy Hook** from Settings.
+
+### GitHub (this repository → Settings → Secrets and variables → Actions)
+| Secret | Value |
+|---|---|
+| `AWS_DEV_ROLE_ARN` | `arn:aws:iam::639324724698:role/pitchnest-dev-api-deploy` |
+| `AWS_PROD_ROLE_ARN` | `arn:aws:iam::415081251151:role/pitchnest-prod-api-deploy` |
+| `RENDER_DEV_DEPLOY_HOOK` | the DEV service's deploy hook |
+| `RENDER_PROD_DEPLOY_HOOK` | the PROD service's deploy hook |
+
+Treat the deploy hooks as secrets: anyone who has one can trigger a deploy.
+
+### Vercel (PitchNest-Frontend)
+Under **Environment Variables**, for **Preview** (branch `dev`):
+- `VITE_API_URL` = `https://l5isutzx18.execute-api.eu-west-2.amazonaws.com`
+- `VITE_WS_BACKEND_URL` = `wss://<DEV Render service>.onrender.com/ws`
+- `VITE_GOOGLE_CLIENT_ID` = the DEV Google client ID
+
+Without them, a preview build talks to PROD. The website's Content-Security-Policy must also allow the DEV API, the DEV WebSocket and the DEV Supabase project. The Google OAuth client must list the DEV website as an authorized JavaScript origin.
 
 ### Recommended
-Protect `main` (Settings → Rules → Rulesets): require a pull request and the **Test and package** check. Merging to `main` is a production release.
+Protect `main` and `dev` (Settings → Rules → Rulesets): require a pull request and the **Test and package** check.

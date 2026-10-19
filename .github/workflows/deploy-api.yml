@@ -1,20 +1,19 @@
 name: Deploy API
 
-# Every push to main releases the backend:
-#   1. test, build and verify the Lambda package
-#   2. upload it to pitchnest-prod-api and publish an immutable version
-#   3. smoke-test that version directly, before any user reaches it
-#   4. move the `live` alias, then check the public API (moving it back on failure)
-#   5. ask Render to deploy the same commit (live-pitch WebSocket server)
+# dev  -> DEV:  Lambda pitchnest-dev-api (API l5isutzx18) + Render DEV service
+# main -> PROD: Lambda pitchnest-prod-api, alias `live` (API mkrkiditq5) + Render PROD service
 #
+# Every run tests, builds and verifies one package; the release job ships that
+# exact package (scripts/release-lambda.sh), then asks Render to deploy the
+# same commit. Pull requests stop after the package checks.
 # Database migrations are never run here: apply them in Supabase first.
-# One-time setup (AWS role, GitHub secrets): docs/deployment.md.
+# One-time setup and rollback: docs/deployment.md.
 
 on:
   push:
-    branches: [main]
+    branches: [dev, main]
   pull_request:
-    branches: [main]
+    branches: [dev, main]
   workflow_dispatch:
 
 permissions:
@@ -25,9 +24,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  FUNCTION_NAME: pitchnest-prod-api
   AWS_REGION: eu-west-2
-  API_URL: https://mkrkiditq5.execute-api.eu-west-2.amazonaws.com
 
 jobs:
   package:
@@ -46,6 +43,10 @@ jobs:
         run: npm ci
       - name: Type-check
         run: npm run lint
+      - name: Check the release script
+        run: |
+          bash -n scripts/release-lambda.sh
+          shellcheck --severity=warning scripts/release-lambda.sh
       - name: Run application and security tests
         # Placeholders only: the tests stub every external service, and the
         # .invalid hosts guarantee nothing real can be reached.
@@ -88,8 +89,58 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  release:
-    name: Release to production
+  release-dev:
+    name: Release to DEV
+    needs: package
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: release-dev-api
+      cancel-in-progress: false
+    env:
+      FUNCTION_NAME: pitchnest-dev-api
+      API_URL: https://l5isutzx18.execute-api.eu-west-2.amazonaws.com
+    steps:
+      - name: Check out the release script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch the verified package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: lambda-package
+          path: dist
+      - name: Sign in to the DEV account (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEV_ROLE_ARN }}
+          role-session-name: deploy-api-dev-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+      - name: Update and smoke-test the DEV function
+        run: bash scripts/release-lambda.sh latest "$FUNCTION_NAME" "$API_URL"
+      - name: Deploy the DEV live-pitch server (Render)
+        env:
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEV_DEPLOY_HOOK }}
+        run: |
+          if [ -z "${RENDER_DEPLOY_HOOK:-}" ]; then
+            echo "::warning::RENDER_DEV_DEPLOY_HOOK is not set, so the DEV Render service was not deployed."
+            exit 0
+          fi
+          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK}&ref=${GITHUB_SHA}"
+          echo "DEV Render deploy of ${GITHUB_SHA:0:7} requested"
+      - name: Release summary
+        run: |
+          {
+            echo "### DEV updated to ${GITHUB_SHA:0:7}"
+            echo "- API: \`$FUNCTION_NAME\` (\$LATEST) at $API_URL"
+            echo "- Live-pitch server: Render DEV deploy requested; it is live a few minutes later."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release-prod:
+    name: Release to PROD
     needs: package
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -100,116 +151,45 @@ jobs:
     concurrency:
       group: release-prod-api
       cancel-in-progress: false
+    env:
+      FUNCTION_NAME: pitchnest-prod-api
+      API_URL: https://mkrkiditq5.execute-api.eu-west-2.amazonaws.com
     steps:
+      - name: Check out the release script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Fetch the verified package
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: lambda-package
           path: dist
-
-      - name: Sign in to AWS (OIDC, no stored keys)
+      - name: Sign in to the PROD account (OIDC, no stored keys)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          role-session-name: deploy-api-${{ github.run_id }}
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
+          role-session-name: deploy-api-prod-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
-
-      - name: Publish, smoke-test and promote the Lambda version
+      - name: Publish, smoke-test and promote the PROD version
         id: lambda
-        shell: bash
-        run: |
-          set -euo pipefail
-          zip=dist/pitchnest-api-prod.zip
-          expected=$(jq -r .sha256_base64 dist/pitchnest-api-prod.manifest.json)
-          built_from=$(jq -r .gitCommit dist/pitchnest-api-prod.manifest.json)
-          if [ "$built_from" != "$GITHUB_SHA" ]; then
-            echo "::error::The package was built from $built_from, not $GITHUB_SHA."
-            exit 1
-          fi
-
-          # Every AWS call below prints one field only: function configuration
-          # (including environment variables) must never reach public logs.
-          previous=$(aws lambda get-alias --function-name "$FUNCTION_NAME" --name live \
-            --query FunctionVersion --output text)
-          echo "live is on version $previous"
-
-          uploaded=$(aws lambda update-function-code --function-name "$FUNCTION_NAME" \
-            --zip-file "fileb://$zip" --query CodeSha256 --output text)
-          if [ "$uploaded" != "$expected" ]; then
-            echo "::error::Uploaded CodeSha256 $uploaded does not match the package ($expected)."
-            exit 1
-          fi
-          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-
-          # --code-sha256 refuses to publish if $LATEST changed in the meantime.
-          version=$(aws lambda publish-version --function-name "$FUNCTION_NAME" \
-            --code-sha256 "$expected" --description "main ${GITHUB_SHA:0:7} (run $GITHUB_RUN_ID)" \
-            --query Version --output text)
-          echo "published version $version"
-
-          smoke() {
-            local path=$1 payload function_error status
-            payload=$(jq -cn --arg p "$path" '{version:"2.0",routeKey:"$default",rawPath:$p,rawQueryString:"",
-              headers:{host:"smoke"},isBase64Encoded:false,
-              requestContext:{http:{method:"GET",path:$p,protocol:"HTTP/1.1",sourceIp:"127.0.0.1",userAgent:"smoke"},stage:"$default"}}')
-            function_error=$(aws lambda invoke --function-name "$FUNCTION_NAME" --qualifier "$version" \
-              --cli-binary-format raw-in-base64-out --payload "$payload" \
-              --query FunctionError --output text smoke.json)
-            status=$(jq -r '.statusCode // "none"' smoke.json)
-            echo "version $version: GET $path -> $status"
-            [ "$function_error" = "None" ] && [ "$status" = "200" ]
-          }
-          for path in /api/health /api/public/businesses; do
-            if ! smoke "$path"; then
-              echo "::error::Version $version failed GET $path. live stays on version $previous."
-              exit 1
-            fi
-          done
-
-          if [ "$version" != "$previous" ]; then
-            aws lambda update-alias --function-name "$FUNCTION_NAME" --name live \
-              --function-version "$version" --query FunctionVersion --output text > /dev/null
-          fi
-          echo "live -> version $version"
-
-          healthy=false
-          for attempt in 1 2 3 4 5 6; do
-            if curl -fsS --max-time 20 -o /dev/null "$API_URL/api/health"; then healthy=true; break; fi
-            sleep 10
-          done
-          if [ "$healthy" != true ]; then
-            echo "::error::The public API failed its health check. Moving live back to version $previous."
-            aws lambda update-alias --function-name "$FUNCTION_NAME" --name live \
-              --function-version "$previous" --query FunctionVersion --output text > /dev/null
-            exit 1
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "previous=$previous" >> "$GITHUB_OUTPUT"
-
-      - name: Deploy the live-pitch server (Render)
-        shell: bash
+        run: bash scripts/release-lambda.sh alias "$FUNCTION_NAME" "$API_URL"
+      - name: Deploy the PROD live-pitch server (Render)
         env:
-          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+          RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_PROD_DEPLOY_HOOK }}
         run: |
-          set -euo pipefail
-          if [ -z "${RENDER_DEPLOY_HOOK_URL:-}" ]; then
-            echo "::warning::RENDER_DEPLOY_HOOK_URL is not set, so Render was not deployed. Deploy it by hand."
+          if [ -z "${RENDER_DEPLOY_HOOK:-}" ]; then
+            echo "::warning::RENDER_PROD_DEPLOY_HOOK is not set, so the PROD Render service was not deployed. Deploy it by hand."
             exit 0
           fi
-          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK_URL}&ref=${GITHUB_SHA}"
-          echo "Render deploy of ${GITHUB_SHA:0:7} requested"
-
+          curl -fsS -X POST -o /dev/null "${RENDER_DEPLOY_HOOK}&ref=${GITHUB_SHA}"
+          echo "PROD Render deploy of ${GITHUB_SHA:0:7} requested"
       - name: Release summary
-        shell: bash
         env:
           VERSION: ${{ steps.lambda.outputs.version }}
           PREVIOUS: ${{ steps.lambda.outputs.previous }}
         run: |
           {
-            echo "### Released ${GITHUB_SHA:0:7}"
-            echo "- API (Lambda \`$FUNCTION_NAME\`): \`live\` is on version **$VERSION** (was $PREVIOUS)."
-            echo "- Live-pitch server (Render): deploy requested; it is live a few minutes later."
-            echo "- To undo the API: **Actions → Roll back API → Run workflow**, version **$PREVIOUS**."
+            echo "### PROD released ${GITHUB_SHA:0:7}"
+            echo "- API: \`$FUNCTION_NAME\` alias \`live\` is on version **$VERSION** (was $PREVIOUS)."
+            echo "- Live-pitch server: Render PROD deploy requested; it is live a few minutes later."
+            echo "- To undo the API: **Actions → Roll back API → Run workflow** on \`main\`, version **$PREVIOUS**."
           } >> "$GITHUB_STEP_SUMMARY"

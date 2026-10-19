@@ -1,7 +1,8 @@
 name: Roll back API
 
-# Points the production `live` alias at an earlier Lambda version, without a
-# rebuild. Every "Deploy API" run summary names the version it replaced.
+# Points the PROD `live` alias at an earlier Lambda version, without a
+# rebuild. Every PROD "Deploy API" run summary names the version it replaced.
+# (DEV has no versions: fix forward by pushing a corrected commit to dev.)
 
 on:
   workflow_dispatch:
@@ -34,7 +35,7 @@ jobs:
       - name: Sign in to AWS (OIDC, no stored keys)
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           role-session-name: rollback-api-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
