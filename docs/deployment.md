@@ -79,6 +79,7 @@ The deploy role must carry **no other policy**. Broad grants such as `lambda:*`,
 
   Its execution role (`PitchNest-Dev-LambdaExecutionRole`) has an inline policy, `read-pitchnest-dev-parameters`, that allows `ssm:GetParameters` on `arn:aws:ssm:eu-west-2:639324724698:parameter/pitchnest/dev/*`.
 - `JWT_SECRET` must be at least 32 bytes, and the same value as the DEV Render service's `JWT_SECRET`.
+- DEV signs in with its **own Google OAuth client**, in a separate Google Cloud project (`552615115343-…`). Its publishing status is "Testing", so only listed test users can sign in. `/pitchnest/dev/GOOGLE_CLIENT_ID`, the DEV Render service and Vercel's Preview `VITE_GOOGLE_CLIENT_ID` must all hold that ID. PROD keeps its own client (`617825798877-…`).
 - The function's environment variables:
   - `NODE_ENV=development`, `PITCHNEST_ENV=dev`
   - `ALLOWED_ORIGIN`, `CLIENT_URL` and `APP_BASE_URL` set to the DEV website.
