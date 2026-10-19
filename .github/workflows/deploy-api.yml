@@ -43,10 +43,11 @@ jobs:
         run: npm ci
       - name: Type-check
         run: npm run lint
-      - name: Check the release script
+      - name: Check the release scripts
         run: |
           bash -n scripts/release-lambda.sh
-          shellcheck --severity=warning scripts/release-lambda.sh
+          bash -n scripts/explain-aws-signin.sh
+          shellcheck --severity=warning scripts/release-lambda.sh scripts/explain-aws-signin.sh
       - name: Run application and security tests
         # Placeholders only: the tests stub every external service, and the
         # .invalid hosts guarantee nothing real can be reached.
@@ -113,12 +114,18 @@ jobs:
           name: lambda-package
           path: dist
       - name: Sign in to the DEV account (OIDC, no stored keys)
+        id: signin
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_DEV_ROLE_ARN }}
           role-session-name: deploy-api-dev-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
+      - name: Explain a refused AWS sign-in
+        if: failure() && steps.signin.outcome == 'failure'
+        env:
+          ROLE: ${{ secrets.AWS_DEV_ROLE_ARN }}
+        run: bash scripts/explain-aws-signin.sh
       - name: Update and smoke-test the DEV function
         run: bash scripts/release-lambda.sh latest "$FUNCTION_NAME" "$API_URL"
       - name: Deploy the DEV live-pitch server (Render)
@@ -163,12 +170,18 @@ jobs:
           name: lambda-package
           path: dist
       - name: Sign in to the PROD account (OIDC, no stored keys)
+        id: signin
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_PROD_ROLE_ARN }}
           role-session-name: deploy-api-prod-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
           mask-aws-account-id: true
+      - name: Explain a refused AWS sign-in
+        if: failure() && steps.signin.outcome == 'failure'
+        env:
+          ROLE: ${{ secrets.AWS_PROD_ROLE_ARN }}
+        run: bash scripts/explain-aws-signin.sh
       - name: Publish, smoke-test and promote the PROD version
         id: lambda
         run: bash scripts/release-lambda.sh alias "$FUNCTION_NAME" "$API_URL"
