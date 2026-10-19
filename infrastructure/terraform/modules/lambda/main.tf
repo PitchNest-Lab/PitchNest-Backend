@@ -21,8 +21,8 @@ resource "aws_lambda_function" "this" {
   lifecycle {
     ignore_changes = [
       environment,
-       filename,
-       source_code_hash,
+      filename,
+      source_code_hash,
     ]
   }
 }

@@ -3,7 +3,7 @@
 - **Account:** `415081251151` (PROD). DEV is `639324724698` and is **not** managed here.
 - **Region:** `eu-west-2`
 - **CLI profile:** `pitchnest-prod`
-- **Status:** prepared and statically validated. **Not applied.** Applying it creates no production traffic path: the frontend keeps its current REST target until a separate, approved cutover.
+- **Status:** live since 18 October 2026. The frontend routes production REST traffic here; Lambda alias `live` pointed to version 4 at that release, with version 3 retained as the rollback. Treat version numbers as release records, not permanent configuration.
 
 ## What this creates
 
@@ -12,11 +12,11 @@
 | `aws_iam_role` `pitchnest-prod-api-execution` + inline policy | **Owned**, least-privilege execution role: write to its own log group; `ssm:GetParameters` on the exact `/pitchnest/prod/<NAME>` ARNs; optional `kms:Decrypt` restricted to SSM (`kms:ViaService`) |
 | `aws_cloudwatch_log_group` `/aws/lambda/pitchnest-prod-api` | Function logs: JSON format, 90-day retention |
 | `aws_lambda_function` `pitchnest-prod-api` | nodejs22.x, 512 MB, 30 s, `publish = true`. Created with a **placeholder** that answers 503 |
-| `aws_lambda_alias` `live` | The only thing API Gateway invokes. The pipeline moves it on release; operators move it back to roll back |
-| `aws_apigatewayv2_*` `pitchnest-prod-api` | HTTP API with `$default` route → **alias** integration (not `$LATEST`); stage throttling (50 rps, burst 100); structured JSON access logs. **The default execute-api endpoint is disabled until release** (`api_public_endpoint_enabled = false`) |
+| `aws_lambda_alias` `live` | The only thing API Gateway invokes. A reviewed manual release moves it; operators move it back to roll back |
+| `aws_apigatewayv2_*` `pitchnest-prod-api` | HTTP API with `$default` route → **alias** integration (not `$LATEST`); stage throttling (50 rps, burst 100); structured JSON access logs. The public endpoint is enabled for the live service; setting `api_public_endpoint_enabled = false` is an emergency shutdown. |
 | `aws_cloudwatch_log_group` `/aws/apigateway/pitchnest-prod-api/access` | Access logs: 90-day retention. No headers, query strings or bodies, so tokens never reach the log |
 | `aws_sns_topic` `pitchnest-prod-api-alarms` + `aws_sns_topic_policy` + optional email subscriptions | Alarm notifications. **No SSE**: `alias/aws/sns` can't be used, because CloudWatch can't use the AWS-managed SNS key. Protected by a topic policy: only this account's `pitchnest-prod-api-*` alarms may publish; TLS required; administration delegated to the account's IAM |
-| 5 × `aws_cloudwatch_metric_alarm` | Lambda Errors, Throttles and p95 Duration (alias-level); API 5xx (threshold `api_5xx_threshold`, default 20 per 5 min) and p95 Latency. They **evaluate from day one**; **notifications are off until release** (`alarm_notifications_enabled = false`) |
+| 5 × `aws_cloudwatch_metric_alarm` | Lambda Errors, Throttles and p95 Duration (alias-level); API 5xx (threshold `api_5xx_threshold`, default 20 per 5 min) and p95 Latency. They evaluate continuously. The repository default leaves notification actions off; confirm subscriptions and delivery before turning them on. |
 
 Not created here, by design:
 - **The state bucket.** It's a prerequisite (below).
@@ -29,12 +29,12 @@ Not created here, by design:
 | Owner | Owns |
 |---|---|
 | Terraform | Infrastructure and **non-secret** configuration: `NODE_ENV=production`, `PITCHNEST_ENV=prod`, `CLIENT_URL`, `ALLOWED_ORIGIN`, `APP_BASE_URL`, plus `extra_environment_variables`. A validation rule rejects secret-looking variable names |
-| Pipeline | **Code**: upload a reviewed artifact, publish a version, smoke-test it, move `live`. Terraform ignores the code fields and the alias pointer after creation |
+| Release operator | **Code**: upload a reviewed artifact, publish a version, smoke-test it, move `live`. Terraform ignores the code fields and the alias pointer after creation |
 | Operators | **Secret values** in SSM (`/pitchnest/prod/*`), and rollbacks |
 
-**A Terraform configuration change publishes a new version but does not move `live`.** It only reaches users when the pipeline (or an operator) moves the alias. That's intentional: there are no silent production changes.
+**A Terraform configuration change publishes a new version but does not move `live`.** It only reaches users when an operator moves the alias. That's intentional: there are no silent code releases.
 
-## Prerequisites (before the first `terraform init`)
+## Infrastructure prerequisites and invariants
 
 ### 1. State bucket requirements (PROD account)
 
@@ -104,16 +104,17 @@ terraform apply prod.tfplan
 ```
 
 After the apply:
-1. `curl $(terraform output -raw api_endpoint)/api/health` should **fail**: the default endpoint is disabled until release. A `403`/`404` or a connection error is expected.
-2. Confirm the SNS email subscriptions, if any were configured.
+1. `curl $(terraform output -raw api_endpoint)/api/health` should return a small `status: ok` response.
+2. Confirm the alias still points to the intended immutable version; an infrastructure apply must not move it.
+3. Confirm the SNS email subscriptions, if any were configured.
 
-## Pre-release safeguards, and how to lift them at release
+## Live-service safeguards
 
-| Safeguard (default) | Effect before release | Lift at release |
-|---|---|---|
-| `api_public_endpoint_enabled = false` | The default execute-api endpoint is disabled; not even the 503 placeholder is public | After the first release passes the qualified-version smoke test and `live` has been moved: set `true`, then plan and apply (reviewed) |
-| `alarm_notifications_enabled = false` | Alarms evaluate and keep state history; no notifications are sent | Set `true` in the same reviewed change |
-| 503 placeholder on the `live` alias | Every request would get 503 even if the endpoint were enabled | Replaced by the pipeline moving `live` to a reviewed version |
+| Safeguard | Current repository posture |
+|---|---|
+| `api_public_endpoint_enabled = true` | Matches the live REST API. Changing it to false is an emergency shutdown, not a pre-release default. |
+| `alarm_notifications_enabled = false` | Alarms retain state, but notification delivery is not assumed. Confirm the SNS subscriptions and test delivery before enabling actions. |
+| Bootstrap placeholder | Used only when Terraform must recreate the function. API Gateway invokes `live`, and releases move that alias only after a qualified-version smoke test. |
 
 Disabling or enabling the default endpoint can need a fresh stage deployment before it takes effect. Verify with `curl`; if needed run `aws apigatewayv2 create-deployment --api-id <id> --stage-name '$default'`.
 

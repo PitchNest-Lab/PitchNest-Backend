@@ -1,9 +1,9 @@
 import { WebSocket, WebSocketServer } from "ws";
 import type { IncomingMessage } from "http";
-import { isIP } from "node:net";
 import { supabase } from "../config/supabase.ts";
 import { config, hasAzureTtsConfig, hasOpenAiConfig } from "../config/env.ts";
 import { verifyAccessToken } from "../utils/accessToken.ts";
+import { resolveClientIp } from "../utils/clientIp.ts";
 import {
   evaluatePitch,
   hasSubstantivePitch,
@@ -603,6 +603,7 @@ const MAX_FOUNDER_MESSAGE_CHARS = 8_000;
 const MAX_TRANSCRIPT_ENTRIES = 1_000;
 const MAX_TRANSCRIPT_CHARS = 500_000;
 const CLIENT_READY_TIMEOUT_MS = 15_000;
+const PRINCIPAL_RECHECK_MS = config.nodeEnv === "test" ? 100 : 30_000;
 const activeWsByUser = new Map<number, Set<WebSocket>>();
 const activeWsByIp = new Map<string, Set<WebSocket>>();
 
@@ -666,16 +667,14 @@ function untrackUserWs(userId: number, ws: WebSocket) {
 export function initRestSocket(wss: WebSocketServer) {
   wss.on("connection", async (ws, req: IncomingMessage) => {
     // Render terminates TLS in front of the service, so remoteAddress is the
-    // proxy for every browser. Trust the first forwarded address only in
-    // production (where the app is always behind that configured proxy), and
-    // validate it before using it as a connection-limit key.
-    const forwardedIp = String(req.headers["x-forwarded-for"] || "")
-      .split(",")[0]
-      .trim();
-    const remoteIp =
-      config.nodeEnv === "production" && isIP(forwardedIp)
-        ? forwardedIp
-        : req.socket.remoteAddress || "unknown";
+    // proxy for every browser. With exactly one trusted proxy, only the
+    // right-most forwarded hop was observed by infrastructure; the first hop
+    // may have been supplied by the browser and must not key connection limits.
+    const remoteIp = resolveClientIp(
+      req.headers["x-forwarded-for"],
+      req.socket.remoteAddress,
+      config.nodeEnv === "production",
+    );
     const activeForIp = activeWsByIp.get(remoteIp) ?? new Set<WebSocket>();
     if (wss.clients.size >= MAX_TOTAL_WS || activeForIp.size >= MAX_WS_PER_IP) {
       sendJson(ws, {
@@ -749,7 +748,7 @@ export function initRestSocket(wss: WebSocketServer) {
     // (a refresh mid-pitch) arrives before this lookup returns and must not be
     // dropped.
     const principalUserId = authenticatedUserId;
-    const principalCheck: Promise<boolean> = (async () => {
+    const validatePrincipal = async (): Promise<boolean> => {
       try {
         const { data: authUser, error: authUserError } = await supabase
           .from("users")
@@ -771,7 +770,22 @@ export function initRestSocket(wss: WebSocketServer) {
         ws.close(4001, "Authentication failed");
         return false;
       }
-    })();
+    };
+    let principalCheckInFlight = true;
+    let principalCheck: Promise<boolean> = validatePrincipal().finally(() => {
+      principalCheckInFlight = false;
+    });
+    // Lambda logout/reset requests and Render WebSockets are separate
+    // processes. Re-check the durable auth version so revocation reaches an
+    // already-open live pitch without relying on process-local socket maps.
+    const principalRecheckInterval = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN || principalCheckInFlight) return;
+      principalCheckInFlight = true;
+      principalCheck = validatePrincipal().finally(() => {
+        principalCheckInFlight = false;
+      });
+    }, PRINCIPAL_RECHECK_MS);
+    principalRecheckInterval.unref?.();
 
     // ── Session admission ───────────────────────────────────────────────────
     // A connection is admitted only once client_ready has passed every gate
@@ -1119,6 +1133,7 @@ export function initRestSocket(wss: WebSocketServer) {
     ws.on("close", () => {
       console.log("🔌 Client disconnected.");
       clearTimeout(clientReadyTimer);
+      clearInterval(principalRecheckInterval);
       if (authenticatedUserId) {
         untrackUserWs(authenticatedUserId, ws);
         // Keep the grant for a reconnect, but free it from this socket.
@@ -3143,6 +3158,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
           sessionId = 0;
           let shareId = crypto.randomUUID();
+          let sessionPersisted = false;
           try {
             // Position in the pitch chain, resolved from the claim made at
             // client_ready — never from anything the client sent with
@@ -3179,6 +3195,7 @@ export function initRestSocket(wss: WebSocketServer) {
 
             if (!dbError && dbData) {
               sessionId = dbData.id;
+              sessionPersisted = true;
               if (dbData.share_id) shareId = dbData.share_id;
 
               // Cross-session founder memory: fold THIS session into the profile
@@ -3284,8 +3301,13 @@ export function initRestSocket(wss: WebSocketServer) {
                       `❌ Background PDF generation failed for session ${dbData.id}:`,
                       err,
                     );
-                  });
+                });
               }
+            } else {
+              console.error(
+                "❌ Failed to save session to Supabase:",
+                dbError?.message || "insert returned no row",
+              );
             }
           } catch (dbErr) {
             console.error("❌ Failed to save session to Supabase:", dbErr);
@@ -3307,7 +3329,8 @@ export function initRestSocket(wss: WebSocketServer) {
             type: "report",
             data: reportData,
             sessionId,
-            shareId,
+            shareId: sessionPersisted ? shareId : null,
+            persisted: sessionPersisted,
           });
         }
       } catch (error) {

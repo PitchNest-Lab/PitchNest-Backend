@@ -34,6 +34,14 @@ variable "extra_environment_variables" {
     ])) == 0
     error_message = "extra_environment_variables must not override managed keys (NODE_ENV, PITCHNEST_ENV, URLs, Azure API version, pricing, BILLING_CHECKOUT_ENABLED)."
   }
+
+  validation {
+    condition = alltrue([
+      for name in keys(var.extra_environment_variables) :
+      length(regexall("(?i)(secret|password|token|credential|api[_-]?key|private[_-]?key|webhook[_-]?hash)", name)) == 0
+    ])
+    error_message = "extra_environment_variables must contain non-secret settings only. Put credentials in SSM so they do not enter Terraform state."
+  }
 }
 
 variable "azure_openai_api_version" {
@@ -122,21 +130,19 @@ variable "log_retention_days" {
 
 variable "api_public_endpoint_enabled" {
   description = <<-EOT
-    Enable the public execute-api endpoint. Keep FALSE until the first reviewed
-    release has passed qualified-version smoke tests (aws lambda invoke
-    --qualifier <VERSION>) and the live alias has been moved. While false, the
-    default endpoint is disabled entirely, so not even the 503 placeholder is
-    publicly reachable.
+    Enable the public execute-api endpoint. Production has been live since
+    2026-10-18, so TRUE is the desired state. Setting this false is an emergency
+    shutdown that makes the API unreachable and requires explicit approval.
   EOT
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "alarm_notifications_enabled" {
   description = <<-EOT
-    Send alarm/OK notifications to the SNS topic. Keep FALSE until release:
-    alarms still evaluate and record state history, but nobody is paged by
-    pre-release noise.
+    Send alarm/OK notifications to the SNS topic. Keep FALSE until every
+    subscription is confirmed and a deliberate alarm-state test proves that
+    delivery works; alarms still evaluate and retain history while disabled.
   EOT
   type        = bool
   default     = false

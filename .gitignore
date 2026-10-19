@@ -8,6 +8,10 @@ coverage/
 !.env.example
 Docs
 
+# Local-only waitlist fallbacks contain email addresses and survey responses.
+waitlist.json
+survey-responses.json
+
 # Terraform local files and sensitive artifacts
 **/.terraform/
 **/*.tfstate

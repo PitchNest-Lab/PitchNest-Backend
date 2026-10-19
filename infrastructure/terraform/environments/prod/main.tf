@@ -1,8 +1,8 @@
 # PitchNest PROD REST API: Lambda (alias "live") behind an HTTP API.
 #
-# Nothing here routes production traffic: the frontend keeps its current REST
-# target until a separate, approved cutover. Until the pipeline deploys a
-# reviewed release, the function serves a placeholder that answers 503.
+# Production is live. API Gateway routes to the immutable Lambda alias `live`;
+# the bootstrap package below is used only if the function must be recreated.
+# Code releases remain a separate, explicitly approved alias move.
 
 data "aws_caller_identity" "current" {}
 
@@ -84,7 +84,8 @@ module "api_gateway" {
 
   integration_timeout_ms = 30000
 
-  # Default endpoint stays OFF until release (explicit variable, default false).
+  # Production is already released. Setting this false is an emergency endpoint
+  # shutdown and must be an explicit reviewed Terraform change.
   disable_execute_api_endpoint = !var.api_public_endpoint_enabled
 
   throttling_rate_limit     = var.throttling_rate_limit
@@ -103,7 +104,8 @@ module "observability" {
   api_stage              = module.api_gateway.stage_name
   alarm_email_endpoints  = var.alarm_email_endpoints
 
-  # Alarms evaluate from day one; notifications start at release.
+  # Alarms evaluate continuously; notification actions remain an explicit,
+  # separately tested opt-in.
   alarm_actions_enabled = var.alarm_notifications_enabled
   api_5xx_threshold     = var.api_5xx_threshold
 

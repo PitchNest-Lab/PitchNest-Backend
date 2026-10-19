@@ -49,6 +49,7 @@ const UNVERIFIED = { id: 62, email: "unverified@x.test" };
 const LEGIT = { id: 64, email: "legit@x.test" };
 const RACER = { id: 65, email: "racer@x.test" };
 const DELETED_ID = 66;
+const REVOKED = { id: 67, email: "revoked@x.test" };
 
 const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 db.seed("users", [
@@ -56,6 +57,7 @@ db.seed("users", [
   { ...UNVERIFIED, ...FREE, isEmailVerified: false },
   { ...LEGIT, ...FREE, isEmailVerified: true },
   { ...RACER, ...FREE, isEmailVerified: true },
+  { ...REVOKED, ...FREE, isEmailVerified: true },
 ]);
 db.seed(
   "session_starts",
@@ -181,6 +183,23 @@ try {
     c.send(END);
     assert.equal(await c.closed, 4001);
     assert.equal(rowsFor(DELETED_ID), 0);
+  }
+
+  // Lambda logout/reset increments the durable auth version in a different
+  // process. An already-open Render socket must observe that change and close.
+  {
+    const c = await connect(tokenFor(REVOKED.id));
+    await settle(250);
+    const row = db.rows("users").find((user) => user.id === REVOKED.id);
+    assert.ok(row, "revocation test user exists");
+    row.auth_version += 1;
+    const closeCode = await Promise.race([
+      c.closed,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("revoked socket stayed open")), 2_000),
+      ),
+    ]);
+    assert.equal(closeCode, 4001);
   }
 
   // Positive control: an admitted founder gets exactly one report and one slot,
