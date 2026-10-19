@@ -34,16 +34,18 @@ AWS access uses GitHub OIDC; no AWS keys are stored anywhere. The DEV role trust
 
 ## One-time setup
 ### AWS: in each account
-Do this once in DEV (`639324724698`, branch `dev`, function `pitchnest-dev-api`) and once in PROD (`415081251151`, branch `main`, function `pitchnest-prod-api`).
+Each account needs:
+- the GitHub OIDC identity provider: `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`
+- one deploy role, as follows:
 
-1. **IAM → Identity providers → Add provider:** OpenID Connect, URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
-2. **IAM → Roles → Create role → Web identity:**
-   - provider `token.actions.githubusercontent.com`, audience `sts.amazonaws.com`
-   - organization `PitchNest-Lab`, repository `PitchNest-Backend`, branch `dev` or `main`
-   - no managed policies
-   - name it `pitchnest-dev-api-deploy` or `pitchnest-prod-api-deploy`
+| Account | Role | Trusted branch | Function |
+|---|---|---|---|
+| DEV `639324724698` | `PitchNest-Dev-GitHubActionsRole` (the existing role, reduced to the policy below) | `dev` | `pitchnest-dev-api` |
+| PROD `415081251151` | `pitchnest-prod-api-deploy` | `main` | `pitchnest-prod-api` |
 
-   Its trust policy must end up as:
+The deploy role must carry **no other policy**. Broad grants such as `lambda:*`, `secretsmanager:*` or `cloudformation:*` would let any workflow on the trusted branch take over the account.
+
+1. **The role's trust policy** must be exactly:
    ```json
    {
      "Version": "2012-10-17",
@@ -52,30 +54,19 @@ Do this once in DEV (`639324724698`, branch `dev`, function `pitchnest-dev-api`)
        "Principal": { "Federated": "arn:aws:iam::<ACCOUNT>:oidc-provider/token.actions.githubusercontent.com" },
        "Action": "sts:AssumeRoleWithWebIdentity",
        "Condition": {
-         "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-         "StringLike": { "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab/PitchNest-Backend:ref:refs/heads/<BRANCH>" }
+         "StringEquals": {
+           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+           "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab/PitchNest-Backend:ref:refs/heads/<BRANCH>"
+         }
        }
      }]
    }
    ```
-3. **Inline policy** on the role:
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Effect": "Allow",
-       "Action": [
-         "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode",
-         "lambda:PublishVersion", "lambda:InvokeFunction", "lambda:GetAlias", "lambda:UpdateAlias"
-       ],
-       "Resource": [
-         "arn:aws:lambda:eu-west-2:<ACCOUNT>:function:<FUNCTION>",
-         "arn:aws:lambda:eu-west-2:<ACCOUNT>:function:<FUNCTION>:*"
-       ]
-     }]
-   }
-   ```
-   It can only ship code to that one function and move its alias.
+2. **Its only permissions** are one inline policy:
+   - **DEV** (`deploy-pitchnest-dev-api`): `lambda:GetFunction`, `lambda:GetFunctionConfiguration`, `lambda:UpdateFunctionCode` and `lambda:InvokeFunction`.
+   - **PROD** (`deploy-pitchnest-prod-api`): those four, plus `lambda:PublishVersion`, `lambda:GetAlias` and `lambda:UpdateAlias`.
+
+   In both, `Resource` is the function's ARN and the same ARN followed by `:*`.
 
 **DEV only:**
 - The DEV function reads nine secrets from `/pitchnest/dev/`:
@@ -85,7 +76,7 @@ Do this once in DEV (`639324724698`, branch `dev`, function `pitchnest-dev-api`)
   - `GOOGLE_CLIENT_ID`
   - `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_DEPLOYMENT`
 
-  Its execution role (`PitchNest-Dev-LambdaExecutionRole`) must be allowed `ssm:GetParameters` on all nine.
+  Its execution role (`PitchNest-Dev-LambdaExecutionRole`) has an inline policy, `read-pitchnest-dev-parameters`, that allows `ssm:GetParameters` on `arn:aws:ssm:eu-west-2:639324724698:parameter/pitchnest/dev/*`.
 - `JWT_SECRET` must be at least 32 bytes, and the same value as the DEV Render service's `JWT_SECRET`.
 - The function's environment variables:
   - `NODE_ENV=development`, `PITCHNEST_ENV=dev`
@@ -99,7 +90,7 @@ Do this once in DEV (`639324724698`, branch `dev`, function `pitchnest-dev-api`)
 ### GitHub (this repository → Settings → Secrets and variables → Actions)
 | Secret | Value |
 |---|---|
-| `AWS_DEV_ROLE_ARN` | `arn:aws:iam::639324724698:role/pitchnest-dev-api-deploy` |
+| `AWS_DEV_ROLE_ARN` | `arn:aws:iam::639324724698:role/PitchNest-Dev-GitHubActionsRole` |
 | `AWS_PROD_ROLE_ARN` | `arn:aws:iam::415081251151:role/pitchnest-prod-api-deploy` |
 | `RENDER_DEV_DEPLOY_HOOK` | the DEV service's deploy hook |
 | `RENDER_PROD_DEPLOY_HOOK` | the PROD service's deploy hook |
