@@ -1,0 +1,57 @@
+name: Roll back API
+
+# Points the production `live` alias at an earlier Lambda version, without a
+# rebuild. Every "Deploy API" run summary names the version it replaced.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Lambda version to put live (a number, e.g. 4)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-prod-api
+  cancel-in-progress: false
+
+env:
+  FUNCTION_NAME: pitchnest-prod-api
+  AWS_REGION: eu-west-2
+  API_URL: https://mkrkiditq5.execute-api.eu-west-2.amazonaws.com
+
+jobs:
+  rollback:
+    name: Move live to an earlier version
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Sign in to AWS (OIDC, no stored keys)
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: rollback-api-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+          mask-aws-account-id: true
+
+      - name: Move live
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$VERSION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Version must be a whole number, such as 4."
+            exit 1
+          fi
+          previous=$(aws lambda get-alias --function-name "$FUNCTION_NAME" --name live \
+            --query FunctionVersion --output text)
+          aws lambda update-alias --function-name "$FUNCTION_NAME" --name live \
+            --function-version "$VERSION" --query FunctionVersion --output text > /dev/null
+          curl -fsS --retry 5 --retry-all-errors --max-time 20 -o /dev/null "$API_URL/api/health"
+          echo "live: version $previous -> $VERSION" | tee -a "$GITHUB_STEP_SUMMARY"
