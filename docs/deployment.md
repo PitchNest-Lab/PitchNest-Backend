@@ -56,12 +56,13 @@ The deploy role must carry **no other policy**. Broad grants such as `lambda:*`,
        "Condition": {
          "StringEquals": {
            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-           "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab/PitchNest-Backend:ref:refs/heads/<BRANCH>"
+           "token.actions.githubusercontent.com:sub": "repo:PitchNest-Lab@288660191/PitchNest-Backend@1384711444:ref:refs/heads/<BRANCH>"
          }
        }
      }]
    }
    ```
+   GitHub identifies this repository by its owner and repository IDs (`@288660191`, `@1384711444`). The IAM console's GitHub fields generate the older `repo:PitchNest-Lab/PitchNest-Backend:…` form, which AWS refuses, so create the role with **Custom trust policy** and paste the JSON above. If a sign-in is ever refused, the run's **Explain a refused AWS sign-in** annotations show the exact `sub` that GitHub presented.
 2. **Its only permissions** are one inline policy:
    - **DEV** (`deploy-pitchnest-dev-api`): `lambda:GetFunction`, `lambda:GetFunctionConfiguration`, `lambda:UpdateFunctionCode` and `lambda:InvokeFunction`.
    - **PROD** (`deploy-pitchnest-prod-api`): those four, plus `lambda:PublishVersion`, `lambda:GetAlias` and `lambda:UpdateAlias`.
