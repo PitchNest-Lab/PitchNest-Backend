@@ -332,12 +332,19 @@ export const attachSessionRecording = async (req: Request, res: Response) => {
       return res.status(409).json({ error: "This session already has a recording" });
     }
 
-    const { data: updated, error: updateError } = await supabase
+    // Older sessions store "" rather than NULL for "no recording yet". Update
+    // only if the value is still the one read above, so concurrent attaches
+    // cannot both succeed.
+    const attach = supabase
       .from("sessions")
       .update({ video_url: recording })
       .eq("id", session.id)
-      .eq("user_id", userId)
-      .is("video_url", null)
+      .eq("user_id", userId);
+    const { data: updated, error: updateError } = await (
+      typeof session.video_url === "string"
+        ? attach.eq("video_url", session.video_url)
+        : attach.is("video_url", null)
+    )
       .select("id")
       .maybeSingle();
     if (updateError || !updated) {

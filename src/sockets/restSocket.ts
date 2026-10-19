@@ -3179,7 +3179,8 @@ export function initRestSocket(wss: WebSocketServer) {
               business_name: currentBusinessName,
               summary: reportData.summary,
               evaluation_report: reportData,
-              video_url: currentVideoUrl,
+              // NULL until the recording is attached after the report.
+              video_url: currentVideoUrl || null,
               share_id: shareId,
               mode: sessionMode,
               pitch_config: pitchConfigSnapshot,

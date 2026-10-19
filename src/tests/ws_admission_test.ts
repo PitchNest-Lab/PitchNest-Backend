@@ -241,6 +241,8 @@ try {
     await settle(800);
     assert.equal(c.messages.filter((m) => m.type === "report").length, 1);
     assert.equal(rowsFor(LEGIT.id), 1);
+    // The recording is attached after the report, so the row starts with none.
+    assert.equal(db.rows("sessions").find((r) => r.user_id === LEGIT.id)?.video_url, null);
     assert.equal(startsFor(LEGIT.id), 1);
     c.ws.terminate();
   }

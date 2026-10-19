@@ -148,6 +148,36 @@ test("H6: a local-file token cannot read another user's rec_ file via a poisoned
   }
 });
 
+test("the owner's recording attaches to a session saved without one (NULL or empty)", async () => {
+  for (const [id, unset] of [[810, null], [811, ""]] as const) {
+    const recording = `pitches/${ATTACKER.id}/1700000000007_session${id}.webm`;
+    db.rows("sessions").push({ id, user_id: ATTACKER.id, video_url: unset });
+    const r = await call(base, "PUT", `/api/sessions/${id}/recording`, {
+      token: attackerToken,
+      body: { recording },
+    });
+    assert.equal(r.status, 200, `session ${id} (${JSON.stringify(unset)}) → ${r.status}`);
+    assert.equal(db.rows("sessions").find((s) => s.id === id)?.video_url, recording);
+  }
+  const removed = db.storageCalls.filter((c) => c.op === "remove").flatMap((c) => c.paths);
+  assert.deepEqual(removed, [], "attached uploads are kept");
+});
+
+test("a session that already has a recording keeps it and refuses another", async () => {
+  const extra = `pitches/${ATTACKER.id}/1700000000009_extra.webm`;
+  const r = await call(base, "PUT", "/api/sessions/806/recording", {
+    token: attackerToken,
+    body: { recording: extra },
+  });
+  assert.equal(r.status, 409);
+  assert.equal(
+    db.rows("sessions").find((s) => s.id === 806)?.video_url,
+    `pitches/${ATTACKER.id}/1700000000003_mine.webm`,
+  );
+  const removed = db.storageCalls.filter((c) => c.op === "remove").flatMap((c) => c.paths);
+  assert.deepEqual(removed, [extra], "only the refused upload is removed");
+});
+
 test("H6: recording uploads are keyed under the uploader's own prefix", async () => {
   const form = new FormData();
   form.append("video", new Blob([new Uint8Array([0x1a, 0x45, 0xdf, 0xa3])], { type: "audio/webm" }), "../../decks/evil.webm");
