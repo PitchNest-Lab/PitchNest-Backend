@@ -40,7 +40,7 @@ record() {
 
 # smoke <qualifier> <path>: GET <path> through the handler of that exact version.
 smoke() {
-  local qualifier=$1 path=$2 payload function_error status
+  local qualifier=$1 path=$2 payload function_error status detail
   payload=$(jq -cn --arg p "$path" '{
     version: "2.0", routeKey: "$default", rawPath: $p, rawQueryString: "",
     headers: { host: "smoke" }, isBase64Encoded: false,
@@ -53,7 +53,14 @@ smoke() {
     --query FunctionError --output text smoke.json) || return 1
   status=$(jq -r '.statusCode // "none"' smoke.json 2>/dev/null || echo "unreadable")
   echo "$fn:$qualifier GET $path -> $status"
-  [ "$function_error" = "None" ] && [ "$status" = "200" ]
+  if [ "$function_error" = "None" ] && [ "$status" = "200" ]; then return 0; fi
+  # The app's own error text (startup checks name settings and parameter
+  # paths, never their values), so a failure is readable on the run page.
+  detail=$(jq -r '[.errorType, .errorMessage] | map(select(. != null)) | join(": ")' smoke.json 2>/dev/null)
+  if [ -z "$detail" ]; then detail=$(jq -r '.body // empty' smoke.json 2>/dev/null); fi
+  detail=$(printf '%s' "$detail" | tr '\r\n' '  ')
+  echo "::warning title=Smoke test GET $path::${detail:0:300}"
+  return 1
 }
 
 public_api_healthy() {
