@@ -748,41 +748,50 @@ export function initRestSocket(wss: WebSocketServer) {
     // (a refresh mid-pitch) arrives before this lookup returns and must not be
     // dropped.
     const principalUserId = authenticatedUserId;
-    const validatePrincipal = async (): Promise<boolean> => {
+    let principalRejected = false;
+    // A re-check (recheck = true) ends the session only on a definite answer:
+    // a revoked, deleted or unverified account. If the lookup itself fails, the
+    // socket stays open and the next interval tries again. The connect-time
+    // check still treats a failed lookup as a refusal.
+    const validatePrincipal = async (recheck = false): Promise<boolean> => {
+      let authUser: { isEmailVerified?: unknown; auth_version?: unknown } | null = null;
       try {
-        const { data: authUser, error: authUserError } = await supabase
+        const { data, error } = await supabase
           .from("users")
           .select("id, isEmailVerified, auth_version")
           .eq("id", principalUserId)
           .maybeSingle();
-        if (
-          authUserError ||
-          !authUser ||
-          authUser.isEmailVerified !== true ||
-          Number(authUser.auth_version ?? 0) !== authenticatedAuthVersion
-        ) {
-          sendJson(ws, { type: "error", message: "This session is no longer valid.", code: "AUTH_FAILED" });
-          ws.close(4001, "Authentication failed");
-          return false;
-        }
-        return true;
+        if (error) throw error;
+        authUser = data;
       } catch {
+        if (recheck) {
+          console.warn(`⚠️ WS sign-in re-check for user ${principalUserId} failed; retrying.`);
+          return true;
+        }
+      }
+      if (
+        !authUser ||
+        authUser.isEmailVerified !== true ||
+        Number(authUser.auth_version ?? 0) !== authenticatedAuthVersion
+      ) {
+        principalRejected = true;
+        sendJson(ws, { type: "error", message: "This session is no longer valid.", code: "AUTH_FAILED" });
         ws.close(4001, "Authentication failed");
         return false;
       }
+      return true;
     };
-    let principalCheckInFlight = true;
-    let principalCheck: Promise<boolean> = validatePrincipal().finally(() => {
-      principalCheckInFlight = false;
-    });
+    const principalCheck = validatePrincipal();
     // Lambda logout/reset requests and Render WebSockets are separate
     // processes. Re-check the durable auth version so revocation reaches an
     // already-open live pitch without relying on process-local socket maps.
+    // Re-checks run alongside the session: no message waits for one.
+    let principalRecheckInFlight = false;
     const principalRecheckInterval = setInterval(() => {
-      if (ws.readyState !== WebSocket.OPEN || principalCheckInFlight) return;
-      principalCheckInFlight = true;
-      principalCheck = validatePrincipal().finally(() => {
-        principalCheckInFlight = false;
+      if (ws.readyState !== WebSocket.OPEN || principalRecheckInFlight) return;
+      principalRecheckInFlight = true;
+      void validatePrincipal(true).finally(() => {
+        principalRecheckInFlight = false;
       });
     }, PRINCIPAL_RECHECK_MS);
     principalRecheckInterval.unref?.();
@@ -1886,7 +1895,7 @@ export function initRestSocket(wss: WebSocketServer) {
     };
 
     ws.on("message", async (message, isBinary) => {
-      if (!(await principalCheck)) return;
+      if (principalRejected || !(await principalCheck)) return;
       if (isBinary) {
         const byteLength = Array.isArray(message)
           ? message.reduce((total, chunk) => total + chunk.byteLength, 0)

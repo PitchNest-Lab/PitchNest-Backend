@@ -50,6 +50,7 @@ const LEGIT = { id: 64, email: "legit@x.test" };
 const RACER = { id: 65, email: "racer@x.test" };
 const DELETED_ID = 66;
 const REVOKED = { id: 67, email: "revoked@x.test" };
+const OUTAGE = { id: 68, email: "outage@x.test" };
 
 const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
 db.seed("users", [
@@ -58,6 +59,7 @@ db.seed("users", [
   { ...LEGIT, ...FREE, isEmailVerified: true },
   { ...RACER, ...FREE, isEmailVerified: true },
   { ...REVOKED, ...FREE, isEmailVerified: true },
+  { ...OUTAGE, ...FREE, isEmailVerified: true },
 ]);
 db.seed(
   "session_starts",
@@ -197,6 +199,30 @@ try {
       c.closed,
       new Promise<never>((_resolve, reject) =>
         setTimeout(() => reject(new Error("revoked socket stayed open")), 2_000),
+      ),
+    ]);
+    assert.equal(closeCode, 4001);
+  }
+
+  // A re-check that cannot reach the database must not end a live pitch. Only
+  // a definite answer (revoked, deleted or unverified) closes the socket.
+  {
+    const c = await connect(tokenFor(OUTAGE.id));
+    await settle(250);
+    db.failTables.add("users");
+    const duringOutage = await Promise.race([
+      c.closed.then((code) => `closed with ${code}`),
+      settle(600).then(() => "open"),
+    ]);
+    db.failTables.delete("users");
+    assert.equal(duringOutage, "open", "a failed re-check closed the live pitch");
+    const row = db.rows("users").find((user) => user.id === OUTAGE.id);
+    assert.ok(row, "outage test user exists");
+    row.auth_version += 1;
+    const closeCode = await Promise.race([
+      c.closed,
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error("revoked socket stayed open after the outage")), 2_000),
       ),
     ]);
     assert.equal(closeCode, 4001);
