@@ -12,9 +12,14 @@ const MAX_PAGE_SIZE = 24;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 type DirectoryCursor = {
+  /** Present when the list is ordered by support count (migration 0033). */
+  supportCount?: number;
   publishedAt: string;
   publicationId: string;
 };
+
+/** How a directory page is ordered; returned with every page. */
+export type DirectoryOrder = "most_supported" | "newest";
 
 export interface PublicBusinessSummary {
   slug: string;
@@ -117,11 +122,23 @@ export function decodeDirectoryCursor(value: string): DirectoryCursor | null {
     ) {
       return null;
     }
-    return { publishedAt: date.toISOString(), publicationId: parsed.publicationId };
+    const cursor: DirectoryCursor = { publishedAt: date.toISOString(), publicationId: parsed.publicationId };
+    if (parsed.supportCount !== undefined) {
+      if (!Number.isSafeInteger(parsed.supportCount) || parsed.supportCount < 0) return null;
+      cursor.supportCount = parsed.supportCount;
+    }
+    return cursor;
   } catch {
     return null;
   }
 }
+
+/** PostgREST answers PGRST202 for a function the database does not have. */
+function isMissingFunction(error: any): boolean {
+  return error?.code === "PGRST202" || error?.code === "42883";
+}
+
+let warnedNoSupportOrder = false;
 
 function queryText(value: unknown, maxLength: number): string {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
@@ -148,7 +165,7 @@ export async function listPublicBusinesses(req: Request, res: Response) {
   }
 
   try {
-    const { data, error } = await supabase.rpc("discover_public_businesses", {
+    const args = {
       p_query: q || null,
       p_industry: industry || null,
       p_business_type: businessType || null,
@@ -157,7 +174,31 @@ export async function listPublicBusinesses(req: Request, res: Response) {
       p_cursor_published_at: cursor?.publishedAt ?? null,
       p_cursor_publication_id: cursor?.publicationId ?? null,
       p_limit: limit + 1,
-    });
+    };
+    // Most supported first while Discover engagement is on. A cursor keeps the
+    // order of the page it came from, and a database without migration 0033
+    // lists newest first.
+    let order: DirectoryOrder = (cursor ? cursor.supportCount !== undefined : config.discoverEngagementEnabled)
+      ? "most_supported"
+      : "newest";
+    let result = order === "most_supported"
+      ? await supabase.rpc("discover_public_businesses_by_support", {
+          ...args,
+          p_cursor_support_count: cursor?.supportCount ?? null,
+        })
+      : null;
+    if (result?.error && isMissingFunction(result.error)) {
+      if (!warnedNoSupportOrder) {
+        warnedNoSupportOrder = true;
+        console.warn("Discover lists newest first: the database has no discover_public_businesses_by_support (migration 0033).");
+      }
+      result = null;
+    }
+    if (!result) {
+      order = "newest";
+      result = await supabase.rpc("discover_public_businesses", args);
+    }
+    const { data, error } = result;
     if (error) {
       console.error("Public business directory query failed:", error);
       return res.status(500).json({ error: "Failed to load businesses." });
@@ -181,6 +222,7 @@ export async function listPublicBusinesses(req: Request, res: Response) {
     const finalRow = hasMore ? page[page.length - 1] : null;
     const nextCursor = finalRow
       ? encodeDirectoryCursor({
+          ...(order === "most_supported" ? { supportCount: Number(finalRow.support_count) } : {}),
           publishedAt: new Date(finalRow.published_at).toISOString(),
           publicationId: finalRow.publication_id,
         })
@@ -200,6 +242,7 @@ export async function listPublicBusinesses(req: Request, res: Response) {
     return res.json({
       data: businesses,
       pagination: { nextCursor, hasMore },
+      order,
     });
   } catch (error) {
     console.error("Public business directory threw:", error);

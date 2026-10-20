@@ -118,12 +118,20 @@ const cursorInput = {
 };
 assert.deepEqual(decodeDirectoryCursor(encodeDirectoryCursor(cursorInput)), cursorInput);
 assert.equal(decodeDirectoryCursor("not-a-cursor"), null);
+// A most-supported cursor also carries the support count, a whole number.
+const supportCursor = { supportCount: 12, ...cursorInput };
+assert.deepEqual(decodeDirectoryCursor(encodeDirectoryCursor(supportCursor)), supportCursor);
+for (const supportCount of [-1, 1.5, "12", null]) {
+  assert.equal(decodeDirectoryCursor(encodeDirectoryCursor({ ...cursorInput, supportCount } as any)), null);
+}
 
 const mutableSupabase = supabase as any;
 const originalRpc = mutableSupabase.rpc;
 const originalEngagementFlag = config.discoverEngagementEnabled;
 (config as any).discoverEngagementEnabled = true;
 let recordedRpc: { name: string; args: any } | null = null;
+const directoryCalls: string[] = [];
+let bySupportResult: any = null;
 let engagementArgs: any = null;
 mutableSupabase.rpc = async (name: string, args: any) => {
   if (name === "public_business_engagement") {
@@ -144,17 +152,21 @@ mutableSupabase.rpc = async (name: string, args: any) => {
     };
   }
   recordedRpc = { name, args };
+  directoryCalls.push(name);
+  if (name === "discover_public_businesses_by_support" && bySupportResult) return bySupportResult;
   return {
     data: [
       {
         publication_id: "22222222-2222-4222-8222-222222222222",
         published_at: "2026-10-14T10:00:00.000Z",
         public_snapshot: privateSnapshot,
+        support_count: 12,
       },
       {
         publication_id: "33333333-3333-4333-8333-333333333333",
         published_at: "2026-10-13T10:00:00.000Z",
         public_snapshot: { ...privateSnapshot, slug: "second", name: "Second" },
+        support_count: 5,
       },
     ],
     error: null,
@@ -175,19 +187,80 @@ try {
     response,
   );
   assert.equal(response.statusCode, 200);
-  assert.equal(recordedRpc?.name, "discover_public_businesses");
+  // Discover engagement is on, so the most-supported list (migration 0033).
+  assert.equal(recordedRpc?.name, "discover_public_businesses_by_support");
+  assert.equal(recordedRpc?.args.p_cursor_support_count, null);
   assert.equal(recordedRpc?.args.p_query, "trade");
   assert.equal(recordedRpc?.args.p_business_type, "services");
   assert.equal(recordedRpc?.args.p_limit, 2);
+  assert.equal(response.body.order, "most_supported");
   assert.equal(response.body.data.length, 1);
   assert.equal(response.body.data[0].slug, "market-bridge");
   assert.equal(response.body.pagination.hasMore, true);
-  assert.ok(decodeDirectoryCursor(response.body.pagination.nextCursor));
+  assert.equal(decodeDirectoryCursor(response.body.pagination.nextCursor)?.supportCount, 12);
   // Counts ride along, looked up by the snapshot id, which is never emitted.
   assert.deepEqual(engagementArgs, { p_business_ids: [privateSnapshot.id], p_viewer_id: null });
   assert.deepEqual(response.body.data[0].engagement, { supportCount: 4, commentCount: 2 });
   assert.equal("id" in response.body.data[0], false);
   assert.equal(JSON.stringify(response.body).includes(privateSnapshot.id), false);
+
+  // The next page continues after all three sort keys of the last row.
+  await listPublicBusinesses(
+    { query: { cursor: response.body.pagination.nextCursor } } as unknown as Request,
+    responseRecorder(),
+  );
+  assert.equal(recordedRpc?.name, "discover_public_businesses_by_support");
+  assert.equal(recordedRpc?.args.p_cursor_support_count, 12);
+  assert.equal(recordedRpc?.args.p_cursor_published_at, "2026-10-14T10:00:00.000Z");
+  assert.equal(recordedRpc?.args.p_cursor_publication_id, "22222222-2222-4222-8222-222222222222");
+
+  // A newest-first cursor stays newest first.
+  const newestPage = responseRecorder();
+  await listPublicBusinesses(
+    { query: { cursor: encodeDirectoryCursor(cursorInput) } } as unknown as Request,
+    newestPage,
+  );
+  assert.equal(recordedRpc?.name, "discover_public_businesses");
+  assert.equal(newestPage.body.order, "newest");
+
+  // A database without 0033 lists newest first and says so once in the log.
+  const warnings: unknown[] = [];
+  const originalWarn = console.warn;
+  const originalError = console.error;
+  console.warn = (...parts: unknown[]) => void warnings.push(parts);
+  try {
+    bySupportResult = { data: null, error: { code: "PGRST202", message: "Could not find the function" } };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      directoryCalls.length = 0;
+      const fallback = responseRecorder();
+      await listPublicBusinesses({ query: { limit: "1" } } as unknown as Request, fallback);
+      assert.equal(fallback.statusCode, 200);
+      assert.deepEqual(directoryCalls, ["discover_public_businesses_by_support", "discover_public_businesses"]);
+      assert.equal(fallback.body.order, "newest");
+      assert.equal(decodeDirectoryCursor(fallback.body.pagination.nextCursor)?.supportCount, undefined);
+    }
+    assert.equal(warnings.length, 1);
+
+    // Any other database error stays an error, not a silent change of order.
+    bySupportResult = { data: null, error: { code: "57014", message: "canceling statement due to statement timeout" } };
+    console.error = () => {};
+    const failing = responseRecorder();
+    await listPublicBusinesses({ query: {} } as unknown as Request, failing);
+    assert.equal(failing.statusCode, 500);
+  } finally {
+    console.warn = originalWarn;
+    console.error = originalError;
+    bySupportResult = null;
+  }
+
+  // With Discover engagement off, supports are not public: newest first.
+  (config as any).discoverEngagementEnabled = false;
+  directoryCalls.length = 0;
+  const engagementOff = responseRecorder();
+  await listPublicBusinesses({ query: {} } as unknown as Request, engagementOff);
+  assert.deepEqual(directoryCalls, ["discover_public_businesses"]);
+  assert.equal(engagementOff.body.order, "newest");
+  (config as any).discoverEngagementEnabled = true;
 
   const invalidCursorResponse = responseRecorder();
   await listPublicBusinesses(
@@ -221,5 +294,15 @@ assert.match(migration, /publication\.status = 'active'/);
 assert.match(migration, /business\.status = 'published'/);
 assert.match(migration, /public_snapshot/);
 assert.doesNotMatch(migration, /sessions|decks|transcripts|evaluation_report/i);
+
+const supportOrderMigration = readFileSync(
+  new URL("../../migrations/0033_discover_most_supported.sql", import.meta.url),
+  "utf8",
+);
+assert.match(supportOrderMigration, /publication\.status = 'active'/);
+assert.match(supportOrderMigration, /business\.status = 'published'/);
+assert.match(supportOrderMigration, /FROM business_supports/);
+assert.match(supportOrderMigration, /GRANT EXECUTE ON FUNCTION discover_public_businesses_by_support\([^)]*\) TO service_role;/);
+assert.doesNotMatch(supportOrderMigration, /sessions|decks|transcripts|evaluation_report/i);
 
 console.log("Public business serialization and discovery tests passed.");
