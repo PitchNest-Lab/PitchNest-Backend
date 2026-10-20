@@ -106,7 +106,7 @@ try {
 
   // A search records which filters were used, never the text.
   mutableSupabase.rpc = async (name: string) => {
-    assert.match(name, /^discover_public_businesses(_by_support)?$/);
+    assert.match(name, /^discover_public_businesses(_ranked|_by_support)?$/);
     return { data: [], error: null };
   };
   const searched = recorder();

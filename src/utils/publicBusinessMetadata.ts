@@ -70,7 +70,8 @@ export function injectPublicBusinessMetadata(
   const description = business
     ? (business.tagline || business.description || `Explore ${business.name} on PitchNest.`).slice(0, 220)
     : "This PitchNest business profile is not publicly available.";
-  const robots = business ? "index, follow" : "noindex, follow";
+  // Example profiles are illustrations, not businesses to send searchers to.
+  const robots = business && !business.isExample ? "index, follow" : "noindex, follow";
   // The business's own approved cover (best for wide previews), then its logo.
   const image = business?.coverUrl || business?.logoUrl || `${origin}/og-image.png`;
 

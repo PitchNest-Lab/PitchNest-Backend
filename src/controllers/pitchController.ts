@@ -105,6 +105,8 @@ export function toPitchSummary(row: any) {
       tagline: typeof row?.business_tagline === "string" ? row.business_tagline : "",
       industry: typeof row?.business_industry === "string" ? row.business_industry : "",
       region: typeof row?.business_region === "string" ? row.business_region : "",
+      // A sample business (migration 0034); absent before it, so false.
+      isExample: row?.business_is_example === true,
     },
   };
 }

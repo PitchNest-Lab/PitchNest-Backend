@@ -100,6 +100,9 @@ const summary = toPitchSummary({
 });
 assert.equal(JSON.stringify(summary).includes(DRAFT_ID), false);
 assert.equal(summary.business.slug, "market-bridge");
+// Pitches from example businesses say so (migration 0034); without it, none are.
+assert.equal(summary.business.isExample, false);
+assert.equal(toPitchSummary({ business_slug: "x", business_is_example: true }).business.isExample, true);
 
 const cursor = { at: "2026-10-15T10:00:00.000Z", id: DRAFT_ID };
 assert.deepEqual(decodePitchCursor(encodePitchCursor(cursor)), cursor);

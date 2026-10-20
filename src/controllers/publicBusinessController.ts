@@ -12,6 +12,8 @@ const MAX_PAGE_SIZE = 24;
 const SLUG_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 type DirectoryCursor = {
+  /** Present when the list puts real businesses before examples (migration 0034). */
+  isExample?: boolean;
   /** Present when the list is ordered by support count (migration 0033). */
   supportCount?: number;
   publishedAt: string;
@@ -33,6 +35,8 @@ export interface PublicBusinessSummary {
   logoUrl: string | null;
   coverUrl: string | null;
   publishedAt: string | null;
+  /** A sample profile that shows what a complete business page looks like (migration 0034). */
+  isExample: boolean;
 }
 
 export interface PublicBusinessProfile extends PublicBusinessSummary {
@@ -87,6 +91,7 @@ export function toPublicBusinessSummary(
     logoUrl: publicMediaUrl("logo", snapshot.id, snapshot.logoFile),
     coverUrl: publicMediaUrl("cover", snapshot.id, snapshot.coverFile),
     publishedAt: typeof publishedAt === "string" ? publishedAt : null,
+    isExample: snapshot.isExample === true,
   };
 }
 
@@ -123,6 +128,10 @@ export function decodeDirectoryCursor(value: string): DirectoryCursor | null {
       return null;
     }
     const cursor: DirectoryCursor = { publishedAt: date.toISOString(), publicationId: parsed.publicationId };
+    if (parsed.isExample !== undefined) {
+      if (typeof parsed.isExample !== "boolean") return null;
+      cursor.isExample = parsed.isExample;
+    }
     if (parsed.supportCount !== undefined) {
       if (!Number.isSafeInteger(parsed.supportCount) || parsed.supportCount < 0) return null;
       cursor.supportCount = parsed.supportCount;
@@ -138,7 +147,12 @@ function isMissingFunction(error: any): boolean {
   return error?.code === "PGRST202" || error?.code === "42883";
 }
 
-let warnedNoSupportOrder = false;
+const warnedMissing = new Set<string>();
+function warnMissingOnce(fn: string, migration: string, fallback: string) {
+  if (warnedMissing.has(fn)) return;
+  warnedMissing.add(fn);
+  console.warn(`Discover lists ${fallback}: the database has no ${fn} (migration ${migration}).`);
+}
 
 function queryText(value: unknown, maxLength: number): string {
   return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
@@ -175,24 +189,38 @@ export async function listPublicBusinesses(req: Request, res: Response) {
       p_cursor_publication_id: cursor?.publicationId ?? null,
       p_limit: limit + 1,
     };
-    // Most supported first while Discover engagement is on. A cursor keeps the
-    // order of the page it came from, and a database without migration 0033
-    // lists newest first.
-    let order: DirectoryOrder = (cursor ? cursor.supportCount !== undefined : config.discoverEngagementEnabled)
-      ? "most_supported"
-      : "newest";
-    let result = order === "most_supported"
-      ? await supabase.rpc("discover_public_businesses_by_support", {
+    // Real businesses before examples (migration 0034), then most supported
+    // first while Discover engagement is on, otherwise newest first. A cursor
+    // keeps the order of the page it came from. Without 0034 the list falls
+    // back to 0033's support order, and without that to newest first.
+    const bySupport = cursor ? cursor.supportCount !== undefined : config.discoverEngagementEnabled;
+    let examplesLast = !cursor || cursor.isExample !== undefined;
+    let order: DirectoryOrder = bySupport ? "most_supported" : "newest";
+    let result = examplesLast
+      ? await supabase.rpc("discover_public_businesses_ranked", {
           ...args,
-          p_cursor_support_count: cursor?.supportCount ?? null,
+          p_by_support: bySupport,
+          p_cursor_is_example: cursor?.isExample ?? null,
+          // Every row carries 0 when the list is not ordered by support.
+          p_cursor_support_count: cursor ? (bySupport ? cursor.supportCount : 0) : null,
         })
       : null;
     if (result?.error && isMissingFunction(result.error)) {
-      if (!warnedNoSupportOrder) {
-        warnedNoSupportOrder = true;
-        console.warn("Discover lists newest first: the database has no discover_public_businesses_by_support (migration 0033).");
-      }
+      warnMissingOnce("discover_public_businesses_ranked", "0034", "examples among real businesses");
       result = null;
+    }
+    if (!result) {
+      examplesLast = false;
+      if (bySupport) {
+        result = await supabase.rpc("discover_public_businesses_by_support", {
+          ...args,
+          p_cursor_support_count: cursor?.supportCount ?? null,
+        });
+        if (result.error && isMissingFunction(result.error)) {
+          warnMissingOnce("discover_public_businesses_by_support", "0033", "newest first");
+          result = null;
+        }
+      }
     }
     if (!result) {
       order = "newest";
@@ -222,6 +250,7 @@ export async function listPublicBusinesses(req: Request, res: Response) {
     const finalRow = hasMore ? page[page.length - 1] : null;
     const nextCursor = finalRow
       ? encodeDirectoryCursor({
+          ...(examplesLast ? { isExample: finalRow.is_example === true } : {}),
           ...(order === "most_supported" ? { supportCount: Number(finalRow.support_count) } : {}),
           publishedAt: new Date(finalRow.published_at).toISOString(),
           publicationId: finalRow.publication_id,
