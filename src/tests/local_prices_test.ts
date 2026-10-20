@@ -5,7 +5,7 @@ import type { Request, Response as ExpressResponse } from "express";
 import { config, resolvePlanPrice } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 import { checkoutPrice, convertFromUsd, priceListIn } from "../services/localPriceService.ts";
-import { getPrice, handleWebhook, startCheckout } from "../controllers/billingController.ts";
+import { getPlan, getPrice, handleWebhook, startCheckout } from "../controllers/billingController.ts";
 
 // ── Rounding ─────────────────────────────────────────────────────────────────
 assert.equal(convertFromUsd(15, 1450, "NGN"), 21_800, "rounded up to the next ₦100");
@@ -302,6 +302,15 @@ try {
   res = recorder();
   await getPrice(withQuery({ currency: "GHS" }), res);
   assert.equal(res.body.currency, "USD", "a currency not on offer falls back to dollars");
+
+  // The signed-in plan view prices the same way, and still says checkout is on.
+  res = recorder();
+  await getPlan({ user: { id: 12 }, body: {}, query: { currency: "NGN" } } as unknown as Request, res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(res.body.billingEnabled, true);
+  assert.equal(res.body.currency, "NGN");
+  assert.deepEqual(res.body.price, { amount: proNaira, currency: "NGN", days: proMonthly.days });
+  assert.ok(res.body.catalog.every((item: any) => item.purchasable === true));
 
   // ── Checkout in naira ─────────────────────────────────────────────────────
   calls.length = 0;
