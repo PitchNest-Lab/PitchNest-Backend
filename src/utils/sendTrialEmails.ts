@@ -5,11 +5,11 @@ import { withTimeout } from "./withTimeout.ts";
 /**
  * The trial reminder emails.
  *
- * WHAT THESE ARE FOR. The trial grants full Pro access for 30 days and then
- * quietly lapses: on day 31 the founder loses the PDF and the longer pitch
- * durations, and until now nothing told them. These four emails are the
- * replacement — one a week out, one at three days, one the day before, and one
- * after it ends.
+ * WHAT THESE ARE FOR. The trial grants full Pro access for FREE_TRIAL_DAYS and
+ * then quietly lapses: the founder loses the PDF and the longer pitch durations,
+ * and until now nothing told them. These emails are the replacement — one a
+ * week out and one at three days (only when the trial is long enough for
+ * them), one the day before, and one after it ends.
  *
  * THE TONE IS THE DESIGN. The market is Africa-first and the constraint is that
  * product quality outranks conversion pressure, so these are written to inform

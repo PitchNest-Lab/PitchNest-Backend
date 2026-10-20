@@ -8,7 +8,7 @@ import { signUserToken } from "../helpers/tokens.ts";
 
 /**
  * FUTURE posture (switch explicitly "true"): checkout may only ever sell
- * Pro monthly at USD 10 for 30 days. Flutterwave is mocked — no network call
+ * Pro monthly at USD 15 for 30 days. Flutterwave is mocked — no network call
  * leaves this process.
  */
 
@@ -65,7 +65,7 @@ for (const [label, body] of [
   ["no body (what the web client sends)", undefined],
   ["explicit pro/monthly", { plan: "pro", term: "monthly" }],
 ] as const) {
-  test(`checkout sells Pro monthly at USD 10 for one monthly term — ${label}`, async () => {
+  test(`checkout sells Pro monthly at USD 15 for one monthly term — ${label}`, async () => {
     const { initialGrantDays } = await import("../../services/subscriptionService.ts");
     const r = await call(base, "POST", "/api/billing/checkout", { token: signUserToken(USER), body });
     assert.equal(r.status, 200);
@@ -75,7 +75,7 @@ for (const [label, body] of [
     assert.equal(rows.length, 1);
     assert.equal(rows[0].plan, "pro");
     assert.equal(rows[0].term, "monthly");
-    assert.equal(rows[0].amount, 10);
+    assert.equal(rows[0].amount, 15);
     assert.equal(rows[0].currency, "USD");
     // One calendar month plus the renewal grace, and no free-month bonus.
     assert.equal(rows[0].granted_days, initialGrantDays("monthly", 0));
@@ -84,7 +84,7 @@ for (const [label, body] of [
 
     const payments = flutterwaveRequests.filter((req) => req.url.endsWith("/payments"));
     assert.equal(payments.length, 1);
-    assert.equal(payments[0].body.amount, 10);
+    assert.equal(payments[0].body.amount, 15);
     assert.equal(payments[0].body.currency, "USD");
     assert.equal(payments[0].body.payment_plan, 8000);
     assert.equal(payments[0].body.meta.plan, "pro");

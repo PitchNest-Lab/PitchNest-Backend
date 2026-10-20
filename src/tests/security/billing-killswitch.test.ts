@@ -47,13 +47,15 @@ after(async () => {
   await close();
 });
 
-test("public price: billingEnabled=false and Pro monthly is USD 10 for 30 days", async () => {
+test("public price: billingEnabled=false and Pro monthly is USD 15 for 30 days", async () => {
   const r = await call(base, "GET", "/api/billing/price");
   assert.equal(r.status, 200);
   assert.equal(r.json.billingEnabled, false, "keys alone must not enable billing");
-  assert.deepEqual(r.json.price, { amount: 10, currency: "USD", days: 30 });
+  assert.deepEqual(r.json.price, { amount: 15, currency: "USD", days: 30 });
   const proMonthly = r.json.catalog.find((c: any) => c.plan === "pro" && c.term === "monthly");
-  assert.deepEqual(proMonthly, { plan: "pro", term: "monthly", amount: 10, currency: "USD", days: 30, purchasable: true });
+  assert.deepEqual(proMonthly, { plan: "pro", term: "monthly", amount: 15, currency: "USD", days: 30, purchasable: true });
+  const founderMonthly = r.json.catalog.find((c: any) => c.plan === "prep" && c.term === "monthly");
+  assert.equal(founderMonthly.amount, 9.99, "Founder stays at USD 9.99");
   const unsold = r.json.catalog.filter((c: any) => !(c.plan === "pro" && c.term === "monthly"));
   assert.ok(unsold.length > 0 && unsold.every((c: any) => c.purchasable === false), "only Pro monthly is on sale by default");
 });
@@ -75,7 +77,7 @@ test("checkout still requires authentication", async () => {
 });
 
 test("webhook: missing or wrong signature is rejected before any processing", async () => {
-  const body = { data: { id: 1, tx_ref: "pn-71-0-x", status: "successful", amount: 10, currency: "USD" } };
+  const body = { data: { id: 1, tx_ref: "pn-71-0-x", status: "successful", amount: 15, currency: "USD" } };
   assert.equal((await call(base, "POST", "/api/billing/webhook", { body })).status, 401);
   const res = await fetch(`${base}/api/billing/webhook`, {
     method: "POST",
@@ -103,9 +105,10 @@ test("free trial preserved: an expired trial falls back to the free tier", async
   assert.equal(r.json.isTrial, false);
 });
 
-test("trial length is independent of PRO_PLAN_DAYS (still 30 days for new accounts)", async () => {
+test("trial length is independent of PRO_PLAN_DAYS (3 days for new accounts)", async () => {
   const { FREE_TRIAL_DAYS, entitlementsForPlan } = await import("../../services/entitlementService.ts");
-  assert.equal(FREE_TRIAL_DAYS, 30);
+  assert.equal(FREE_TRIAL_DAYS, 3);
+  // A trial granted before the change keeps its stored end date.
   const ent = entitlementsForPlan("free", null, inDays(10), "active", inDays(-20));
   assert.equal(ent.isTrial, true);
   assert.equal(ent.pdfDownload, true);

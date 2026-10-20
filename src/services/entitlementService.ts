@@ -29,8 +29,12 @@ export const PREP_DURATIONS = [10, 20] as const;
 /** Durations a paid Pro user or Trial user may choose, in minutes. */
 export const PRO_DURATIONS = [10, 20, 30, 40] as const;
 
-/** Default trial duration in days for new users during testing period. */
-export const FREE_TRIAL_DAYS = 30;
+/**
+ * Full-access Pro trial for NEW accounts, in days (was 30 during testing). The
+ * end date is stored at signup, so changing this never shortens a trial that
+ * was already granted.
+ */
+export const FREE_TRIAL_DAYS = 3;
 
 export interface Entitlement {
   plan: Plan;
@@ -45,7 +49,7 @@ export interface Entitlement {
   /** Which models coach this plan (config/aiModels.ts). Scoring is not here:
    *  it uses the same judge model on every plan. */
   ai: PlanAiProfile;
-  /** True when user is in the 30-day full access trial period. */
+  /** True while the user is in the full-access trial (FREE_TRIAL_DAYS). */
   isTrial: boolean;
   /** Trial days remaining if active. */
   trialDaysRemaining?: number;
@@ -81,8 +85,8 @@ const PRO: Entitlement = {
   isTrial: false,
 };
 
-/** Full Access Trial Entitlement — grants complete Pro capabilities during the 30-day testing period. */
-export function getTrialEntitlement(daysRemaining: number = 30): Entitlement {
+/** Full Access Trial Entitlement — grants complete Pro capabilities during the free trial. */
+export function getTrialEntitlement(daysRemaining: number = FREE_TRIAL_DAYS): Entitlement {
   return {
     plan: "pro",
     maxWeeklySessions: Infinity,
@@ -108,7 +112,7 @@ export function isTrialActive(
   }
 
   // Derive explicit end date: if trialExpiresAt is present use it;
-  // otherwise, if trialStartedAt is present, calculate trialStartedAt + 30 days.
+  // otherwise, if trialStartedAt is present, calculate trialStartedAt + FREE_TRIAL_DAYS.
   // If neither timestamp is set, the trial is inactive (prevents perpetual free access).
   let end: Date | null = null;
   if (trialExpiresAt) {

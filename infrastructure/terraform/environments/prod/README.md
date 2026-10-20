@@ -135,7 +135,7 @@ PitchNest is not accepting subscription payments. The existing free trial is unc
 |---|---|
 | `BILLING_CHECKOUT_ENABLED` (`billing_checkout_enabled`) | **`"false"`**. Checkout returns 503 `billing_unavailable` even if the keys were loaded |
 | Flutterwave keys readable by the Lambda | **No.** They aren't in `ssm_parameter_names`, so IAM denies them; checkout and webhook stay inert |
-| Purchasable SKU | **Pro monthly only** (USD 10 for 30 days: `PRO_PLAN_*`). Annual and Prep requests return 400 `plan_not_available` |
+| Purchasable SKU | **Pro monthly only** (USD 15 for 30 days: `PRO_PLAN_*`). Annual and Prep requests return 400 `plan_not_available` |
 | `extra_environment_variables` | Can't override any managed key (validation) |
 
 Enabling billing later requires **all** of the following, each reviewed:

@@ -66,12 +66,20 @@ export interface TrialSweepResult {
  * milestone is a slot in the sequence, not a promise about the number in the
  * subject line — the copy is told the real day count, so a late run says "5 days
  * left" rather than "a week".
+ *
+ * A reminder is only due if the trial is longer than its lead time: a 3-day
+ * trial would otherwise get "3 days left" on the day it starts. Trials granted
+ * before the 3-day change keep the full sequence.
  */
-export function reminderSlot(daysRemaining: number, expired: boolean): TrialMilestone | null {
+export function reminderSlot(
+  daysRemaining: number,
+  expired: boolean,
+  trialDays: number,
+): TrialMilestone | null {
   if (expired) return "expired";
   if (daysRemaining <= 1) return "t1";
-  if (daysRemaining <= 3) return "t3";
-  if (daysRemaining <= 7) return "t7";
+  if (daysRemaining <= 3 && trialDays > 3) return "t3";
+  if (daysRemaining <= 7 && trialDays > 7) return "t7";
   return null;
 }
 
@@ -233,8 +241,9 @@ export async function runTrialLifecycleSweep(): Promise<TrialSweepResult> {
     }
     const expired = expiry <= now;
     const daysRemaining = Math.max(0, Math.ceil((expiry - now) / DAY_MS));
+    const trialDays = Math.round((expiry - trialStart) / DAY_MS);
 
-    const milestone = reminderSlot(daysRemaining, expired);
+    const milestone = reminderSlot(daysRemaining, expired, trialDays);
     if (!milestone) {
       result.skipped++;
       continue;

@@ -13,7 +13,7 @@ export const DUMMY_FLW_HASH = "dummy-webhook-hash-for-tests";
 export function applyBillingEnv(checkoutSwitch: string | undefined): void {
   process.env.FLW_SECRET_KEY = DUMMY_FLW_SECRET;
   process.env.FLW_WEBHOOK_HASH = DUMMY_FLW_HASH;
-  process.env.PRO_PLAN_AMOUNT = "10";
+  process.env.PRO_PLAN_AMOUNT = "15";
   process.env.PRO_PLAN_CURRENCY = "USD";
   process.env.PRO_PLAN_DAYS = "30";
   // No first-subscription bonus here, so a checkout grants exactly one period.

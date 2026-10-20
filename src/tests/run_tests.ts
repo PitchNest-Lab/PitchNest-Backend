@@ -19,7 +19,9 @@ import {
   isTrialActive,
   entitlementsForPlan,
   getTrialEntitlement,
+  FREE_TRIAL_DAYS,
 } from "../services/entitlementService.ts";
+import { reminderSlot } from "../jobs/trialLifecycle.ts";
 import { sanitizeUploadName, signLocalFileUrl, verifyLocalFileToken } from "../services/storageService.ts";
 import { sanitizeFounderInput, sanitizeDeckText, inlinePromptFragment } from "../utils/aiTextSanitizer.ts";
 import {
@@ -115,10 +117,13 @@ assert(deckIntel.slides[2].keyNumbers.includes("100"), "Slide 3 key numbers extr
 const slideMapping = inferActiveSlide("Our users face huge friction because cross-border settlements take almost a week with heavy fees.", deckIntel);
 assert(slideMapping.activeSlide?.slideNumber === 2, "Semantic slide-to-speech mapping accurately selected Slide 2");
 
-// 6. Entitlement & 30-Day Free Access Test
+// 6. Entitlement & Free Trial Test
+// A stored end date is honoured, so trials granted before the 3-day change
+// (up to 30 days) keep running.
 const futureDate = new Date(Date.now() + 25 * 86400000).toISOString();
 const trialCheck = isTrialActive(futureDate, "active");
-assert(trialCheck.active === true && trialCheck.daysRemaining >= 24, "30-day trial status active with >= 24 days remaining");
+assert(trialCheck.active === true && trialCheck.daysRemaining >= 24, "Stored trial end date honoured (25 days left)");
+assert(FREE_TRIAL_DAYS === 3, "New accounts get a 3-day trial");
 
 // 6b. Fix 4 Verification: Null trial timestamps must NOT grant perpetual access
 const nullTrialCheck = isTrialActive(null, null, null);
@@ -126,7 +131,15 @@ assert(nullTrialCheck.active === false && nullTrialCheck.daysRemaining === 0, "N
 
 const startedRecent = new Date(Date.now() - 1 * 86400000).toISOString();
 const derivedTrial = isTrialActive(null, "active", startedRecent);
-assert(derivedTrial.active === true && derivedTrial.daysRemaining >= 28, "Active trial derived correctly from trial_started_at + 30 days");
+assert(derivedTrial.active === true && derivedTrial.daysRemaining === 2, "Active trial derived correctly from trial_started_at + 3 days");
+const startedLonger = new Date(Date.now() - 4 * 86400000).toISOString();
+assert(isTrialActive(null, "active", startedLonger).active === false, "Derived 3-day trial has ended after 4 days");
+
+// 6c. Trial reminders only fire when the trial is longer than their lead time
+assert(reminderSlot(3, false, 3) === null, "No '3 days left' email on the first day of a 3-day trial");
+assert(reminderSlot(1, false, 3) === "t1", "3-day trial: reminder the day before it ends");
+assert(reminderSlot(0, true, 3) === "expired", "3-day trial: email when it has ended");
+assert(reminderSlot(7, false, 30) === "t7" && reminderSlot(3, false, 30) === "t3", "Existing 30-day trials keep the week and 3-day reminders");
 
 const trialEnt = entitlementsForPlan("free", null, futureDate, "active");
 assert(trialEnt.plan === "pro", "Trial user granted Pro plan tier");
