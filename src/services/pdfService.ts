@@ -261,13 +261,16 @@ function drawTableRow(
 // ── Dynamic page break helper ────────────────────────────────────────────────
 // Call before every major section: if the remaining vertical space is less than
 // `needed`, start a fresh page with a header so content never runs off the edge.
-function ensureSpace(doc: PDFDoc, needed: number, title: string): void {
+// Returns true when it started a new page.
+function ensureSpace(doc: PDFDoc, needed: number, title: string): boolean {
   const bottomMargin = 80;
   if (doc.y + needed > doc.page.height - bottomMargin) {
     doc.addPage();
     drawHeader(doc, title);
     doc.y = 65;
+    return true;
   }
+  return false;
 }
 
 // ── Vector Icon Drawing System ───────────────────────────────────────────────
@@ -1261,24 +1264,28 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const tableHeaders = ["Category", "Score", "What Went Well", "What Needs Improvement", "Impact"];
       const colWidths = [80, 45, 145, 155, 60];
 
-      let ty = Math.max(370, doc.y + 16);
-      doc.rect(50, ty, 495, 18).fill(COLORS.primary);
-      let tx = 55;
-      tableHeaders.forEach((th, idx) => {
-        doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(th, tx, ty + 5);
-        tx += colWidths[idx];
-      });
+      // Returns the y below the header row; repeated when the table continues.
+      const drawMatrixHeader = (y: number): number => {
+        doc.rect(50, y, 495, 18).fill(COLORS.primary);
+        let tx = 55;
+        tableHeaders.forEach((th, idx) => {
+          doc.font("Inter-Bold").fontSize(7.5).fillColor(COLORS.white).text(th, tx, y + 5);
+          tx += colWidths[idx];
+        });
+        return y + 18;
+      };
 
-      ty += 18;
+      let ty = drawMatrixHeader(Math.max(370, doc.y + 16));
       const catScoreMap: Record<string, number> = {
         Delivery: scores.delivery, Clarity: scores.clarity,
         Scalability: scores.scalability, Readiness: scores.readiness
       };
+      const matrixRow = { padX: 5, padY: 8, lineGap: 1.5, minHeight: 30 };
       // Pattern A: each row grows to fit its tallest cell (shared drawTableRow)
       categoryMatrixRows.forEach((row, rowIdx) => {
         const catScore = catScoreMap[row.category] ?? 0;
-        // Cap the prose cells at 3 lines (Pattern B) so a row grows for normal
-        // wrapping but can't blow the table past the page.
+        // Cap the prose cells at 5 lines (Pattern B) so a row grows for normal
+        // wrapping but stays bounded.
         const cells: RowCell[] = [
           { text: row.category, font: "Inter-Bold" },
           { text: `${catScore}/100`, font: "Inter-Bold" },
@@ -1286,19 +1293,30 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
           { text: fitText(doc, row.needs_improvement, 145, "Inter", 7.5, 5, 1.5) },
           { text: row.impact },
         ];
+        // A long analytics page can push a row past the footer: continue the
+        // table on a fresh page under a repeated header row instead.
+        doc.y = ty;
+        const rowHeight = measureRowHeight(
+          doc, cells, colWidths, matrixRow.padX, matrixRow.padY, matrixRow.lineGap, matrixRow.minHeight,
+        );
+        if (ensureSpace(doc, rowHeight, "Performance & Delivery Analytics")) {
+          ty = drawMatrixHeader(doc.y);
+        }
         ty = drawTableRow(doc, 50, ty, colWidths, cells, {
+          ...matrixRow,
           fill: rowIdx % 2 === 0 ? COLORS.bgLight : COLORS.white,
           border: COLORS.border,
-          padX: 5,
-          padY: 8,
-          lineGap: 1.5,
-          minHeight: 30,
         });
       });
 
-      // Readiness Benchmark — score compared against our scoring rubric
-      ty += 15;
-      
+      // Readiness Benchmark — score compared against our scoring rubric. The
+      // rows above grow with the report's text; when the 140pt card no longer
+      // fits above the footer it starts a fresh page, because otherwise every
+      // label below the margin would open a page of its own.
+      doc.y = ty + 15;
+      ensureSpace(doc, 140, "Performance & Delivery Analytics");
+      ty = doc.y;
+
       // Card background matching VC INVESTMENT PROBABILITY style
       doc.roundedRect(50, ty, 495, 140, 8).lineWidth(0.5).fillAndStroke(COLORS.bgLight, COLORS.border);
       doc.roundedRect(55, ty + 5, 485, 130, 6).fill(COLORS.indigoBg);
