@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import { FakeSupabase } from "../helpers/fakeSupabase.ts";
 import { startApp, call } from "../helpers/httpServer.ts";
 import { signUserToken } from "../helpers/tokens.ts";
+import { config } from "../../config/env.ts";
 
 /**
  * FUTURE posture (switch explicitly "true"): checkout may only ever sell
@@ -18,6 +19,8 @@ let close: () => Promise<void>;
 const realFetch = globalThis.fetch;
 const flutterwaveRequests: { url: string; body: any }[] = [];
 const USER = { id: 81, email: "buyer@x.test" };
+const LIVE_CHECKOUT = "https://checkout.flutterwave.com/v3/hosted/pay/mock";
+let paymentLink = LIVE_CHECKOUT;
 
 before(async () => {
   globalThis.fetch = (async (input: any, init?: any) => {
@@ -27,7 +30,7 @@ before(async () => {
       // Checkout subscribes the card to a payment plan, created once per SKU.
       const data = url.endsWith("/payment-plans")
         ? { id: 8000 }
-        : { link: "https://checkout.flutterwave.com/v3/hosted/pay/mock" };
+        : { link: paymentLink };
       return new Response(JSON.stringify({ status: "success", data }), {
         status: 200,
         headers: { "content-type": "application/json" },
@@ -49,6 +52,7 @@ before(async () => {
 beforeEach(() => {
   db.seed("payments", []);
   flutterwaveRequests.length = 0;
+  paymentLink = LIVE_CHECKOUT;
 });
 
 after(async () => {
@@ -110,6 +114,32 @@ const INVALID_BODIES = [{ plan: "enterprise" }, { plan: "pro", term: "weekly" }]
     assert.equal(db.rows("payments").length, 0);
     assert.equal(flutterwaveRequests.length, 0);
   });
+});
+
+test("a test key accepts Flutterwave's test-mode checkout page", async () => {
+  paymentLink = "https://checkout-testing.flutterwave.example/v3/hosted/pay/mock";
+  const r = await call(base, "POST", "/api/billing/checkout", { token: signUserToken(USER) });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.paymentLink, paymentLink);
+});
+
+test("a live key sends payers only to checkout.flutterwave.com", async () => {
+  const testKey = config.flutterwaveSecretKey;
+  (config as any).flutterwaveSecretKey = "FLWSECK-live-dummy-not-a-real-key-X";
+  try {
+    for (const link of [
+      "https://checkout-testing.flutterwave.example/v3/hosted/pay/mock",
+      "http://checkout.flutterwave.com/v3/hosted/pay/mock",
+    ]) {
+      db.seed("payments", []);
+      paymentLink = link;
+      const r = await call(base, "POST", "/api/billing/checkout", { token: signUserToken(USER) });
+      assert.equal(r.status, 502, link);
+      assert.equal(db.rows("payments")[0]?.status, "failed", "the refused checkout is recorded as failed");
+    }
+  } finally {
+    (config as any).flutterwaveSecretKey = testKey;
+  }
 });
 
 test("createCheckout itself refuses other SKUs (defence in depth)", async () => {

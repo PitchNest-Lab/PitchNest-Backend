@@ -203,9 +203,14 @@ export async function createCheckout(
     });
     throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an invalid payment link");
   }
+  // Live checkout always runs on checkout.flutterwave.com. Test mode hosts its
+  // page elsewhere; the link still comes straight from the authenticated API,
+  // so a test key accepts any https host (logged below).
+  const testMode = config.flutterwaveSecretKey.startsWith("FLWSECK_TEST-");
+  const trustedHost = paymentUrl.hostname === "checkout.flutterwave.com" || testMode;
   if (
     paymentUrl.protocol !== "https:" ||
-    paymentUrl.hostname !== "checkout.flutterwave.com" ||
+    !trustedHost ||
     paymentUrl.username ||
     paymentUrl.password ||
     paymentUrl.toString().length > 2_048
@@ -214,7 +219,13 @@ export async function createCheckout(
       console.error("❌ Could not finalize unsafe checkout response:", error?.message || error);
       throw new CheckoutError("PAYMENT_RECORD_FAILED", "could not mark unsafe checkout failed");
     });
-    throw new CheckoutError("CHECKOUT_INIT_FAILED", "provider returned an unsafe payment link");
+    throw new CheckoutError(
+      "CHECKOUT_INIT_FAILED",
+      `provider returned an unsafe payment link (host ${paymentUrl.hostname})`,
+    );
+  }
+  if (paymentUrl.hostname !== "checkout.flutterwave.com") {
+    console.info(`ℹ️ Flutterwave test checkout on ${paymentUrl.hostname}`);
   }
 
   return { txRef, paymentLink: paymentUrl.toString() };
