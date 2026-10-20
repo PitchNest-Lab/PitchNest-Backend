@@ -19,6 +19,7 @@ import {
   verifyWebhookSignature,
   grantAccess,
   markPaymentFailed,
+  type VerifiedTransactionDetails,
 } from "../services/flutterwaveService.ts";
 import {
   cancelUserSubscription,
@@ -424,31 +425,115 @@ export const handleWebhook = async (req: Request, res: Response) => {
       return res.status(200).json({ received: true, outcome });
     }
 
-    const shortPaid = Number(verified.amount) < Number((expected as any).amount);
-    const wrongCurrency =
-      String((expected as any).currency).toUpperCase() !== verified.currency.toUpperCase();
-    if (shortPaid || wrongCurrency) {
-      console.error(
-        `❌ Payment mismatch for ${verified.txRef}: expected ${(expected as any).amount} ${(expected as any).currency}, got ${verified.amount} ${verified.currency}. NOT granting.`,
-      );
-      await markPaymentFailed(verified.txRef);
-      return res.status(200).json({ received: true, rejected: true });
-    }
-
-    const granted = await grantAccess(verified);
-    // Also on a replay: recording the subscription is idempotent, and this
-    // finishes the job if the first delivery failed after granting.
-    if ((expected as any).kind === "subscription_initial") {
-      await startSubscriptionAfterPayment(verified.txRef, Number((expected as any).user_id), verified.customerEmail);
-    }
-    console.log(
-      granted
-        ? `✅ Pro granted for ${verified.txRef} (${verified.amount} ${verified.currency})`
-        : `↩️ Webhook replay for ${verified.txRef} — already settled, no change.`,
-    );
-    return res.status(200).json({ received: true });
+    const outcome = await settleFirstPayment(verified, expected as CheckoutPaymentRow);
+    return res
+      .status(200)
+      .json(outcome === "rejected" ? { received: true, rejected: true } : { received: true });
   } catch (err: any) {
     console.error("❌ Billing webhook processing failed:", err?.message || err);
+    return res.status(503).json({ error: "settlement unavailable" });
+  }
+};
+
+interface CheckoutPaymentRow {
+  user_id: number;
+  amount: number;
+  currency: string;
+  status: string;
+  provider_ref: string | null;
+  kind: string;
+}
+
+/**
+ * Settles a verified, successful first payment against the checkout we
+ * recorded. Shared by the webhook and the return-page confirmation, so either
+ * may arrive first: the grant and the subscription are both idempotent.
+ */
+async function settleFirstPayment(
+  verified: VerifiedTransactionDetails,
+  expected: CheckoutPaymentRow,
+): Promise<"granted" | "already_settled" | "rejected"> {
+  const shortPaid = Number(verified.amount) < Number(expected.amount);
+  const wrongCurrency = String(expected.currency).toUpperCase() !== verified.currency.toUpperCase();
+  if (shortPaid || wrongCurrency) {
+    console.error(
+      `❌ Payment mismatch for ${verified.txRef}: expected ${expected.amount} ${expected.currency}, got ${verified.amount} ${verified.currency}. NOT granting.`,
+    );
+    await markPaymentFailed(verified.txRef);
+    return "rejected";
+  }
+
+  const granted = await grantAccess(verified);
+  // Also on a replay: recording the subscription is idempotent, and this
+  // finishes the job if an earlier attempt failed after granting.
+  if (expected.kind === "subscription_initial") {
+    await startSubscriptionAfterPayment(verified.txRef, Number(expected.user_id), verified.customerEmail);
+  }
+  console.log(
+    granted
+      ? `✅ Pro granted for ${verified.txRef} (${verified.amount} ${verified.currency})`
+      : `↩️ ${verified.txRef} was already settled; no change.`,
+  );
+  return granted ? "granted" : "already_settled";
+}
+
+/**
+ * POST /api/billing/confirm — settle a checkout as soon as the user returns
+ * from Flutterwave, instead of waiting for the webhook (which may arrive late,
+ * and cannot reach a local backend at all).
+ *
+ * Nothing the browser sends is trusted: the transaction is fetched from
+ * Flutterwave, must be a checkout this user started, and is settled by the same
+ * code as the webhook. Renewals are left to the webhook.
+ */
+export const confirmCheckout = async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: "Authentication required" });
+  if (!hasBillingConfig()) {
+    return res.status(503).json({ error: "billing_unavailable" });
+  }
+  const transactionId = Number(req.body?.transactionId);
+  if (!Number.isSafeInteger(transactionId) || transactionId <= 0) {
+    return res.status(400).json({ error: "A transaction id is required." });
+  }
+
+  try {
+    const verified = await verifyTransactionDetails(transactionId);
+    if (!verified) return res.status(503).json({ error: "verification unavailable" });
+
+    const { data: expected, error: expectedError } = isCheckoutTxRef(verified.txRef)
+      ? await supabase
+          .from("payments")
+          .select("user_id, amount, currency, status, provider_ref, kind")
+          .eq("tx_ref", verified.txRef)
+          .maybeSingle()
+      : { data: null, error: null };
+    if (expectedError) {
+      console.error(`❌ Payment lookup failed for ${verified.txRef}:`, expectedError.message);
+      return res.status(503).json({ error: "settlement unavailable" });
+    }
+    const payment = expected as CheckoutPaymentRow | null;
+    if (!payment || Number(payment.user_id) !== userId) {
+      return res.status(404).json({ error: "Payment not found." });
+    }
+
+    // Settled by another transaction on this checkout: that is a renewal, and
+    // renewals are the webhook's job.
+    if (payment.status === "successful" && String(payment.provider_ref ?? "") !== verified.providerRef) {
+      return res.json({ status: "successful" });
+    }
+    if (verified.status === "failed" || verified.status === "cancelled") {
+      await markPaymentFailed(verified.txRef);
+      return res.json({ status: "failed" });
+    }
+    if (verified.status !== "successful" && verified.status !== "succeeded") {
+      return res.json({ status: "pending" });
+    }
+
+    const outcome = await settleFirstPayment(verified, payment);
+    return res.json({ status: outcome === "rejected" ? "failed" : "successful" });
+  } catch (err: any) {
+    console.error("❌ confirmCheckout:", err?.message || err);
     return res.status(503).json({ error: "settlement unavailable" });
   }
 };

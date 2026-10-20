@@ -5,6 +5,7 @@ import {
   getPrice,
   getPlan,
   startCheckout,
+  confirmCheckout,
   handleWebhook,
   cancelSubscription,
 } from "../controllers/billingController.ts";
@@ -38,7 +39,8 @@ router.get("/price", getPrice);
 
 router.get("/plan", authMiddleware, getPlan);
 router.post("/checkout", authMiddleware, checkoutLimiter, startCheckout);
-// Shares the checkout budget: both call out to Flutterwave on the user's behalf.
+// These share the checkout budget: all call out to Flutterwave on the user's behalf.
+router.post("/confirm", authMiddleware, checkoutLimiter, confirmCheckout);
 router.post("/subscription/cancel", authMiddleware, checkoutLimiter, cancelSubscription);
 
 /**

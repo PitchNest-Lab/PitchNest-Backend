@@ -14,6 +14,7 @@ import {
 } from "../services/subscriptionService.ts";
 import {
   cancelSubscription,
+  confirmCheckout,
   getPlan,
   handleWebhook,
   startCheckout,
@@ -440,6 +441,61 @@ try {
   providerDown = false;
   await stopRenewalsForDeletion(14);
   assert.equal(providerSubscriptions.find((s) => s.id === 9014)!.status, "cancelled");
+
+  // ── Return page: confirming a checkout without waiting for the webhook ────
+  mutableConfig.purchasableSkus = ["prep:monthly", "pro:monthly"];
+  const founderMonthly = resolvePlanPrice("prep", "monthly");
+  db.users.push({ id: 20, email: "back-from-checkout@example.com", name: "Returned", plan: "free", plan_expires_at: null });
+  res = recorder();
+  await startCheckout(asUser(20, { plan: "prep", term: "monthly" }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const returned = db.payments.find((p) => p.user_id === 20)!;
+  transactions.set(71, {
+    id: 71, tx_ref: returned.tx_ref, amount: founderMonthly.amount, currency: founderMonthly.currency,
+    status: "successful", payment_type: "card", customer: { email: "back-from-checkout@example.com" },
+  });
+
+  res = recorder();
+  await confirmCheckout(asUser(10, { transactionId: 71 }), res);
+  assert.equal(res.statusCode, 404, "only the payer can confirm a checkout");
+  assert.equal(returned.status, "pending");
+
+  res = recorder();
+  await confirmCheckout(asUser(20, { transactionId: 71 }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(res.body.status, "successful");
+  assert.equal(returned.status, "successful");
+  assert.equal(db.users.find((u) => u.id === 20)!.plan, "prep");
+  assert.ok(db.subscriptions.some((s) => s.user_id === 20 && s.status === "active"), "the subscription starts too");
+
+  const expiryAfterConfirm = db.users.find((u) => u.id === 20)!.plan_expires_at;
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 71 } }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(db.users.find((u) => u.id === 20)!.plan_expires_at, expiryAfterConfirm, "the later webhook grants nothing twice");
+  assert.equal(db.subscriptions.filter((s) => s.user_id === 20).length, 1);
+  res = recorder();
+  await confirmCheckout(asUser(20, { transactionId: 71 }), res);
+  assert.equal(res.body.status, "successful", "confirming again is harmless");
+  assert.equal(db.users.find((u) => u.id === 20)!.plan_expires_at, expiryAfterConfirm);
+
+  db.users.push({ id: 21, email: "declined@example.com", name: "Declined", plan: "free", plan_expires_at: null });
+  res = recorder();
+  await startCheckout(asUser(21, { plan: "pro", term: "monthly" }), res);
+  const declined = db.payments.find((p) => p.user_id === 21)!;
+  transactions.set(72, {
+    id: 72, tx_ref: declined.tx_ref, amount: proMonthly.amount, currency: proMonthly.currency,
+    status: "failed", payment_type: "card", customer: { email: "declined@example.com" },
+  });
+  res = recorder();
+  await confirmCheckout(asUser(21, { transactionId: 72 }), res);
+  assert.equal(res.body.status, "failed");
+  assert.equal(declined.status, "failed", "a declined card is recorded as failed");
+  assert.equal(db.users.find((u) => u.id === 21)!.plan, "free", "and grants nothing");
+
+  res = recorder();
+  await confirmCheckout(asUser(21, {}), res);
+  assert.equal(res.statusCode, 400, "a transaction id is required");
 
   // ── Migration ─────────────────────────────────────────────────────────────
   const migration = readFileSync(new URL("../../migrations/0031_recurring_subscriptions.sql", import.meta.url), "utf8");
