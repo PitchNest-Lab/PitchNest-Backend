@@ -48,9 +48,17 @@ function captureConsole() {
   return { lines, restore: () => Object.assign(console, orig) };
 }
 
+const OPTIONAL = ["FLW_SECRET_KEY", "FLW_WEBHOOK_HASH"];
+
+const withBillingKeys = () => ({
+  ...fullStore(),
+  ...Object.fromEntries(OPTIONAL.map((n) => [`/pitchnest/dev/${n}`, dummy(n)])),
+});
+
 beforeEach(() => {
   delete process.env.PITCHNEST_ENV;
-  for (const n of REQUIRED) delete process.env[n];
+  delete process.env.BILLING_CHECKOUT_ENABLED;
+  for (const n of [...REQUIRED, ...OPTIONAL]) delete process.env[n];
 });
 
 test("loads all nine parameters, including Azure OpenAI, in one decrypted call", async () => {
@@ -66,6 +74,63 @@ test("loads all nine parameters, including Azure OpenAI, in one decrypted call",
   assert.deepEqual(fake.calls[0].Names.sort(), REQUIRED.map((n) => `/pitchnest/dev/${n}`).sort());
   for (const n of REQUIRED) assert.equal(process.env[n], dummy(n));
   assert.deepEqual(out.lines, ["Loaded 9 configuration parameters from AWS SSM"]);
+});
+
+test("with checkout off the Flutterwave keys are never requested, even if they exist", async () => {
+  process.env.BILLING_CHECKOUT_ENABLED = "false";
+  const fake = new FakeSsm(withBillingKeys());
+  await loadAwsParameters(fake as any);
+  assert.equal(fake.calls.length, 1);
+  assert.ok(!fake.calls.flatMap((c) => c.Names).some((n) => n.includes("FLW")));
+  for (const n of OPTIONAL) assert.equal(process.env[n], undefined);
+});
+
+test("with checkout on, the Flutterwave keys load in a second decrypted call", async () => {
+  process.env.BILLING_CHECKOUT_ENABLED = "true";
+  const fake = new FakeSsm(withBillingKeys());
+  const out = captureConsole();
+  try {
+    await loadAwsParameters(fake as any);
+  } finally {
+    out.restore();
+  }
+  assert.equal(fake.calls.length, 2, "required names first, then the billing keys on their own");
+  assert.deepEqual(fake.calls[1].Names.sort(), OPTIONAL.map((n) => `/pitchnest/dev/${n}`).sort());
+  assert.equal(fake.calls[1].WithDecryption, true);
+  for (const n of OPTIONAL) assert.equal(process.env[n], dummy(n));
+  assert.deepEqual(out.lines, ["Loaded 9 configuration parameters and 2 optional billing parameters from AWS SSM"]);
+});
+
+test("an execution role that cannot read the billing keys still starts, with billing off", async () => {
+  process.env.BILLING_CHECKOUT_ENABLED = "true";
+  const fake = new FakeSsm(withBillingKeys());
+  const realSend = fake.send.bind(fake);
+  fake.send = async (c: GetParametersCommand) => {
+    if ((c.input.Names ?? []).some((n) => n.endsWith("/FLW_SECRET_KEY"))) {
+      const e = new Error("User is not authorized to perform: ssm:GetParameters");
+      e.name = "AccessDeniedException";
+      throw e;
+    }
+    return realSend(c);
+  };
+  const out = captureConsole();
+  try {
+    await loadAwsParameters(fake as any);
+  } finally {
+    out.restore();
+  }
+  for (const n of REQUIRED) assert.equal(process.env[n], dummy(n));
+  for (const n of OPTIONAL) assert.equal(process.env[n], undefined);
+  assert.ok(out.lines.some((l) => l.includes("AccessDeniedException") && l.includes("billing stays off")));
+  assert.ok(!out.lines.join("\n").includes("dummy-value"), "nothing logged with a value");
+});
+
+test("an empty optional key is skipped, not loaded", async () => {
+  process.env.BILLING_CHECKOUT_ENABLED = "true";
+  const store = { ...withBillingKeys(), "/pitchnest/dev/FLW_SECRET_KEY": "" };
+  await loadAwsParameters(new FakeSsm(store) as any);
+  assert.equal(process.env.FLW_SECRET_KEY, undefined);
+  assert.equal(process.env.FLW_WEBHOOK_HASH, dummy("FLW_WEBHOOK_HASH"));
 });
 
 test("Azure values are visible to config/env.ts when it is imported after loading", async () => {

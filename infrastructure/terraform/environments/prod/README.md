@@ -77,7 +77,7 @@ Create these as **SecureString**. Take every value from its **production source*
 - **`JWT_SECRET` must EQUAL Render's production secret** while Live Pitch runs on Render. The Render WebSocket validates tokens issued by this Lambda, and existing users' tokens must keep working. A different value breaks Live Pitch and logs everyone out.
 
 - **These must match `PARAMETER_NAMES` in `src/config/loadAwsParameters.ts`.** The loader fails closed if any is missing, which means every request returns an error.
-- **Extend `ssm_parameter_names` and the loader together** (for example `FLW_SECRET_KEY` and `FLW_WEBHOOK_HASH` when billing is enabled).
+- **Extend `ssm_parameter_names` and the loader together.** The loader already knows `FLW_SECRET_KEY` and `FLW_WEBHOOK_HASH` (requested only while checkout is enabled); add them to `ssm_parameter_names` when billing is switched on.
 - **The Supabase values must point at `PitchNest-Live`** (`oyztdulmyuklorbudcgb`). Verified on 2026-10-11 by project reference only; no values were displayed.
 - **Flutterwave:** `FLW_SECRET_KEY`, `FLW_WEBHOOK_HASH` and `FLW_PUBLIC_KEY` exist in PROD SSM but are **deliberately not readable by the Lambda** (see *Billing: prepared but off*). `FLW_PUBLIC_KEY` is unused by both the backend and the frontend, which uses hosted checkout.
 - **If you use a customer-managed KMS key,** pass `ssm_kms_key_arn`.
@@ -134,7 +134,7 @@ PitchNest is not accepting subscription payments. The existing free trial is unc
 | Control | State |
 |---|---|
 | `BILLING_CHECKOUT_ENABLED` (`billing_checkout_enabled`) | **`"false"`**. Checkout returns 503 `billing_unavailable` even if the keys were loaded |
-| Flutterwave keys readable by the Lambda | **No.** They aren't in `ssm_parameter_names`, so IAM denies them; checkout and webhook stay inert |
+| Flutterwave keys readable by the Lambda | **No.** They aren't in `ssm_parameter_names`, so IAM denies them, and the loader does not request them while checkout is off; checkout and webhook stay inert |
 | Purchasable SKU | **Pro monthly only** (USD 15 for 30 days: `PRO_PLAN_*`). Annual and Prep requests return 400 `plan_not_available` |
 | `extra_environment_variables` | Can't override any managed key (validation) |
 
@@ -142,7 +142,7 @@ Enabling billing later requires **all** of the following, each reviewed:
 1. Supabase: `REVOKE EXECUTE` on `grant_pro_access` from `PUBLIC`/`anon`/`authenticated`.
 2. The webhook fix: grant before responding (readiness P0-2).
 3. A Flutterwave sandbox end-to-end test on DEV.
-4. The loader and `ssm_parameter_names` both gaining `FLW_SECRET_KEY` and `FLW_WEBHOOK_HASH`.
+4. `ssm_parameter_names` gaining `FLW_SECRET_KEY` and `FLW_WEBHOOK_HASH`, so the execution role may read them. The loader already requests them, but only while `BILLING_CHECKOUT_ENABLED` is `"true"`; if it cannot read them it starts with billing off.
 5. `billing_checkout_enabled = true`.
 6. Repointing the Flutterwave webhook URL.
 

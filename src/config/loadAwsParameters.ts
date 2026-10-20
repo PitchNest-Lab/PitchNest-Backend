@@ -27,6 +27,17 @@ const PARAMETER_NAMES = [
 
 type ParameterName = (typeof PARAMETER_NAMES)[number];
 
+/**
+ * Flutterwave billing keys. Requested only while BILLING_CHECKOUT_ENABLED is
+ * "true", so an environment with billing off never asks for them. They are
+ * fetched in a call of their own, because GetParameters is refused as a whole
+ * when any name in it is denied: a missing or unreadable key leaves billing off
+ * (config/env.ts hasBillingConfig) instead of failing start-up.
+ */
+const OPTIONAL_PARAMETER_NAMES = ["FLW_SECRET_KEY", "FLW_WEBHOOK_HASH"] as const;
+
+type OptionalParameterName = (typeof OPTIONAL_PARAMETER_NAMES)[number];
+
 /** SSM GetParameters accepts at most 10 names per call. */
 const MAX_NAMES_PER_CALL = 10;
 
@@ -37,9 +48,11 @@ const ssm = new SSMClient({
 type SsmSender = Pick<SSMClient, "send">;
 
 /**
- * Loads every required parameter into process.env. Called once per Lambda
- * execution environment (src/lambda.ts caches the result), so this costs one
- * GetParameters call per cold start — not per request.
+ * Loads every required parameter, and the billing keys it can read when
+ * checkout is enabled, into process.env. Called once per Lambda execution
+ * environment (src/lambda.ts caches the result), so this costs one
+ * GetParameters call per cold start (two with checkout enabled) — not per
+ * request.
  *
  * Errors name the missing parameter PATHS only; values are never logged or
  * included in messages.
@@ -97,13 +110,52 @@ export async function loadAwsParameters(client: SsmSender = ssm): Promise<void> 
     );
   }
 
+  const optional =
+    process.env.BILLING_CHECKOUT_ENABLED === "true"
+      ? await loadOptionalParameters(client, prefix)
+      : new Map<OptionalParameterName, string>();
+
   // Only assign once everything is present, so a failed load never leaves a
   // partially populated environment behind for a retry.
-  for (const [key, value] of values) {
+  for (const [key, value] of [...values, ...optional]) {
     process.env[key] = value;
   }
 
   console.info(
-    `Loaded ${values.size} configuration parameters from AWS SSM`,
+    optional.size
+      ? `Loaded ${values.size} configuration parameters and ${optional.size} optional billing parameters from AWS SSM`
+      : `Loaded ${values.size} configuration parameters from AWS SSM`,
   );
+}
+
+/** Never throws: an absent, empty or unreadable optional key is simply skipped. */
+async function loadOptionalParameters(
+  client: SsmSender,
+  prefix: string,
+): Promise<Map<OptionalParameterName, string>> {
+  const found = new Map<OptionalParameterName, string>();
+  let parameters: Parameter[];
+  try {
+    const response = await client.send(
+      new GetParametersCommand({
+        Names: OPTIONAL_PARAMETER_NAMES.map((name) => `${prefix}${name}`),
+        WithDecryption: true,
+      }),
+    );
+    parameters = response.Parameters ?? [];
+  } catch (error) {
+    // e.g. AccessDenied while the role may read only the required set.
+    const name = error instanceof Error ? error.name : "error";
+    console.warn(`Optional billing parameters not loaded from AWS SSM (${name}); billing stays off.`);
+    return found;
+  }
+  for (const parameter of parameters) {
+    const key = parameter.Name?.startsWith(prefix)
+      ? (parameter.Name.slice(prefix.length) as OptionalParameterName)
+      : undefined;
+    if (key && OPTIONAL_PARAMETER_NAMES.includes(key) && parameter.Value) {
+      found.set(key, parameter.Value);
+    }
+  }
+  return found;
 }
