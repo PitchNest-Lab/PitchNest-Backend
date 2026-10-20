@@ -147,7 +147,7 @@ test("createCheckout itself refuses other SKUs (defence in depth)", async () => 
   await assert.rejects(
     createCheckout(
       { id: USER.id, email: USER.email },
-      { plan: "pro", term: "annual" },
+      { plan: "pro", term: "annual", amount: 150, currency: "USD", days: 365 },
       { paymentPlanId: 8000, grantedDays: 365, bonusDays: 0 },
     ),
     (e: any) => e.code === "PLAN_NOT_AVAILABLE",

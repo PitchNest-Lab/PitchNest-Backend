@@ -3,9 +3,7 @@ import {
   config,
   hasBillingConfig,
   isPurchasable,
-  resolvePlanPrice,
-  type PaidPlan,
-  type BillingTerm,
+  type ResolvedPrice,
 } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 
@@ -24,10 +22,12 @@ import { supabase } from "../config/supabase.ts";
 
 const FLW_API = "https://api.flutterwave.com/v3";
 const PROVIDER_TIMEOUT_MS = 15_000;
+// A rate check runs inside a pricing request, which should not hang on it.
+const RATE_TIMEOUT_MS = 5_000;
 
-async function providerFetch(url: string, init: RequestInit = {}): Promise<Response> {
+async function providerFetch(url: string, init: RequestInit = {}, timeoutMs = PROVIDER_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   timer.unref?.();
   try {
     return await fetch(url, { ...init, signal: controller.signal });
@@ -74,14 +74,16 @@ function mintTxRef(userId: number): string {
  * Creates a pending payment row and returns the hosted checkout link.
  *
  * The row is written BEFORE calling Flutterwave so the webhook always has a
- * reference to resolve. Price, level and day-count are computed SERVER-SIDE from
- * the (plan, term) catalog and recorded onto the row — the webhook grants from
- * those recorded values, never from client input, so a founder receives exactly
- * the SKU that was priced here.
+ * reference to resolve. `price` is resolved SERVER-SIDE (localPriceService
+ * checkoutPrice: the (plan, term) catalog, converted when the buyer pays in a
+ * local currency) and recorded onto the row — the webhook grants from those
+ * recorded values, never from client input, so a founder receives exactly the
+ * SKU that was priced here.
  *
- * The checkout subscribes the card to `paymentPlanId`, so Flutterwave renews it
- * every period until it is cancelled. `grantedDays` covers the first period
- * (plus any free months, recorded separately as `bonusDays`).
+ * The checkout subscribes the card to `paymentPlanId`, which must be the plan
+ * made for this same price, so Flutterwave renews it every period until it is
+ * cancelled. `grantedDays` covers the first period (plus any free months,
+ * recorded separately as `bonusDays`).
  */
 export async function createCheckout(
   user: {
@@ -89,10 +91,7 @@ export async function createCheckout(
     email: string;
     name?: string | null;
   },
-  selection: {
-    plan: PaidPlan;
-    term: BillingTerm;
-  },
+  price: ResolvedPrice,
   subscription: {
     paymentPlanId: number;
     grantedDays: number;
@@ -104,16 +103,15 @@ export async function createCheckout(
   if (!hasBillingConfig()) {
     throw new CheckoutError("BILLING_NOT_CONFIGURED");
   }
-  if (!isPurchasable(selection.plan, selection.term)) {
+  if (!isPurchasable(price.plan, price.term)) {
     throw new CheckoutError("PLAN_NOT_AVAILABLE");
   }
 
   const txRef = mintTxRef(user.id);
-  const price = resolvePlanPrice(selection.plan, selection.term);
   const { amount, currency } = price;
 
-  const planLabel = selection.plan === "pro" ? "Pro Founder" : "Founder";
-  const termLabel = selection.term === "annual" ? "year" : "month";
+  const planLabel = price.plan === "pro" ? "Pro Founder" : "Founder";
+  const termLabel = price.term === "annual" ? "year" : "month";
 
   const { error: insertErr } = await supabase.from("payments").insert([
     {
@@ -124,8 +122,8 @@ export async function createCheckout(
       amount,
       currency,
       // The intended grant, read back by grant_pro_access under a row lock.
-      plan: selection.plan,
-      term: selection.term,
+      plan: price.plan,
+      term: price.term,
       granted_days: subscription.grantedDays,
       kind: "subscription_initial",
       provider_plan_id: subscription.paymentPlanId,
@@ -163,7 +161,7 @@ export async function createCheckout(
             `PitchNest ${planLabel}, renews every ${termLabel} until you cancel` +
             (subscription.bonusDays > 0 ? ". Your free month is added on top." : "."),
         },
-        meta: { user_id: user.id, plan: selection.plan, term: selection.term },
+        meta: { user_id: user.id, plan: price.plan, term: price.term },
       }),
     });
   } catch (err: any) {
@@ -350,7 +348,7 @@ export class ProviderError extends Error {
   }
 }
 
-async function providerJson(path: string, init: RequestInit = {}): Promise<any> {
+async function providerJson(path: string, init: RequestInit = {}, timeoutMs = PROVIDER_TIMEOUT_MS): Promise<any> {
   if (!config.flutterwaveSecretKey) throw new ProviderError("billing not configured");
   let res: Response;
   try {
@@ -360,7 +358,7 @@ async function providerJson(path: string, init: RequestInit = {}): Promise<any> 
         Authorization: `Bearer ${config.flutterwaveSecretKey}`,
         ...(init.body ? { "Content-Type": "application/json" } : {}),
       },
-    });
+    }, timeoutMs);
   } catch (err: any) {
     throw new ProviderError(`unreachable: ${err?.message || err}`);
   }
@@ -423,6 +421,35 @@ export async function listProviderSubscriptions(filter: {
 /** Stops future renewals. Access already paid for is untouched. */
 export async function cancelProviderSubscription(subscriptionId: number): Promise<void> {
   await providerJson(`/subscriptions/${subscriptionId}/cancel`, { method: "PUT" });
+}
+
+/**
+ * Units of `currency` it takes to deliver one US dollar at Flutterwave's
+ * current rate (GET /transfers/rates, updated a few times a day).
+ *
+ * Worked out from the two amounts rather than the `rate` field, whose direction
+ * Flutterwave's documentation describes both ways.
+ */
+export async function fetchUsdRate(currency: string): Promise<number> {
+  const params = new URLSearchParams({
+    amount: "100",
+    source_currency: currency,
+    destination_currency: "USD",
+  });
+  const body = await providerJson(`/transfers/rates?${params.toString()}`, {}, RATE_TIMEOUT_MS);
+  const source = body?.data?.source;
+  const destination = body?.data?.destination;
+  const sourceAmount = Number(source?.amount);
+  const destinationAmount = Number(destination?.amount);
+  if (
+    String(source?.currency || "").toUpperCase() !== currency ||
+    String(destination?.currency || "").toUpperCase() !== "USD" ||
+    !(sourceAmount > 0) ||
+    !(destinationAmount > 0)
+  ) {
+    throw new ProviderError("rate response had no usable amounts");
+  }
+  return sourceAmount / destinationAmount;
 }
 
 /**

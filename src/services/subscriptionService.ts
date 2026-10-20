@@ -1,8 +1,8 @@
 import {
   config,
-  resolvePlanPrice,
   type BillingTerm,
   type PaidPlan,
+  type ResolvedPrice,
 } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
 import {
@@ -79,12 +79,12 @@ export function nextChargeDate(startedAt: Date, term: BillingTerm, now = new Dat
 const PLAN_NAMES: Record<PaidPlan, string> = { prep: "Founder", pro: "Pro Founder" };
 
 /**
- * The Flutterwave payment plan for this SKU at today's price, created on first
- * use. A price change yields a new plan, so existing subscribers keep renewing
- * at the price they agreed to.
+ * The Flutterwave payment plan for this SKU at this price, created on first
+ * use. A price change, or the same SKU priced in another currency, yields a new
+ * plan, so existing subscribers keep renewing at the amount they agreed to.
  */
-export async function ensureProviderPlan(plan: PaidPlan, term: BillingTerm): Promise<number> {
-  const price = resolvePlanPrice(plan, term);
+export async function ensureProviderPlan(price: ResolvedPrice): Promise<number> {
+  const { plan, term } = price;
   const lookup = async () => {
     const { data, error } = await supabase
       .from("billing_provider_plans")
@@ -104,8 +104,11 @@ export async function ensureProviderPlan(plan: PaidPlan, term: BillingTerm): Pro
 
   let providerPlanId: number;
   try {
+    // Dollar plans keep the names they already have at Flutterwave; a local
+    // one names its currency so it stands out in the dashboard.
+    const local = price.currency === config.proPlanCurrency ? "" : `, ${price.currency}`;
     providerPlanId = await createProviderPaymentPlan({
-      name: `PitchNest ${PLAN_NAMES[plan]} (${term === "annual" ? "yearly" : "monthly"})`,
+      name: `PitchNest ${PLAN_NAMES[plan]} (${term === "annual" ? "yearly" : "monthly"}${local})`,
       amount: price.amount,
       currency: price.currency,
       interval: term === "annual" ? "yearly" : "monthly",

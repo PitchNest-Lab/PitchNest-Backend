@@ -2,8 +2,6 @@ import { Request, Response } from "express";
 import {
   config,
   hasBillingConfig,
-  resolvePlanPrice,
-  listBillingCatalog,
   isPaidPlan,
   isBillingTerm,
   isPurchasable,
@@ -34,25 +32,32 @@ import {
   subscriptionViewFor,
   SubscriptionError,
 } from "../services/subscriptionService.ts";
+import { checkoutPrice, priceListIn } from "../services/localPriceService.ts";
 
 /**
- * The featured price (Pro, monthly) plus the full purchasable catalog.
+ * The featured price (Pro, monthly) plus the full purchasable catalog, in the
+ * requested currency when it is on offer and in dollars otherwise.
  *
  * `price` is kept for backward-compatibility with surfaces that render a single
  * headline number; `catalog` lists every (plan, term) SKU the checkout will
- * honour. Both come from the same server-side resolver, so display can never
- * drift from what is charged. `offer.freeMonths` is what a first subscription
- * adds on top, so the pricing page can only promise what checkout records.
+ * honour. Both come from the same server-side price list that checkout charges
+ * from, so display can never drift from what is charged. `currency` is the one
+ * the prices are in and `currencies` lists the ones a buyer can switch to.
+ * `offer.freeMonths` is what a first subscription adds on top, so the pricing
+ * page can only promise what checkout records.
  */
-function pricingPayload() {
-  const featured = resolvePlanPrice("pro", "monthly");
+async function pricingPayload(requestedCurrency: unknown) {
+  const prices = await priceListIn(requestedCurrency);
+  const featured = prices.catalog.find((item) => item.plan === "pro" && item.term === "monthly")!;
   return {
     price: {
       amount: featured.amount,
       currency: featured.currency,
       days: featured.days,
     },
-    catalog: listBillingCatalog(),
+    catalog: prices.catalog,
+    currency: prices.currency,
+    currencies: prices.currencies,
     offer: { freeMonths: config.firstSubscriptionFreeMonths },
   };
 }
@@ -73,14 +78,26 @@ function parseSelection(body: any): { plan: PaidPlan; term: BillingTerm } | null
 }
 
 /**
- * GET /api/billing/price — public price + purchasable catalog. No user data.
+ * The currency a checkout request asks to pay in. Omitted means dollars (the
+ * base price); anything that is not a currency code is rejected.
  */
-export const getPrice = async (_req: Request, res: Response) => {
+function parseCurrency(body: any): string | null {
+  const raw = body?.currency;
+  if (raw === undefined) return config.proPlanCurrency;
+  if (typeof raw !== "string" || !/^[A-Za-z]{3}$/.test(raw.trim())) return null;
+  return raw.trim().toUpperCase();
+}
+
+/**
+ * GET /api/billing/price?currency=NGN — public price + purchasable catalog.
+ * No user data.
+ */
+export const getPrice = async (req: Request, res: Response) => {
   try {
     res.setHeader("Cache-Control", "public, max-age=300, stale-while-revalidate=600");
     res.json({
       billingEnabled: hasBillingConfig(),
-      ...pricingPayload(),
+      ...(await pricingPayload(req.query?.currency)),
     });
   } catch (err: any) {
     console.error("❌ getPrice:", err?.message || err);
@@ -89,7 +106,8 @@ export const getPrice = async (_req: Request, res: Response) => {
 };
 
 /**
- * GET /api/billing/plan — user plan status and location-aware pricing.
+ * GET /api/billing/plan?currency=NGN — user plan status and pricing in the
+ * requested currency.
  */
 import { isTrialActive } from "../services/entitlementService.ts";
 
@@ -187,7 +205,7 @@ export const getPlan = async (req: Request, res: Response) => {
       trialExpiresAt: (user as any)?.trial_expires_at ? new Date((user as any).trial_expires_at).toISOString() : null,
       billingEnabled: hasBillingConfig(),
       subscription,
-      ...pricingPayload(),
+      ...(await pricingPayload(req.query?.currency)),
       offer,
     });
   } catch (err: any) {
@@ -200,8 +218,10 @@ export const getPlan = async (req: Request, res: Response) => {
  * POST /api/billing/checkout — start a purchase of a specific SKU.
  *
  * The body may name `plan` ("prep" | "pro") and `term` ("monthly" | "annual");
- * both default to the headline Pro monthly when omitted. The PRICE for the SKU is
- * resolved server-side inside createCheckout — the body never carries an amount.
+ * both default to the headline Pro monthly when omitted. It may also name a
+ * `currency` from the price list's `currencies` (dollars when omitted). The
+ * PRICE for the SKU is resolved server-side by checkoutPrice — the body never
+ * carries an amount.
  */
 export const startCheckout = async (req: Request, res: Response) => {
   try {
@@ -249,6 +269,10 @@ export const startCheckout = async (req: Request, res: Response) => {
         message: "That plan isn't available to buy yet.",
       });
     }
+    const currency = parseCurrency(req.body);
+    if (!currency) {
+      return res.status(400).json({ error: "Please choose a valid currency." });
+    }
 
     let current: Awaited<ReturnType<typeof getActiveSubscription>>;
     let offer: Awaited<ReturnType<typeof offerFor>>;
@@ -278,7 +302,17 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
-    const paymentPlanId = await ensureProviderPlan(selection.plan, selection.term);
+    // Priced once, here: the payment plan and the first charge must carry the
+    // same amount, even if the exchange rate is re-checked in between.
+    const price = await checkoutPrice(selection.plan, selection.term, currency);
+    if (!price) {
+      return res.status(409).json({
+        error: "currency_unavailable",
+        message: "Paying in that currency isn't available right now. Please refresh the page, or pay in US dollars.",
+      });
+    }
+
+    const paymentPlanId = await ensureProviderPlan(price);
     const freeMonths = offer.eligible ? offer.freeMonths : 0;
     const now = new Date();
     const grantedDays = initialGrantDays(selection.term, freeMonths, now);
@@ -290,7 +324,7 @@ export const startCheckout = async (req: Request, res: Response) => {
         email: (user as any).email,
         name: (user as any).name,
       },
-      selection,
+      price,
       { paymentPlanId, grantedDays, bonusDays },
     );
 

@@ -50,6 +50,14 @@ function currencyEnv(name: string, fallback: string): string {
   return /^[A-Z]{3}$/.test(value) ? value : fallback;
 }
 
+function currencyListEnv(name: string): string[] {
+  const codes = String(process.env[name] || "")
+    .split(",")
+    .map((code) => code.trim().toUpperCase())
+    .filter((code) => /^[A-Z]{3}$/.test(code));
+  return [...new Set(codes)];
+}
+
 export const config = {
   supabaseUrl: normalizeSupabaseProjectUrl(process.env.SUPABASE_URL || ""),
   supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY || "",
@@ -152,6 +160,12 @@ export const config = {
   // change. Amount is MAJOR units (15 = $15.00 USD).
   proPlanAmount: positiveMoneyEnv("PRO_PLAN_AMOUNT", 15),
   proPlanCurrency: currencyEnv("PRO_PLAN_CURRENCY", "USD"),
+  // Currencies a buyer may also see and pay in, converted from the dollar
+  // price at Flutterwave's rate (services/localPriceService.ts), for example
+  // "NGN,KES,GHS,ZAR". Unset means dollars only. Codes the price service has
+  // no rounding rule for are ignored, so list only currencies the Flutterwave
+  // account can collect.
+  billingLocalCurrencies: currencyListEnv("BILLING_LOCAL_CURRENCIES"),
   /** Days of Pro granted per successful payment. */
   proPlanDays: positiveDaysEnv("PRO_PLAN_DAYS", 30),
   /**
@@ -188,9 +202,10 @@ export const config = {
 
 // ── Billing catalog: purchasable SKUs (level × term) ─────────────────────────
 // Two paid levels, each on two terms. Price and day-count are SERVER-SIDE and
-// authoritative: both the display (/price, /plan) and the charge (createCheckout)
-// read the SAME resolver, so what a founder is shown can never drift from what
-// the checkout records and the webhook grants.
+// authoritative: both the display (/price, /plan) and the charge (checkout)
+// start from the SAME resolver, so what a founder is shown can never drift from
+// what the checkout records and the webhook grants. Local-currency prices are
+// converted from these in services/localPriceService.ts.
 export type PaidPlan = "prep" | "pro";
 export type BillingTerm = "monthly" | "annual";
 
@@ -258,15 +273,6 @@ export function resolvePlanPrice(plan: PaidPlan, term: BillingTerm): ResolvedPri
     currency: config.proPlanCurrency,
     days: TERM_DAYS[term],
   };
-}
-
-/** Every purchasable SKU, for the pricing UI. */
-export function listBillingCatalog(): Array<ResolvedPrice & { purchasable: boolean }> {
-  const plans: PaidPlan[] = ["prep", "pro"];
-  const terms: BillingTerm[] = ["monthly", "annual"];
-  return plans.flatMap((p) =>
-    terms.map((t) => ({ ...resolvePlanPrice(p, t), purchasable: isPurchasable(p, t) })),
-  );
 }
 
 
