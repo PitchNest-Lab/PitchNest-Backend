@@ -31,7 +31,7 @@
     "test:founders": "tsx src/tests/founder_test.ts",
     "test:billing": "tsx src/tests/subscription_billing_test.ts",
     "test:ws-admission": "tsx src/tests/ws_admission_test.ts",
-    "test:aws": "tsx --test src/tests/security/*.test.ts src/tests/config/*.test.ts src/tests/artifact/*.test.ts",
+    "test:aws": "node scripts/run-test-files.mjs src/tests/security src/tests/config src/tests/artifact",
     "job:trial-lifecycle": "tsx src/jobs/runTrialLifecycle.ts",
     "build:lambda": "bash build-lambda.sh",
     "build:lambda:prod": "node scripts/build-lambda-prod.mjs",
