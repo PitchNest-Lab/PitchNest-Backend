@@ -1,5 +1,6 @@
 import {
   config,
+  type BillingMode,
   type BillingTerm,
   type PaidPlan,
   type ResolvedPrice,
@@ -169,17 +170,22 @@ export interface SubscriptionRow {
   term: BillingTerm;
   amount: number;
   currency: string;
-  provider_plan_id: number;
+  provider_plan_id: number | null;
   provider_subscription_id: number | null;
   customer_email: string;
   status: "active" | "cancelled";
+  billing_mode: BillingMode;
+  next_charge_at: string | null;
+  last_payment_status: "pending" | "successful" | "failed" | null;
+  last_payment_attempt_at: string | null;
+  renewal_failure_count: number;
   provider_cancel_pending: boolean;
   cancelled_at: string | null;
   created_at: string;
 }
 
 const SUBSCRIPTION_COLUMNS =
-  "id, user_id, plan, term, amount, currency, provider_plan_id, provider_subscription_id, customer_email, status, provider_cancel_pending, cancelled_at, created_at";
+  "id, user_id, plan, term, amount, currency, provider_plan_id, provider_subscription_id, customer_email, status, billing_mode, next_charge_at, last_payment_status, last_payment_attempt_at, renewal_failure_count, provider_cancel_pending, cancelled_at, created_at";
 
 export async function getActiveSubscription(userId: number): Promise<SubscriptionRow | null> {
   const { data, error } = await supabase
@@ -189,7 +195,30 @@ export async function getActiveSubscription(userId: number): Promise<Subscriptio
     .eq("status", "active")
     .maybeSingle();
   if (error) throw error;
-  return (data as SubscriptionRow | null) ?? null;
+  const row = (data as SubscriptionRow | null) ?? null;
+  if (!row || row.billing_mode !== "manual") return row;
+
+  // A manual checkout has no provider event that can close its subscription.
+  // End the database subscription when the entitlement it created has ended,
+  // so the next checkout is a renewal rather than an "already subscribed"
+  // conflict. The access check itself still comes from users.plan_expires_at.
+  const { data: user, error: userError } = await supabase
+    .from("users")
+    .select("plan_expires_at")
+    .eq("id", userId)
+    .maybeSingle();
+  if (userError) throw userError;
+  const expiresAt = (user as any)?.plan_expires_at ? new Date((user as any).plan_expires_at) : null;
+  if (expiresAt && Number.isFinite(expiresAt.getTime()) && expiresAt.getTime() > Date.now()) return row;
+
+  const cancelledAt = new Date().toISOString();
+  const { error: expireError } = await supabase
+    .from("subscriptions")
+    .update({ status: "cancelled", cancelled_at: cancelledAt, provider_cancel_pending: false, updated_at: cancelledAt })
+    .eq("id", row.id)
+    .eq("status", "active");
+  if (expireError) throw expireError;
+  return null;
 }
 
 async function getLatestSubscription(userId: number): Promise<SubscriptionRow | null> {
@@ -209,6 +238,10 @@ export interface SubscriptionView {
   term: BillingTerm;
   amount: number;
   currency: string;
+  status: "active" | "cancelled";
+  billingMode: BillingMode;
+  lastPaymentStatus: "pending" | "successful" | "failed" | null;
+  renewalFailureCount: number;
   /** True while Flutterwave will keep charging. */
   autoRenew: boolean;
   /** Next expected charge while auto-renewing; null once cancelled. */
@@ -218,13 +251,25 @@ export interface SubscriptionView {
 
 export function toSubscriptionView(row: SubscriptionRow, now = new Date()): SubscriptionView {
   const active = row.status === "active";
+  const billingMode: BillingMode = row.billing_mode === "manual" ? "manual" : "auto_renew";
+  const storedNextCharge = row.next_charge_at ? new Date(row.next_charge_at) : null;
   return {
     plan: row.plan,
     term: row.term,
     amount: Number(row.amount),
     currency: row.currency,
-    autoRenew: active,
-    nextChargeAt: active ? nextChargeDate(new Date(row.created_at), row.term, now).toISOString() : null,
+    status: row.status,
+    billingMode,
+    lastPaymentStatus: row.last_payment_status ?? null,
+    renewalFailureCount: Number(row.renewal_failure_count || 0),
+    autoRenew: active && billingMode === "auto_renew",
+    nextChargeAt:
+      active && billingMode === "auto_renew"
+        ? (storedNextCharge && Number.isFinite(storedNextCharge.getTime())
+            ? storedNextCharge
+            : nextChargeDate(new Date(row.created_at), row.term, now)
+          ).toISOString()
+        : null,
     cancelledAt: row.cancelled_at,
   };
 }
@@ -239,6 +284,7 @@ export async function subscriptionViewFor(userId: number): Promise<SubscriptionV
 
 /** Finds and stores the provider's id for this subscription; null when it has none active. */
 async function resolveProviderSubscriptionId(row: SubscriptionRow): Promise<number | null> {
+  if (!row.provider_plan_id) return null;
   if (row.provider_subscription_id) return Number(row.provider_subscription_id);
   const matches = await listProviderSubscriptions({
     email: row.customer_email,
@@ -292,7 +338,16 @@ export async function startSubscriptionAfterPayment(txRef: string, userId: numbe
     const { data } = await supabase.from("users").select("email").eq("id", userId).maybeSingle();
     customerEmail = (data as any)?.email ?? null;
   }
-  const { error } = await supabase.rpc("start_subscription_from_payment", {
+  const { data: payment, error: paymentError } = await supabase
+    .from("payments")
+    .select("billing_mode")
+    .eq("tx_ref", txRef)
+    .maybeSingle();
+  if (paymentError) throw paymentError;
+  const rpcName = payment?.billing_mode === "manual"
+    ? "start_manual_subscription_from_payment"
+    : "start_subscription_from_payment";
+  const { error } = await supabase.rpc(rpcName, {
     p_tx_ref: txRef,
     p_customer_email: customerEmail,
   });
@@ -405,6 +460,11 @@ export async function settleRenewal(
     console.warn(`⚠️ Charge ${tx.providerRef} for user ${userId} has no active subscription; needs review.`);
     return "ignored";
   }
+  const subscriptionMode: BillingMode = subscription.billing_mode === "manual" ? "manual" : "auto_renew";
+  if (subscriptionMode !== "auto_renew" || !subscription.provider_plan_id) {
+    console.warn(`Charge ${tx.providerRef} matched a manual subscription; not granting it as an automatic renewal.`);
+    return "ignored";
+  }
   if (tx.planId && tx.planId !== Number(subscription.provider_plan_id)) {
     console.warn(`⚠️ Charge ${tx.providerRef} is for plan ${tx.planId}, not ${subscription.provider_plan_id}.`);
     return "ignored";
@@ -459,11 +519,97 @@ export async function settleRenewal(
     kind: "subscription_renewal",
     provider_plan_id: Number(subscription.provider_plan_id),
     subscription_id: subscription.id,
+    billing_mode: "auto_renew",
   });
   if (insertError && insertError.code !== "23505") throw insertError;
 
   const granted = await grantAccess({ ...tx, txRef });
+  if (granted) {
+    const nextChargeAt = nextChargeDate(new Date(subscription.created_at), subscription.term, new Date()).toISOString();
+    const { error: stateError } = await supabase
+      .from("subscriptions")
+      .update({
+        next_charge_at: nextChargeAt,
+        last_payment_status: "successful",
+        last_payment_attempt_at: new Date().toISOString(),
+        renewal_failure_count: 0,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", subscription.id);
+    if (stateError) throw stateError;
+  }
   return granted ? "granted" : "replay";
+}
+
+/**
+ * Records a failed automatic renewal without changing the user's paid access.
+ * Flutterwave may retry the card charge before it finally cancels the
+ * provider subscription, so this is deliberately an observable state update,
+ * not an immediate entitlement revocation.
+ */
+export async function recordRenewalFailure(
+  tx: VerifiedTransactionDetails,
+  knownUserId: number | null,
+): Promise<"recorded" | "ignored"> {
+  let userId = knownUserId;
+  if (!userId) {
+    if (!tx.customerEmail) return "ignored";
+    const { data: user, error } = await supabase
+      .from("users")
+      .select("id")
+      .eq("email", tx.customerEmail)
+      .maybeSingle();
+    if (error) throw error;
+    if (!user) return "ignored";
+    userId = Number((user as any).id);
+  }
+
+  const subscription = await getActiveSubscription(userId);
+  const subscriptionMode: BillingMode | null = subscription
+    ? subscription.billing_mode === "manual" ? "manual" : "auto_renew"
+    : null;
+  if (!subscription || subscriptionMode !== "auto_renew" || !subscription.provider_plan_id) {
+    return "ignored";
+  }
+  if (tx.planId && tx.planId !== Number(subscription.provider_plan_id)) return "ignored";
+  if (tx.currency !== String(subscription.currency).toUpperCase()) return "ignored";
+
+  const attemptedAt = new Date().toISOString();
+  const { error: insertError } = await supabase.from("payments").insert({
+    user_id: userId,
+    tx_ref: `pn-renew-failed-${tx.providerRef}`,
+    provider: "flutterwave",
+    status: "failed",
+    amount: Number(tx.amount),
+    currency: tx.currency,
+    plan: subscription.plan,
+    term: subscription.term,
+    granted_days: 0,
+    kind: "subscription_renewal",
+    provider_plan_id: Number(subscription.provider_plan_id),
+    subscription_id: subscription.id,
+    billing_mode: "auto_renew",
+    completed_at: attemptedAt,
+  });
+  if (insertError) {
+    // Flutterwave can resend the same failed charge event. The tx_ref is the
+    // idempotency key; a duplicate must not increment the failure counter.
+    if (insertError.code === "23505") return "ignored";
+    throw insertError;
+  }
+
+  const { error: updateError } = await supabase
+    .from("subscriptions")
+    .update({
+      last_payment_status: "failed",
+      last_payment_attempt_at: attemptedAt,
+      renewal_failure_count: Number(subscription.renewal_failure_count || 0) + 1,
+      updated_at: attemptedAt,
+    })
+    .eq("id", subscription.id)
+    .eq("status", "active");
+  if (updateError) throw updateError;
+  return "recorded";
 }
 
 /**

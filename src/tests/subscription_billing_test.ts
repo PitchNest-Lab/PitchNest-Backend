@@ -49,6 +49,7 @@ const db: Record<string, Row[]> = {
     { id: 12, email: "subscribed@example.com", name: "Subscribed", plan: "pro", plan_expires_at: future(20) },
     { id: 13, email: "pro-annual@example.com", name: "Pro Annual", plan: "pro", plan_expires_at: future(200) },
     { id: 14, email: "deleting@example.com", name: "Leaving", plan: "pro", plan_expires_at: future(10) },
+    { id: 17, email: "switching@example.com", name: "Switching", plan: "pro", plan_expires_at: future(20) },
   ],
   payments: [
     { id: 1, user_id: 11, tx_ref: "pn-11-1700000000000-aaaaaaaaaaaaaaaa", provider: "flutterwave", status: "successful", provider_ref: "500", amount: 15, currency: "USD", plan: "pro", term: "monthly", granted_days: 30, kind: "one_time", bonus_days: 0 },
@@ -57,6 +58,7 @@ const db: Record<string, Row[]> = {
   subscriptions: [
     { id: "sub-12", user_id: 12, plan: "pro", term: "monthly", amount: 15, currency: "USD", provider_plan_id: 7001, provider_subscription_id: null, customer_email: "subscribed@example.com", status: "active", provider_cancel_pending: false, cancelled_at: null, created_at: "2026-09-16T00:00:00.000Z", initial_tx_ref: "pn-12-x" },
     { id: "sub-14", user_id: 14, plan: "pro", term: "monthly", amount: 15, currency: "USD", provider_plan_id: 7001, provider_subscription_id: 9014, customer_email: "deleting@example.com", status: "active", provider_cancel_pending: false, cancelled_at: null, created_at: "2026-09-16T00:00:00.000Z", initial_tx_ref: "pn-14-x" },
+    { id: "sub-17", user_id: 17, plan: "pro", term: "monthly", amount: 15, currency: "USD", provider_plan_id: 7001, provider_subscription_id: 9017, customer_email: "switching@example.com", status: "active", billing_mode: "auto_renew", provider_cancel_pending: false, cancelled_at: null, created_at: "2026-09-16T00:00:00.000Z", initial_tx_ref: "pn-17-x" },
   ],
 };
 let nextPaymentId = 100;
@@ -80,6 +82,7 @@ function fakeFrom(table: string) {
   const query: any = {
     select: (_columns?: string, options?: { head?: boolean }) => { if (options?.head) headCount = true; return query; },
     eq: (column: string, value: unknown) => { filters.push((row) => row[column] === value); return query; },
+    in: (column: string, values: unknown[]) => { filters.push((row) => values.includes(row[column])); return query; },
     order: (column: string, options?: { ascending?: boolean }) => { orderColumn = column; orderAscending = options?.ascending !== false; return query; },
     limit: (n: number) => { limit = n; return query; },
     maybeSingle: async () => ({ data: rows()[0] ?? null, error: null }),
@@ -113,8 +116,8 @@ function fakeFrom(table: string) {
 }
 
 async function fakeRpc(name: string, args: Row) {
+  const payment = db.payments.find((p) => p.tx_ref === args.p_tx_ref);
   if (name === "grant_pro_access") {
-    const payment = db.payments.find((p) => p.tx_ref === args.p_tx_ref);
     if (!payment) return { data: null, error: { message: "UNKNOWN_TX_REF" } };
     if (payment.status === "successful") return { data: false, error: null };
     if (args.p_amount < payment.amount || args.p_currency !== payment.currency) {
@@ -130,7 +133,6 @@ async function fakeRpc(name: string, args: Row) {
     return { data: true, error: null };
   }
   if (name === "start_subscription_from_payment") {
-    const payment = db.payments.find((p) => p.tx_ref === args.p_tx_ref);
     if (!payment || payment.status !== "successful" || payment.kind !== "subscription_initial") return { data: null, error: null };
     if (payment.subscription_id) return { data: payment.subscription_id, error: null };
     const plan = db.billing_provider_plans.find((p) => p.provider_plan_id === payment.provider_plan_id)!;
@@ -143,7 +145,29 @@ async function fakeRpc(name: string, args: Row) {
     db.subscriptions.push({
       id, user_id: payment.user_id, plan: payment.plan, term: payment.term, amount: plan.amount, currency: payment.currency,
       provider_plan_id: payment.provider_plan_id, provider_subscription_id: null,
-      customer_email: String(args.p_customer_email).toLowerCase(), status: "active", provider_cancel_pending: false,
+      customer_email: String(args.p_customer_email).toLowerCase(), status: "active", billing_mode: "auto_renew", provider_cancel_pending: false,
+      cancelled_at: null, created_at: new Date().toISOString(), initial_tx_ref: payment.tx_ref,
+    });
+    payment.subscription_id = id;
+    return { data: id, error: null };
+  }
+  if (name === "start_manual_subscription_from_payment") {
+    if (!payment || payment.status !== "successful") return { data: null, error: null };
+    if (payment.subscription_id) return { data: payment.subscription_id, error: null };
+    for (const sub of db.subscriptions) {
+      if (sub.user_id === payment.user_id && sub.status === "active") {
+        Object.assign(sub, {
+          status: "cancelled",
+          cancelled_at: new Date().toISOString(),
+          provider_cancel_pending: sub.provider_plan_id != null && sub.billing_mode !== "manual",
+        });
+      }
+    }
+    const id = `sub-manual-${nextSubscriptionId++}`;
+    db.subscriptions.push({
+      id, user_id: payment.user_id, plan: payment.plan, term: payment.term, amount: payment.amount, currency: payment.currency,
+      provider_plan_id: null, provider_subscription_id: null,
+      customer_email: String(args.p_customer_email).toLowerCase(), status: "active", billing_mode: "manual", provider_cancel_pending: false,
       cancelled_at: null, created_at: new Date().toISOString(), initial_tx_ref: payment.tx_ref,
     });
     payment.subscription_id = id;
@@ -161,6 +185,7 @@ const transactions = new Map<number, Row>();
 const providerSubscriptions: Array<{ id: number; plan: number; status: string; email: string }> = [
   { id: 9012, plan: 7001, status: "active", email: "subscribed@example.com" },
   { id: 9014, plan: 7001, status: "active", email: "deleting@example.com" },
+  { id: 9017, plan: 7001, status: "active", email: "switching@example.com" },
 ];
 let providerDown = false;
 
@@ -331,6 +356,20 @@ try {
   );
   assert.equal(sub10.provider_subscription_id, 9010, "the provider id is learned for cancelling");
 
+  // The same failed renewal may be delivered more than once; count it once.
+  transactions.set(67, {
+    id: 67, tx_ref: "rpp_failed_renewal", amount: proMonthly.amount, currency: proMonthly.currency,
+    status: "failed", payment_type: "card", customer: { email: "new@example.com" },
+  });
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 67 } }), res);
+  assert.equal(res.statusCode, 200);
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 67 } }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(db.subscriptions.find((s) => s.id === sub10.id)!.renewal_failure_count, 1);
+  assert.equal(db.payments.filter((p) => p.tx_ref === "pn-renew-failed-67").length, 1);
+
   res = recorder();
   await handleWebhook(webhook({ event: "charge.completed", data: { id: 62 } }), res);
   assert.equal(res.body.outcome, "replay");
@@ -371,6 +410,70 @@ try {
   await getPlan(asUser(15), res);
   assert.deepEqual(res.body.offer, { freeMonths: config.firstSubscriptionFreeMonths, eligible: true });
   assert.equal(res.body.subscription, null);
+
+  // Manual renewal: no payment plan is created or sent.
+  calls.length = 0;
+  res = recorder();
+  await startCheckout(asUser(15, { plan: "pro", term: "monthly", billingMode: "manual" }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(calls.some((c) => c.path === "/payment-plans"), false);
+  const manualCheckout = calls.find((c) => c.path === "/payments")!;
+  assert.equal("payment_plan" in manualCheckout.body, false);
+  const manualPayment = db.payments.filter((p) => p.user_id === 15).at(-1)!;
+  assert.equal(manualPayment.billing_mode, "manual");
+  transactions.set(68, {
+    id: 68, tx_ref: manualPayment.tx_ref, amount: manualPayment.amount, currency: manualPayment.currency,
+    status: "successful", payment_type: "card", customer: { email: "fresh@example.com" },
+  });
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 68 } }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const manualSub = db.subscriptions.find((s) => s.user_id === 15 && s.status === "active")!;
+  assert.equal(manualSub.billing_mode, "manual");
+  assert.equal(manualSub.provider_plan_id, null);
+  res = recorder();
+  await getPlan(asUser(15), res);
+  assert.equal(res.body.subscription.autoRenew, false);
+  assert.equal(res.body.subscription.billingMode, "manual");
+
+  // Manual subscriptions expire with paid access and can then be renewed at
+  // the same SKU instead of being rejected as already subscribed.
+  db.users.find((u) => u.id === 15)!.plan_expires_at = new Date(Date.now() - 60_000).toISOString();
+  res = recorder();
+  await getPlan(asUser(15), res);
+  assert.equal(res.body.subscription.status, "cancelled");
+  assert.equal(manualSub.status, "cancelled");
+  calls.length = 0;
+  res = recorder();
+  await startCheckout(asUser(15, { plan: "pro", term: "monthly", billingMode: "manual" }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const manualPayment2 = db.payments.filter((p) => p.user_id === 15 && p.billing_mode === "manual").at(-1)!;
+  transactions.set(69, {
+    id: 69, tx_ref: manualPayment2.tx_ref, amount: manualPayment2.amount, currency: manualPayment2.currency,
+    status: "successful", payment_type: "card", customer: { email: "fresh@example.com" },
+  });
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 69 } }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(db.subscriptions.filter((s) => s.user_id === 15 && s.status === "active").length, 1);
+
+  // Switching automatic renewal to manual also cancels the old Flutterwave
+  // subscription; it must not merely retire our local row.
+  calls.length = 0;
+  res = recorder();
+  await startCheckout(asUser(17, { plan: "pro", term: "monthly", billingMode: "manual" }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const switchPayment = db.payments.filter((p) => p.user_id === 17).at(-1)!;
+  transactions.set(70, {
+    id: 70, tx_ref: switchPayment.tx_ref, amount: switchPayment.amount, currency: switchPayment.currency,
+    status: "successful", payment_type: "card", customer: { email: "switching@example.com" },
+  });
+  res = recorder();
+  await handleWebhook(webhook({ event: "charge.completed", data: { id: 70 } }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  assert.equal(db.subscriptions.find((s) => s.id === "sub-17")!.provider_cancel_pending, false);
+  assert.equal(providerSubscriptions.find((s) => s.id === 9017)!.status, "cancelled");
+  assert.equal(db.subscriptions.filter((s) => s.user_id === 17 && s.status === "active")[0].billing_mode, "manual");
 
   // ── Switching term retires the old subscription at Flutterwave ────────────
   res = recorder();
@@ -499,6 +602,7 @@ try {
 
   // ── Migration ─────────────────────────────────────────────────────────────
   const migration = readFileSync(new URL("../../migrations/0031_recurring_subscriptions.sql", import.meta.url), "utf8");
+  const billingModesMigration = readFileSync(new URL("../../migrations/0036_billing_modes_and_renewal_state.sql", import.meta.url), "utf8");
   assert.match(migration, /CREATE TABLE IF NOT EXISTS subscriptions/);
   assert.match(migration, /CREATE UNIQUE INDEX IF NOT EXISTS subscriptions_one_active_per_user[\s\S]*WHERE status = 'active'/);
   assert.match(migration, /provider_cancel_pending = TRUE/, "a retired subscription is flagged for a provider cancel");
@@ -506,6 +610,11 @@ try {
   assert.match(migration, /REVOKE ALL ON FUNCTION start_subscription_from_payment\(TEXT, TEXT\) FROM PUBLIC, anon, authenticated/);
   assert.match(migration, /VALUES \('0031'/);
   assert.doesNotMatch(migration, /UPDATE users/, "subscriptions never grant access by themselves");
+  assert.match(
+    billingModesMigration,
+    /provider_cancel_pending = \([\s\S]*provider_plan_id IS NOT NULL[\s\S]*billing_mode = 'auto_renew'/,
+    "manual checkout retires an old automatic provider subscription for cancellation",
+  );
 
   console.log("Subscription billing tests passed.");
 } finally {

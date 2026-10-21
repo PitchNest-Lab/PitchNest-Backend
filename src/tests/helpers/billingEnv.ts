@@ -19,6 +19,11 @@ export function applyBillingEnv(checkoutSwitch: string | undefined): void {
   // No first-subscription bonus here, so a checkout grants exactly one period.
   // The free-month offer has its own coverage in subscription_billing_test.ts.
   process.env.FIRST_SUBSCRIPTION_FREE_MONTHS = "0";
+  // Keep security tests deterministic even when a developer's .env enables
+  // broader local-currency or SKU rollout settings.
+  process.env.BILLING_PURCHASABLE_SKUS = "pro:monthly";
+  process.env.BILLING_LOCAL_CURRENCIES = "";
+  process.env.BILLING_AUTO_RENEW_CURRENCIES = "";
   if (checkoutSwitch === undefined) delete process.env.BILLING_CHECKOUT_ENABLED;
   else process.env.BILLING_CHECKOUT_ENABLED = checkoutSwitch;
 }

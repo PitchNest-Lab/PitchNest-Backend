@@ -166,6 +166,11 @@ export const config = {
   // no rounding rule for are ignored, so list only currencies the Flutterwave
   // account can collect.
   billingLocalCurrencies: currencyListEnv("BILLING_LOCAL_CURRENCIES"),
+  // Payment-plan renewals are card-only. Leave this unset to allow the same
+  // explicitly configured currencies as the local catalog, or restrict it to
+  // currencies that Flutterwave has enabled for recurring card payments on the
+  // merchant account.
+  billingAutoRenewCurrencies: currencyListEnv("BILLING_AUTO_RENEW_CURRENCIES"),
   /** Days of Pro granted per successful payment. */
   proPlanDays: positiveDaysEnv("PRO_PLAN_DAYS", 30),
   /**
@@ -208,6 +213,7 @@ export const config = {
 // converted from these in services/localPriceService.ts.
 export type PaidPlan = "prep" | "pro";
 export type BillingTerm = "monthly" | "annual";
+export type BillingMode = "auto_renew" | "manual";
 
 export interface ResolvedPrice {
   plan: PaidPlan;

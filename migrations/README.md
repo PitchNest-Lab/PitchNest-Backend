@@ -44,6 +44,7 @@ Apply in order, staging first:
 | `0033` | `discover_public_businesses_by_support`: the Discover list ordered by support count, then newest, with the same filters as `discover_public_businesses` (unchanged) | Order does not matter. While `FEATURE_DISCOVER_ENGAGEMENT` is on, the backend lists most-supported first; without this function it lists newest first and logs a warning once |
 | `0034` | Example businesses (active publication snapshot `"isExample": true`): `discover_public_businesses_ranked` lists real businesses before examples, then most supported or newest; the sitemap leaves examples out; `list_public_pitches` gains `business_is_example` | Order does not matter. Without it the backend falls back to `0033`, then `0020`, and logs a warning once. The website labels examples from the snapshot flag either way |
 | `0035` | `billing_fx_rates`: units of each local currency per US dollar, as last read from Flutterwave, so every server prices local currencies from the same rate | Apply before setting `BILLING_LOCAL_CURRENCIES`. Without it prices stay in dollars and the backend logs a warning once |
+| `0036` | Billing modes (`auto_renew` or `manual`) and durable subscription renewal state; manual subscriptions may omit a Flutterwave payment plan | Apply before deploying the checkout that offers manual renewal. Set `BILLING_AUTO_RENEW_CURRENCIES` only to currencies enabled for recurring card payments |
 
 Grant moderation access to a trusted account:
 

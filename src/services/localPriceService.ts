@@ -1,7 +1,9 @@
 import {
   config,
+  hasBillingConfig,
   isPurchasable,
   resolvePlanPrice,
+  type BillingMode,
   type BillingTerm,
   type PaidPlan,
   type ResolvedPrice,
@@ -41,6 +43,15 @@ const RULES: Readonly<Record<string, LocalCurrencyRule>> = {
   KES: { step: 10, minRate: 20, maxRate: 2_000 },
   GHS: { step: 1, minRate: 1, maxRate: 500 },
   ZAR: { step: 1, minRate: 2, maxRate: 200 },
+  GBP: { step: 0.01, minRate: 0.2, maxRate: 3 },
+  EUR: { step: 0.01, minRate: 0.2, maxRate: 3 },
+  UGX: { step: 100, minRate: 100, maxRate: 10_000 },
+  RWF: { step: 100, minRate: 100, maxRate: 10_000 },
+  TZS: { step: 100, minRate: 100, maxRate: 10_000 },
+  MWK: { step: 100, minRate: 100, maxRate: 10_000 },
+  EGP: { step: 1, minRate: 5, maxRate: 500 },
+  XAF: { step: 100, minRate: 100, maxRate: 2_000 },
+  XOF: { step: 100, minRate: 100, maxRate: 2_000 },
 };
 
 const MINUTE_MS = 60 * 1000;
@@ -54,6 +65,8 @@ const MIN_MOVE = 0.02;
 /** One catalog entry in the currency the buyer asked for. */
 export type PricedSku = ResolvedPrice & {
   purchasable: boolean;
+  /** Payment paths available for this currency on the current merchant account. */
+  billingModes: BillingMode[];
   /** On a converted price only: the dollar price it was converted from. */
   baseAmount?: number;
   baseCurrency?: string;
@@ -81,6 +94,23 @@ function localCurrencies(): string[] {
   return config.billingLocalCurrencies.filter((code) => Object.hasOwn(RULES, code));
 }
 
+/**
+ * Payment-plan renewals are card-only at Flutterwave. Manual renewal remains
+ * available for every currency we intentionally expose in the catalog.
+ * An empty auto-renew list preserves the existing rollout behaviour while an
+ * operator can restrict recurring billing to explicitly enabled currencies.
+ */
+export function billingModesFor(currency: string): BillingMode[] {
+  const normalized = currency.toUpperCase();
+  const autoRenewAllowed =
+    config.billingAutoRenewCurrencies.length === 0 || config.billingAutoRenewCurrencies.includes(normalized);
+  return autoRenewAllowed ? ["auto_renew", "manual"] : ["manual"];
+}
+
+export function isBillingModeAvailable(currency: string, mode: BillingMode): boolean {
+  return billingModesFor(currency).includes(mode);
+}
+
 function plausible(currency: string, usdRate: number): boolean {
   const rule = RULES[currency];
   return Number.isFinite(usdRate) && usdRate >= rule.minRate && usdRate <= rule.maxRate;
@@ -90,7 +120,13 @@ function plausible(currency: string, usdRate: number): boolean {
 export function convertFromUsd(usdAmount: number, usdRate: number, currency: string): number {
   const step = RULES[currency].step;
   // The epsilon stops float noise (2175.0000000000005 steps) adding a whole step.
-  return Math.ceil((usdAmount * usdRate) / step - 1e-9) * step;
+  const rounded = Math.ceil((usdAmount * usdRate) / step - 1e-9) * step;
+  // JavaScript's binary floats can turn a valid two-decimal price such as
+  // 69.96 into 69.96000000000001. Flutterwave plan lookup compares the stored
+  // numeric amount exactly, so return the currency's decimal representation,
+  // not the intermediate binary-float artefact.
+  const decimalPlaces = Math.max(0, (String(step).split(".")[1] ?? "").length);
+  return Number(rounded.toFixed(decimalPlaces));
 }
 
 async function readRates(currencies: string[]): Promise<Map<string, Rate> | null> {
@@ -161,6 +197,10 @@ async function recheckRate(currency: string, stored: Rate | undefined, now: numb
 /** Rates for the local currencies offered right now, re-checking any that are a day old. */
 async function usableRates(now: number): Promise<Map<string, number>> {
   const usable = new Map<string, number>();
+  // The billing kill switch also stops outbound Flutterwave rate requests. A
+  // disabled checkout falls back to the USD catalog without touching the
+  // provider, which keeps the closed state genuinely closed.
+  if (!hasBillingConfig()) return usable;
   const currencies = localCurrencies();
   if (currencies.length === 0) return usable;
   const stored = await readRates(currencies);
@@ -201,12 +241,15 @@ export async function priceListIn(requested: unknown, now = Date.now()): Promise
     catalog: PLANS.flatMap((plan) =>
       TERMS.map((term): PricedSku => {
         const price = resolvePlanPrice(plan, term);
-        if (usdRate === undefined) return { ...price, purchasable: isPurchasable(plan, term) };
+        if (usdRate === undefined) {
+          return { ...price, purchasable: isPurchasable(plan, term), billingModes: billingModesFor(price.currency) };
+        }
         return {
           ...price,
           amount: convertFromUsd(price.amount, usdRate, currency),
           currency,
           purchasable: isPurchasable(plan, term),
+          billingModes: billingModesFor(currency),
           baseAmount: price.amount,
           baseCurrency: price.currency,
         };

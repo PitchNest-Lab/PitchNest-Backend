@@ -14,6 +14,10 @@ assert.equal(convertFromUsd(9.99, 1450, "NGN"), 14_500);
 assert.equal(convertFromUsd(15, 129.4, "KES"), 1_950, "shillings round to 10");
 assert.equal(convertFromUsd(15, 11.2, "GHS"), 168, "cedis round to 1");
 assert.equal(convertFromUsd(99.9, 17.43, "ZAR"), 1_742, "rand round to 1");
+assert.equal(convertFromUsd(99.9, 0.7003, "GBP"), 69.96, "pound prices do not retain binary-float noise");
+assert.equal(convertFromUsd(15, 0.933, "EUR"), 14, "euro prices are normalized to cents");
+assert.equal(convertFromUsd(15, 3_500, "UGX"), 52_500, "Ugandan shillings round to 100");
+assert.equal(convertFromUsd(15, 50, "EGP"), 750, "Egyptian pounds round to 1");
 
 // ── Fake database ────────────────────────────────────────────────────────────
 type Row = Record<string, any>;
@@ -103,7 +107,7 @@ async function fakeRpc(name: string, args: Row) {
 
 // ── Fake Flutterwave ─────────────────────────────────────────────────────────
 // Units of each currency per dollar, as Flutterwave would quote them.
-const quotes: Record<string, number> = { NGN: 1450, KES: 129.4, GHS: 11.2, ZAR: 17.43 };
+const quotes: Record<string, number> = { NGN: 1450, KES: 129.4, GHS: 11.2, ZAR: 17.43, EUR: 0.92 };
 const rateCalls: string[] = [];
 let ratesDown = false;
 type Call = { method: string; path: string; body: any };
@@ -209,13 +213,13 @@ try {
   mutableConfig.billingLocalCurrencies = ["NGN", "KES", "GHS", "ZAR", "EUR"];
   list = await priceListIn("ngn", T0);
   assert.equal(list.currency, "NGN");
-  assert.deepEqual(list.currencies, ["USD", "NGN", "KES", "GHS", "ZAR"], "EUR has no rounding rule and is ignored");
+  assert.deepEqual(list.currencies, ["USD", "NGN", "KES", "GHS", "ZAR", "EUR"]);
   assert.deepEqual(
     { amount: pro(list).amount, currency: pro(list).currency, baseAmount: pro(list).baseAmount, baseCurrency: pro(list).baseCurrency },
     { amount: convertFromUsd(proMonthly.amount, 1450, "NGN"), currency: "NGN", baseAmount: proMonthly.amount, baseCurrency: "USD" },
   );
   assert.ok(list.catalog.every((item) => item.currency === "NGN" && item.purchasable === true));
-  assert.deepEqual([...rateCalls].sort(), ["GHS", "KES", "NGN", "ZAR"]);
+  assert.deepEqual([...rateCalls].sort(), ["EUR", "GHS", "KES", "NGN", "ZAR"]);
   assert.equal(rateRow("NGN").usd_rate, 1450);
   assert.equal(rateRow("KES").usd_rate, 129.4);
 
@@ -228,7 +232,7 @@ try {
   // ── A day later: small moves keep the price, big moves change it ──────────
   quotes.NGN = 1470; // +1.4%
   list = await priceListIn("NGN", T0 + 25 * HOUR);
-  assert.equal(rateCalls.length, 4, "every day-old rate is re-checked");
+  assert.equal(rateCalls.length, 5, "every day-old rate is re-checked");
   assert.equal(rateRow("NGN").usd_rate, 1450, "a move under 2% keeps the rate");
   assert.equal(rateRow("NGN").checked_at, new Date(T0 + 25 * HOUR).toISOString(), "and records the check");
   assert.equal(rateRow("NGN").updated_at, new Date(T0).toISOString());
@@ -253,9 +257,9 @@ try {
   const T3 = T2 + 3 * DAY;
   list = await priceListIn("NGN", T3);
   assert.equal(list.currency, "NGN", "a rate a few days old prices while Flutterwave is down");
-  assert.equal(rateCalls.length, 4);
+  assert.equal(rateCalls.length, 5);
   await priceListIn("NGN", T3 + 5 * 60_000);
-  assert.equal(rateCalls.length, 4, "and Flutterwave is not asked again straight away");
+  assert.equal(rateCalls.length, 5, "and Flutterwave is not asked again straight away");
 
   const T8 = T2 + 8 * DAY;
   list = await priceListIn("NGN", T8);
@@ -269,7 +273,7 @@ try {
   quotes.GHS = 0.0893; // the inverse of a real rate
   list = await priceListIn("GHS", T8 + HOUR);
   assert.equal(list.currency, "USD", "an implausible quote is never priced from");
-  assert.deepEqual(list.currencies, ["USD", "NGN", "KES", "ZAR"]);
+  assert.deepEqual(list.currencies, ["USD", "NGN", "KES", "ZAR", "EUR"]);
   assert.equal(rateRow("GHS").usd_rate, 11.2, "nor stored");
 
   // ── Before migration 0035: dollars, no error ──────────────────────────────

@@ -5,6 +5,7 @@ import {
   isPaidPlan,
   isBillingTerm,
   isPurchasable,
+  type BillingMode,
   type PaidPlan,
   type BillingTerm,
 } from "../config/env.ts";
@@ -27,12 +28,13 @@ import {
   initialGrantDays,
   offerFor,
   retryPendingProviderCancels,
+  recordRenewalFailure,
   settleRenewal,
   startSubscriptionAfterPayment,
   subscriptionViewFor,
   SubscriptionError,
 } from "../services/subscriptionService.ts";
-import { checkoutPrice, priceListIn } from "../services/localPriceService.ts";
+import { checkoutPrice, isBillingModeAvailable, priceListIn } from "../services/localPriceService.ts";
 
 /**
  * The featured price (Pro, monthly) plus the full purchasable catalog, in the
@@ -86,6 +88,12 @@ function parseCurrency(body: any): string | null {
   if (raw === undefined) return config.proPlanCurrency;
   if (typeof raw !== "string" || !/^[A-Za-z]{3}$/.test(raw.trim())) return null;
   return raw.trim().toUpperCase();
+}
+
+function parseBillingMode(body: any): BillingMode | null {
+  const raw = body?.billingMode;
+  if (raw === undefined) return "auto_renew";
+  return raw === "auto_renew" || raw === "manual" ? raw : null;
 }
 
 /**
@@ -273,6 +281,16 @@ export const startCheckout = async (req: Request, res: Response) => {
     if (!currency) {
       return res.status(400).json({ error: "Please choose a valid currency." });
     }
+    const billingMode = parseBillingMode(req.body);
+    if (!billingMode) {
+      return res.status(400).json({ error: "Please choose a valid renewal option." });
+    }
+    if (!isBillingModeAvailable(currency, billingMode)) {
+      return res.status(409).json({
+        error: "billing_mode_unavailable",
+        message: "Automatic renewal is not available for that currency. Choose manual renewal or another currency.",
+      });
+    }
 
     let current: Awaited<ReturnType<typeof getActiveSubscription>>;
     let offer: Awaited<ReturnType<typeof offerFor>>;
@@ -283,7 +301,14 @@ export const startCheckout = async (req: Request, res: Response) => {
       return res.status(503).json({ error: "Checkout is temporarily unavailable." });
     }
 
-    if (current && current.plan === selection.plan && current.term === selection.term) {
+    if (
+      current &&
+      current.plan === selection.plan &&
+      current.term === selection.term &&
+      String(current.currency).toUpperCase() === currency &&
+      (current.billing_mode ?? "auto_renew") === billingMode &&
+      billingMode !== "manual"
+    ) {
       return res.status(409).json({
         error: "already_subscribed",
         message: "You're already subscribed to this plan.",
@@ -312,7 +337,7 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
-    const paymentPlanId = await ensureProviderPlan(price);
+    const paymentPlanId = billingMode === "auto_renew" ? await ensureProviderPlan(price) : undefined;
     const freeMonths = offer.eligible ? offer.freeMonths : 0;
     const now = new Date();
     const grantedDays = initialGrantDays(selection.term, freeMonths, now);
@@ -325,7 +350,7 @@ export const startCheckout = async (req: Request, res: Response) => {
         name: (user as any).name,
       },
       price,
-      { paymentPlanId, grantedDays, bonusDays },
+      { paymentPlanId, grantedDays, bonusDays, billingMode },
     );
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
@@ -429,6 +454,7 @@ export const handleWebhook = async (req: Request, res: Response) => {
     if (verified.status !== "successful" && verified.status !== "succeeded") {
       console.log(`ℹ️ Transaction ${verified.txRef} verified as '${verified.status}'; not granting.`);
       if (ours) await markPaymentFailed(verified.txRef);
+      else await recordRenewalFailure(verified, null);
       return res.status(200).json({ received: true });
     }
 

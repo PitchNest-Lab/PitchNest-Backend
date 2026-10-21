@@ -53,7 +53,15 @@ test("public price: billingEnabled=false and Pro monthly is USD 15 for 30 days",
   assert.equal(r.json.billingEnabled, false, "keys alone must not enable billing");
   assert.deepEqual(r.json.price, { amount: 15, currency: "USD", days: 30 });
   const proMonthly = r.json.catalog.find((c: any) => c.plan === "pro" && c.term === "monthly");
-  assert.deepEqual(proMonthly, { plan: "pro", term: "monthly", amount: 15, currency: "USD", days: 30, purchasable: true });
+  assert.deepEqual(proMonthly, {
+    plan: "pro",
+    term: "monthly",
+    amount: 15,
+    currency: "USD",
+    days: 30,
+    purchasable: true,
+    billingModes: ["auto_renew", "manual"],
+  });
   const founderMonthly = r.json.catalog.find((c: any) => c.plan === "prep" && c.term === "monthly");
   assert.equal(founderMonthly.amount, 9.99, "Founder stays at USD 9.99");
   const unsold = r.json.catalog.filter((c: any) => !(c.plan === "pro" && c.term === "monthly"));

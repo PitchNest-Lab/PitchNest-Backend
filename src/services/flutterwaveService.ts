@@ -3,6 +3,7 @@ import {
   config,
   hasBillingConfig,
   isPurchasable,
+  type BillingMode,
   type ResolvedPrice,
 } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
@@ -93,9 +94,10 @@ export async function createCheckout(
   },
   price: ResolvedPrice,
   subscription: {
-    paymentPlanId: number;
+    paymentPlanId?: number;
     grantedDays: number;
     bonusDays: number;
+    billingMode?: BillingMode;
   },
 ): Promise<CheckoutSession> {
   // Same gates as the controller, enforced again here so no other caller can
@@ -109,6 +111,11 @@ export async function createCheckout(
 
   const txRef = mintTxRef(user.id);
   const { amount, currency } = price;
+  const billingMode = subscription.billingMode ?? "auto_renew";
+  if (billingMode === "auto_renew" && !Number.isSafeInteger(subscription.paymentPlanId)) {
+    throw new CheckoutError("PLAN_NOT_AVAILABLE", "automatic renewal requires a provider payment plan");
+  }
+  const providerPlanId = billingMode === "auto_renew" ? subscription.paymentPlanId : undefined;
 
   const planLabel = price.plan === "pro" ? "Pro Founder" : "Founder";
   const termLabel = price.term === "annual" ? "year" : "month";
@@ -126,7 +133,8 @@ export async function createCheckout(
       term: price.term,
       granted_days: subscription.grantedDays,
       kind: "subscription_initial",
-      provider_plan_id: subscription.paymentPlanId,
+      provider_plan_id: providerPlanId ?? null,
+      billing_mode: billingMode,
       bonus_days: subscription.bonusDays,
     },
   ]);
@@ -147,9 +155,10 @@ export async function createCheckout(
         tx_ref: txRef,
         amount,
         currency,
-        // Subscribes this card to the plan. Flutterwave fixes the payment
-        // method to card and charges again every period until cancelled.
-        payment_plan: subscription.paymentPlanId,
+        // A payment plan subscribes this card to automatic renewal. Manual
+        // checkout intentionally omits it so Flutterwave can offer the
+        // payment methods enabled for the selected currency.
+        ...(providerPlanId ? { payment_plan: providerPlanId } : {}),
         redirect_url: `${config.appBaseUrl}/billing/return`,
         customer: {
           email: user.email,
@@ -158,10 +167,10 @@ export async function createCheckout(
         customizations: {
           title: `PitchNest ${planLabel}`,
           description:
-            `PitchNest ${planLabel}, renews every ${termLabel} until you cancel` +
+            `PitchNest ${planLabel}, ${billingMode === "auto_renew" ? `renews every ${termLabel} until you cancel` : "one-time payment; renew manually"}` +
             (subscription.bonusDays > 0 ? ". Your free month is added on top." : "."),
         },
-        meta: { user_id: user.id, plan: price.plan, term: price.term },
+        meta: { user_id: user.id, plan: price.plan, term: price.term, billing_mode: billingMode },
       }),
     });
   } catch (err: any) {
