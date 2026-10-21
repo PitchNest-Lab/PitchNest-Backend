@@ -7,7 +7,7 @@
     "node": ">=22 <25"
   },
   "scripts": {
-    "start": "node --max-old-space-size=384 ./node_modules/tsx/dist/cli.mjs server.ts",
+    "start": "node --max-old-space-size=320 ./node_modules/tsx/dist/cli.mjs server.ts",
     "dev": "tsx watch server.ts",
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",

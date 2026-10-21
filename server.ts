@@ -10,6 +10,12 @@ import { checkApiKeyStatus } from "./src/services/aiService.ts";
 import { checkTtsStatus } from "./src/services/ttsService.ts";
 import { startTrialLifecycleJob } from "./src/jobs/trialLifecycle.ts";
 
+// Once the platform asks this instance to stop, do not admit a new live room
+// that would be terminated moments later. Existing sockets are still closed by
+// the shutdown path below; this guard makes the hand-off deterministic and is
+// the first step toward graceful draining during paid Render deploys.
+let isDraining = false;
+
 const server = createServer(app);
 const wss = new WebSocketServer({
   server,
@@ -24,6 +30,8 @@ const wss = new WebSocketServer({
   handleProtocols: (protocols) =>
     protocols.has("pitchnest-v1") ? "pitchnest-v1" : false,
   verifyClient: ({ origin }, done) => {
+    if (isDraining) return done(false, 503, "Service is restarting");
+
     // Native/mobile and server clients may omit Origin. Browser clients always
     // send it and must match the same explicit allowlist as HTTP CORS.
     if (!origin || isAllowedBrowserOrigin(origin)) return done(true);
@@ -74,6 +82,7 @@ let shuttingDown = false;
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
+  isDraining = true;
   console.log(`\n${signal} received; draining HTTP and WebSocket connections.`);
   for (const socket of wss.clients) socket.close(1012, "Service restarting");
   wss.close();
