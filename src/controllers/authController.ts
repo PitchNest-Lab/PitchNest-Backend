@@ -19,6 +19,7 @@ import {
   safeEqualText,
 } from "../utils/authTokens.ts";
 import { withTimeout } from "../utils/withTimeout.ts";
+import { startResponseFloor } from "../utils/responseFloor.ts";
 import { revokeUserSockets } from "../sockets/restSocket.ts";
 import {
   ACCESS_TOKEN_AUDIENCE,
@@ -376,6 +377,10 @@ export const signup = async (req: Request, res: Response) => {
       return res.status(400).json({ error: "That organization invitation is invalid." });
     }
 
+    // Every outcome from here replies with genericSignup after at least the
+    // same wait, whether or not the address already has an account.
+    const replyFloor = startResponseFloor();
+
     const { data: existingUser, error: existingUserError } = await supabase
       .from("users")
       .select("*")
@@ -386,22 +391,18 @@ export const signup = async (req: Request, res: Response) => {
       return res.status(503).json({ error: "Signup is temporarily unavailable." });
     }
 
-    const is_verified = existingUser?.isEmailVerified;
-
     if (existingUser) {
-      if (!is_verified) {
-        // Auto-resend so a genuinely-stuck owner can still verify. Best-effort.
-        sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
+      // Send a fresh code so a genuinely stuck owner can still verify. A
+      // verified account gets no email, only the same reply. Best-effort.
+      if (!existingUser.isEmailVerified) {
+        await sendVerificationEmail(existingUser.id, cleanEmail).catch((err) => {
           console.error(
             "Failed to resend verification email on signup retry:",
             err,
           );
         });
-        return res.status(200).json(genericSignup);
       }
-
-      // If the account is already verified, provide honest and actionable feedback:
-      // do not redirect them to /verify waiting for a phantom email that was never sent.
+      await replyFloor();
       return res.status(200).json(genericSignup);
     }
     // Hash password before storing
@@ -444,13 +445,18 @@ export const signup = async (req: Request, res: Response) => {
     // this), so returning a token here would be a usable session for an
     // unverified account — the takeover vector we are closing. The client routes
     // to the /verify screen on `requiresVerification`.
-    sendVerificationEmail(newUser.id, cleanEmail).catch((err) => {
+    //
+    // Awaited: on Lambda nothing runs after the reply is sent, so an unawaited
+    // send would sit frozen until some later request woke the function, and the
+    // founder would wait on a code that had not gone out.
+    await sendVerificationEmail(newUser.id, cleanEmail).catch((err) => {
       console.error("Failed to send verification email:", err);
     });
 
     // 200 (not 201) to match the existing-account branch above: a different
     // status would let an attacker distinguish a new email from a registered
     // one, defeating the identical-body anti-enumeration measure.
+    await replyFloor();
     res.status(200).json(genericSignup);
   } catch (error) {
     console.error("Signup error:", error);
@@ -908,67 +914,77 @@ export const forgotPassword = async (req: Request, res: Response) => {
   const generic = {
     message: "If an account with that email exists, a reset link has been sent.",
   };
+  const replyFloor = startResponseFloor();
   try {
     const { email } = req.body;
     if (typeof email !== "string" || !email.trim() || email.length > 254) {
       return res.status(400).json({ error: "A valid email is required." });
     }
-    const cleanEmail = email.toLowerCase().trim();
+    await sendPasswordResetEmail(email.toLowerCase().trim());
+  } catch (error) {
+    console.error("Forgot password error:", error);
+  }
+  // Always 200 with the SAME message after at least the same wait, so neither
+  // the reply nor its timing shows whether the address has an account.
+  await replyFloor();
+  res.status(200).json(generic);
+};
 
-    const { data: user, error: userLookupError } = await supabase
-      .from("users")
-      .select("id, email, auth_provider")
-      .eq("email", cleanEmail)
-      .maybeSingle();
-    if (userLookupError) {
-      console.error("Password reset account lookup failed:", userLookupError.message);
-      return res.status(200).json(generic);
-    }
+/**
+ * Emails a reset link when the address belongs to a password account, and does
+ * nothing otherwise. Resolves only once the mail provider has accepted the
+ * email (or the attempt failed): on Lambda nothing runs after the reply is
+ * sent, so an unawaited send would sit frozen until a later request.
+ */
+async function sendPasswordResetEmail(cleanEmail: string): Promise<void> {
+  const { data: user, error: userLookupError } = await supabase
+    .from("users")
+    .select("id, email, auth_provider")
+    .eq("email", cleanEmail)
+    .maybeSingle();
+  if (userLookupError) {
+    console.error("Password reset account lookup failed:", userLookupError.message);
+    return;
+  }
+  if (!user) return;
 
-    // Always return 200 with the SAME message to prevent email enumeration.
-    if (!user) return res.status(200).json(generic);
+  // Google accounts have no usable password — a reset would set one that
+  // still can't log in (method lock). Point the user at Google instead.
+  if (user.auth_provider === "google") return;
 
-    // Google accounts have no usable password — a reset would set one that
-    // still can't log in (method lock). Point the user at Google instead.
-    if (user.auth_provider === "google") {
-      return res.status(200).json(generic);
-    }
+  // Generate a reset token and store it
+  const resetToken = crypto.randomBytes(32).toString("hex");
+  const resetDigest = hashAuthToken("password-reset", resetToken);
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
 
-    // Generate a reset token and store it
-    const resetToken = crypto.randomBytes(32).toString("hex");
-    const resetDigest = hashAuthToken("password-reset", resetToken);
-    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString(); // 1 hour
+  const { error: clearError } = await supabase
+    .from("password_resets")
+    .delete()
+    .eq("user_id", user.id);
+  if (clearError) throw clearError;
 
-    const { error: clearError } = await supabase
-      .from("password_resets")
-      .delete()
-      .eq("user_id", user.id);
-    if (clearError) throw clearError;
+  const { error: resetInsertError } = await supabase.from("password_resets").insert([
+    {
+      user_id: user.id,
+      token: resetDigest,
+      expires_at: expiresAt,
+      used: false,
+    },
+  ]);
+  if (resetInsertError) throw resetInsertError;
+  const baseUrl = config.clientUrl;
+  const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
 
-    const { error: resetInsertError } = await supabase.from("password_resets").insert([
-      {
-        user_id: user.id,
-        token: resetDigest,
-        expires_at: expiresAt,
-        used: false,
-      },
-    ]);
-    if (resetInsertError) throw resetInsertError;
-    const baseUrl = config.clientUrl;
-    const resetLink = `${baseUrl}/reset-password?token=${resetToken}`;
+  if (!resend) {
+    console.error(
+      "❌ Password reset email not sent: RESEND_API_KEY is missing or still set to re_xxxxxxxxx.",
+    );
+    await supabase.from("password_resets").delete().eq("token", resetDigest);
+    return;
+  }
 
-    if (!resend) {
-      console.error(
-        "❌ Password reset email not sent: RESEND_API_KEY is missing or still set to re_xxxxxxxxx.",
-      );
-      await supabase.from("password_resets").delete().eq("token", resetDigest);
-      return res.status(200).json(generic);
-    }
-
-    // The response does not wait on the mail provider. This keeps account
-    // existence from being observable through a several-second timing gap.
-    res.status(200).json(generic);
-    void withTimeout(resend.emails.send({
+  try {
+    const { error } = await withTimeout(resend.emails.send({
         from: config.emailFrom,
         replyTo: config.emailReplyTo,
         to: user.email,
@@ -994,22 +1010,15 @@ export const forgotPassword = async (req: Request, res: Response) => {
     `,
       }, {
         idempotencyKey: `password-reset/${user.id}/${resetDigest.slice(0, 32)}`,
-      }), 15_000, "Password reset email request")
-      .then(async ({ error }) => {
-        if (!error) return;
-        console.error("❌ Password reset email send failed:", error.message);
-        await supabase.from("password_resets").delete().eq("token", resetDigest);
-      })
-      .catch(async (mailErr: any) => {
-        console.error("❌ Password reset email send failed:", mailErr?.message || mailErr);
-        await supabase.from("password_resets").delete().eq("token", resetDigest);
-      });
-    return;
-  } catch (error) {
-    console.error("Forgot password error:", error);
-    res.status(200).json(generic);
+      }), 15_000, "Password reset email request");
+    if (!error) return;
+    console.error("❌ Password reset email send failed:", error.message);
+  } catch (mailErr: any) {
+    console.error("❌ Password reset email send failed:", mailErr?.message || mailErr);
   }
-};
+  // The email did not go out, so the link it would have carried must not work.
+  await supabase.from("password_resets").delete().eq("token", resetDigest);
+}
 
 export const verifyEmail = async (req: Request, res: Response) => {
   try {
@@ -1251,6 +1260,7 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
   const generic = {
     message: "If an unverified account exists for that email, a verification link has been sent.",
   };
+  const replyFloor = startResponseFloor();
   try {
     const { email } = req.body;
     // Normalize exactly as signup does (it stores email.toLowerCase().trim()).
@@ -1267,24 +1277,21 @@ export const resendEmailVerification = async (req: Request, res: Response) => {
       .eq("email", cleanEmail)
       .maybeSingle();
 
-    // If no user exists, generic success to prevent enumeration
-    if (!user) return res.json(generic);
-
-    // If the account is already verified, give explicit feedback so the user knows to log in
-    if (user.isEmailVerified) {
-      return res.json(generic);
+    // Only an unverified account gets an email. Awaited: on Lambda nothing runs
+    // after the reply is sent, so an unawaited send would sit frozen until a
+    // later request woke the function.
+    if (user && !user.isEmailVerified) {
+      await sendVerificationEmail(user.id, cleanEmail).catch((err) => {
+        console.error("Failed to resend verification email:", err);
+      });
     }
-
-    // Don't block the response on email delivery
-    sendVerificationEmail(user.id, cleanEmail).catch((err) => {
-      console.error("Failed to resend verification email:", err);
-    });
-
-    res.json(generic);
   } catch (error) {
     console.error("resend Email verification error:", error);
-    res.json(generic);
   }
+  // Unknown, verified and unverified addresses all get the same reply after at
+  // least the same wait, so neither shows whether the address has an account.
+  await replyFloor();
+  res.json(generic);
 };
 
 /**
