@@ -6,6 +6,7 @@
  * AI never loses numbers, dates, traction, pricing, market, business model,
  * or previous statements, and performs temporal & mathematical reasoning.
  */
+import { classifyFundingStage } from "../prompts/fundingStage.ts";
 
 export type StartupStage = "idea" | "pre_revenue" | "early_revenue" | "growth";
 
@@ -142,14 +143,15 @@ export function createPitchSessionState(
   };
 }
 
+// The starting point follows the shared stage classifier, so the memory's
+// yardstick and the prompt's FOUNDER'S STAGE block describe the same founder.
+// What the founder says can still move it (a recent launch, paying customers).
 function inferInitialStage(stageStr: string): StartupStage {
-  const s = (stageStr || "").toLowerCase();
-  if (/growth|series [b-z]|scale/i.test(s)) return "growth";
-  if (/series a|early revenue|generating revenue/i.test(s)) return "early_revenue";
-  if (/pre[- ]?seed|pilot|beta|waitlist/i.test(s)) return "pre_revenue";
-  if (/idea|bootstrap|concept|pre-launch/i.test(s)) return "idea";
-  if (/seed/i.test(s)) return "early_revenue";
-  return "pre_revenue";
+  const band = classifyFundingStage(stageStr);
+  if (band === "idea") return "idea";
+  if (band === "pre_seed") return "pre_revenue";
+  if (band === "seed") return "early_revenue";
+  return "growth";
 }
 
 /**
@@ -618,13 +620,13 @@ export function buildPitchMemoryPromptBlock(state: PitchSessionState): string {
   // Stage-calibrated guidance
   parts.push(`STAGE-APPROPRIATE EVALUATION YARDSTICK:`);
   if (state.inferredStage === "idea") {
-    parts.push(`- Idea stage: Zero users/revenue is NORMAL. Focus on problem validation, customer discovery, founder insight, and early prototype plan. NEVER demand retention cohorts or revenue.`);
+    parts.push(`- Idea stage: no users or revenue is NORMAL. Focus on the problem, the customer, the founder's insight and the plan. NEVER ask for revenue, retention or unit economics.`);
   } else if (state.inferredStage === "pre_revenue") {
-    parts.push(`- Pre-revenue stage: Focus on early LOIs, waitlist depth, pilots, user testing feedback, and path to first customer. Do not penalize absence of scaled metrics.`);
+    parts.push(`- Pre-revenue stage: no revenue is NORMAL. Customer conversations, a prototype, a waitlist or a pilot are a bonus if they exist, never a requirement. Focus on the problem, the customer and the path to the first customers.`);
   } else if (state.inferredStage === "early_revenue") {
-    parts.push(`- Early revenue stage: Focus on paying customer feedback, pricing logic, early growth, unit economics direction, and acquisition channels.`);
+    parts.push(`- Early signals stage: ask what first users or paying customers say, the pricing logic and early growth. Estimates are fine; do not demand scaled metrics.`);
   } else {
-    parts.push(`- Growth stage: Expect concrete metrics (CAC, LTV, churn, growth rate, sales efficiency, margins). Push hard on defensibility and capital efficiency.`);
+    parts.push(`- Series A or later: real numbers are expected (revenue, growth, retention, unit economics, margins). Ask for them plainly and judge them fairly.`);
   }
 
   parts.push(`=== END PITCH MEMORY ===`);

@@ -59,7 +59,9 @@ function getVerdict(score: number, isInsufficient: boolean, mode: string = "pane
   }
   if (score >= 80) return "Strong Buy (Invest)";
   if (score >= 60) return "Consideration (Follow Up)";
-  return "Decline to Invest";
+  // Honest without closing the door: most founders here are early, and the
+  // label is read as the panel's last word. Mirrors the website's verdictLabel.
+  return "Not Yet — Keep Building";
 }
 
 function getVerdictColor(score: number, isInsufficient: boolean): string {
@@ -1353,8 +1355,10 @@ export async function generatePitchReportPDF(session: any): Promise<Buffer> {
       const benchmarkData = [
         { label: "Your Overall Score", val: isInsufficient ? 0 : overallScore, color: COLORS.primary },
         { label: "Readiness benchmark (average)", val: AVERAGE_FOUNDER_SCORE, color: COLORS.textLight },
-        { label: "Strong pitch benchmark", val: 68, color: COLORS.textLight },
-        { label: "Exceptional pitch benchmark", val: 80, color: COLORS.textLight }
+        // The bands of the scoring scale (aiService SCORING_SCALE): 70 starts
+        // "good for this stage", 85 starts "exceptional".
+        { label: "Strong pitch benchmark", val: 70, color: COLORS.textLight },
+        { label: "Exceptional pitch benchmark", val: 85, color: COLORS.textLight }
       ];
 
       let barY = ty + 65;

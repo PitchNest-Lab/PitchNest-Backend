@@ -3028,7 +3028,7 @@ export function initRestSocket(wss: WebSocketServer) {
             .join(", ");
 
           enqueueTurn({
-            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:") and give ONE specific, personalized reason tied to something the founder actually said or failed to address during this pitch. Weigh this fairly: actively look for the reasons to say YES, not just the reasons to say no. If the pitch genuinely supports it, say you are IN ("I'm in because…") — a conditional yes is allowed ("I'm in, provided you can prove out the retention numbers"). Only say you are OUT ("I'm out because…") when there is a specific, concrete blocker you cannot get past — never as a reflex. If you are genuinely on the fence, say so honestly and name the ONE thing that would tip you. Do not invent flaws to justify a pass, and do not manufacture enthusiasm you do not feel. Each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
+            text: `[SYSTEM: The pitch session is NOW OVER. Time for final verdicts. Each panelist must give their verdict IN ORDER: ${panelistNames}. Each panelist: prefix with your name (e.g. "Marcus:") and give ONE specific, personalized reason tied to something the founder actually said during this pitch. Judge as an investor who backs companies at THIS founder's stage (see FOUNDER'S STAGE): at idea or pre-seed stage, a real problem, a credible founder and a sensible plan are enough to be IN, and missing revenue, users or traction is never a reason to be out. Start from the reasons to say YES. If the pitch supports it, say you are IN ("I'm in because…") — a conditional yes is welcome ("I'm in, provided you…"). Only say you are OUT ("I'm out because…") when there is a specific, concrete blocker at this stage that you cannot get past — never as a reflex. If you are genuinely on the fence, say so honestly and name the ONE thing that would tip you. Do not invent flaws to justify a pass, and do not manufacture enthusiasm you do not feel. Each verdict must feel distinct and authentic to your character. Keep each verdict to 1-2 sentences. Do not ask any more questions. Start now.]`,
             isVerdict: true,
             panelists: panelists,
           });
@@ -3064,6 +3064,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 marketSnapshot,
                 pitchConfigSnapshot?.fundingStage || "",
                 elapsedSec,
+                pitchConfigSnapshot,
               ).catch((err) => {
                 console.error("❌ Background evaluation failed:", err);
                 return null;
@@ -3125,6 +3126,7 @@ export function initRestSocket(wss: WebSocketServer) {
                 marketSnapshot,
                 pitchConfigSnapshot?.fundingStage || "",
                 durationSec,
+                pitchConfigSnapshot,
               );
             }
             // Respect the status evaluatePitch reports. It returns
