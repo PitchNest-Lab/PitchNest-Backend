@@ -86,14 +86,24 @@ assert.equal(summary.logoUrl, logoUrl);
 assert.equal(summary.coverUrl, null, "a malformed snapshot value never becomes a URL");
 assert.equal("logoFile" in summary, false);
 
-// Link previews use the business's own image.
+// Link previews use the business's own logo, then its cover.
+const sharedProfile = { ...summary, coverUrl: "https://cdn.example/cover.webp", description: "", problem: "", solution: "", targetCustomer: "", websiteUrl: "", team: [] };
 const shared = injectPublicBusinessMetadata(
   "<html><head><title>x</title></head><body></body></html>",
-  { ...summary, coverUrl: "https://cdn.example/cover.webp", description: "", problem: "", solution: "", targetCustomer: "", websiteUrl: "", team: [] },
+  sharedProfile,
   "https://example.app",
   "market-bridge",
 );
-assert.match(shared, /property="og:image" content="https:\/\/cdn\.example\/cover\.webp"/);
+assert.ok(shared.includes(`property="og:image" content="${logoUrl}"`), "the logo leads the preview");
+assert.match(shared, /name="twitter:card" content="summary"/, "a square logo uses the small card");
+const sharedWithoutLogo = injectPublicBusinessMetadata(
+  "<html><head><title>x</title></head><body></body></html>",
+  { ...sharedProfile, logoUrl: null },
+  "https://example.app",
+  "market-bridge",
+);
+assert.match(sharedWithoutLogo, /property="og:image" content="https:\/\/cdn\.example\/cover\.webp"/);
+assert.match(sharedWithoutLogo, /name="twitter:card" content="summary_large_image"/);
 
 // ── Public team: allowlisted fields, role order, cap ────────────────────────
 const team = toPublicTeam(

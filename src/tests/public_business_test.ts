@@ -12,6 +12,7 @@ import {
 } from "../controllers/publicBusinessController.ts";
 import {
   injectPublicBusinessMetadata,
+  leadSentences,
   renderPublicBusinessShareDocument,
 } from "../utils/publicBusinessMetadata.ts";
 import { config } from "../config/env.ts";
@@ -317,12 +318,44 @@ const shareDocument = renderPublicBusinessShareDocument(
   "https://site.example",
   "market-bridge",
 );
-assert.match(shareDocument, /<meta property="og:title" content="Market &lt;Bridge&gt; — PitchNest" \/>/);
+assert.match(shareDocument, /<meta property="og:title" content="Market &lt;Bridge&gt; has launched on PitchNest Discover" \/>/);
+assert.match(shareDocument, /<meta name="twitter:title" content="Market &lt;Bridge&gt; has launched on PitchNest Discover" \/>/);
+// The preview text is the founder's description, not the tagline.
+assert.match(shareDocument, /<meta property="og:description" content="A public approved description\." \/>/);
+assert.match(shareDocument, /<title>Market &lt;Bridge&gt; — PitchNest<\/title>/);
 assert.match(shareDocument, /href="https:\/\/site\.example\/businesses\/market-bridge"/);
 assert.doesNotMatch(shareDocument, /<Bridge>/);
+// An example profile is never announced as a launch.
+const exampleShareDocument = renderPublicBusinessShareDocument(
+  { ...profile, isExample: true },
+  "https://site.example",
+  "market-bridge",
+);
+assert.match(exampleShareDocument, /property="og:title" content="Example business: Market Bridge — PitchNest Discover"/);
+assert.doesNotMatch(exampleShareDocument, /has launched/);
+// Without a description, the tagline still gives the preview its text.
+const taglineShareDocument = renderPublicBusinessShareDocument(
+  { ...profile, description: "" },
+  "https://site.example",
+  "market-bridge",
+);
+assert.match(taglineShareDocument, /property="og:description" content="Trade infrastructure for local merchants"/);
 const missingShareDocument = renderPublicBusinessShareDocument(null, "https://site.example", "private-draft");
 assert.match(missingShareDocument, /name="robots" content="noindex, follow"/);
 assert.match(missingShareDocument, /href="https:\/\/site\.example\/discover"/);
+
+// Preview text: whole opening sentences within the limit, never a mid-word cut.
+assert.equal(leadSentences("We help shops sell online. Orders arrive by WhatsApp. Payouts are daily."), "We help shops sell online. Orders arrive by WhatsApp. Payouts are daily.");
+assert.equal(leadSentences("  First   line.\n\nSecond line.  "), "First line. Second line.");
+assert.equal(
+  leadSentences(`${"A".repeat(120)}. ${"B".repeat(100)}. Third.`),
+  `${"A".repeat(120)}.`,
+  "stops before the sentence that would pass 200 characters",
+);
+assert.equal(leadSentences("We serve small shops, e.g. kiosks and stalls. We are live in Lagos."), "We serve small shops, e.g. kiosks and stalls. We are live in Lagos.");
+const longFirstSentence = leadSentences(`${"word ".repeat(60)}end.`);
+assert.ok(longFirstSentence.length <= 200 && longFirstSentence.endsWith("word…"), longFirstSentence);
+assert.equal(leadSentences(""), "");
 
 const migration = readFileSync(
   new URL("../../migrations/0020_discover_public_reads.sql", import.meta.url),
