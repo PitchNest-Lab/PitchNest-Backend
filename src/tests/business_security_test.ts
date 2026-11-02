@@ -3,9 +3,11 @@ import assert from "node:assert/strict";
 import type { NextFunction, Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import {
+  BUSINESS_PUBLICATION_CONSENT_VERSION,
   getLegacyBusinessDraft,
   legacyProfileToBusinessDraft,
   publicationBlockers,
+  publishBusiness,
   slugifyBusinessName,
   toPrivateBusiness,
   toPublicBusinessPreview,
@@ -98,6 +100,16 @@ assert.deepEqual(publicationBlockers(row), []);
 assert.deepEqual(publicationBlockers({ ...row, tagline: "", region: null }), [
   "tagline",
   "region",
+]);
+// The pitch story is required before publication, and kept short.
+assert.deepEqual(publicationBlockers({ ...row, problem: "", solution: "   " }), ["problem", "solution"]);
+assert.deepEqual(
+  validateBusinessInput({ problem: "p".repeat(500), solution: "s".repeat(500) }, { partial: true }).errors,
+  [],
+);
+assert.deepEqual(validateBusinessInput({ problem: "p".repeat(501), solution: "s".repeat(501) }, { partial: true }).errors, [
+  "problem is too long (max 500 characters).",
+  "solution is too long (max 500 characters).",
 ]);
 
 const legacyDraft = legacyProfileToBusinessDraft({
@@ -264,4 +276,51 @@ try {
   console.log("Business authorization and serialization tests passed.");
 } finally {
   mutableSupabase.from = originalFrom;
+}
+
+// Publishing is refused before the database is asked, whatever the client sends.
+const originalRpc = mutableSupabase.rpc;
+let storedBusiness: any = { ...row, solution: "" };
+let publishRpcCalls = 0;
+mutableSupabase.from = (table: string) => {
+  assert.equal(table, "businesses");
+  const query = {
+    select: () => query,
+    eq: () => query,
+    maybeSingle: async () => ({ data: storedBusiness, error: null }),
+  };
+  return query;
+};
+mutableSupabase.rpc = async (name: string) => {
+  assert.equal(name, "publish_business");
+  publishRpcCalls += 1;
+  return { data: [{ ...storedBusiness, status: "published" }], error: null };
+};
+
+try {
+  const publishRequest = {
+    body: {
+      confirmed: true,
+      consentVersion: BUSINESS_PUBLICATION_CONSENT_VERSION,
+      profileVersion: row.profile_version,
+    },
+    businessMembership: { businessId: BUSINESS_ID, userId: 7, role: "owner" },
+    user: { id: 7, email: "owner@example.com", accountType: "user" },
+  } as unknown as Request;
+
+  const refused = responseRecorder();
+  await publishBusiness(publishRequest, refused);
+  assert.equal(refused.statusCode, 422);
+  assert.equal(refused.body.error, "Complete these fields before publishing: solution.");
+  assert.equal(publishRpcCalls, 0, "an incomplete profile never reaches publish_business");
+
+  storedBusiness = { ...row };
+  const allowed = responseRecorder();
+  await publishBusiness(publishRequest, allowed).catch(() => undefined);
+  assert.equal(publishRpcCalls, 1, "a complete profile goes on to publish_business");
+
+  console.log("Business publication requirement tests passed.");
+} finally {
+  mutableSupabase.from = originalFrom;
+  mutableSupabase.rpc = originalRpc;
 }

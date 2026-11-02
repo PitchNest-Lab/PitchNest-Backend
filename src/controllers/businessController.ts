@@ -36,8 +36,8 @@ const FIELD_SPECS = {
   industry: { column: "industry", max: 100 },
   stage: { column: "stage", max: 80 },
   region: { column: "region", max: 120 },
-  problem: { column: "problem", max: 1500 },
-  solution: { column: "solution", max: 1500 },
+  problem: { column: "problem", max: 500 },
+  solution: { column: "solution", max: 500 },
   targetCustomer: { column: "target_customer", max: 800 },
   websiteUrl: { column: "website_url", max: 500 },
 } as const;
@@ -260,6 +260,8 @@ export function publicationBlockers(row: any): string[] {
     ["industry", row.industry],
     ["stage", row.stage],
     ["region", row.region],
+    ["problem", row.problem],
+    ["solution", row.solution],
   ];
   return required
     .filter(([, value]) => typeof value !== "string" || value.trim() === "")
@@ -518,6 +520,20 @@ export async function publishBusiness(req: Request, res: Response) {
   ) {
     return res.status(400).json({
       error: "Review the current preview and explicitly confirm publication.",
+    });
+  }
+
+  // publish_business (SQL) checks the identity and market fields only; the
+  // pitch story is required too, so every blocker is checked here first.
+  const { data: current, error: currentError } = await fetchBusiness(req.businessMembership!.businessId);
+  if (currentError) {
+    console.error("Business publication check failed:", currentError);
+    return res.status(500).json({ error: "Failed to publish business." });
+  }
+  const blockers = current ? publicationBlockers(current) : [];
+  if (blockers.length > 0) {
+    return res.status(422).json({
+      error: `Complete these fields before publishing: ${blockers.join(", ")}.`,
     });
   }
 
