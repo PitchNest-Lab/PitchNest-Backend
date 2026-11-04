@@ -15,6 +15,7 @@ import {
 import { optionalUserAuth } from "../middleware/authMiddleware.ts";
 import { listPublicBusinessUpdates } from "../controllers/businessActivityController.ts";
 import { listPublicOpportunities } from "../controllers/opportunityController.ts";
+import { getChallengePromo, getPublicChallenge } from "../controllers/challengeController.ts";
 import { getPublicFounder } from "../controllers/founderController.ts";
 import { recordClientEvent } from "../services/eventService.ts";
 import {
@@ -85,8 +86,12 @@ const eventLimiter = rateLimit({
   message: { error: "Too many requests." },
 });
 router.post("/events", eventLimiter, optionalUserAuth, recordClientEvent);
-// Staff-curated opportunities; read-only for everyone else.
+// Staff-curated opportunities; read-only for everyone else. Includes the
+// challenges PitchNest hosts (migration 0038), marked source "pitchnest".
 router.get("/opportunities", discoverReadLimiter, listPublicOpportunities);
+// Hosted challenges: drafts are a 404; entries and private data never appear.
+router.get("/challenges/promo", discoverReadLimiter, getChallengePromo);
+router.get("/challenges/:slug", discoverReadLimiter, getPublicChallenge);
 router.get("/businesses", discoverReadLimiter, listPublicBusinesses);
 router.get("/businesses/:slug", discoverReadLimiter, getPublicBusiness);
 // Link-preview HTML for social crawlers, because the static SPA shell cannot

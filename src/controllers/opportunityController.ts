@@ -1,11 +1,26 @@
 import type { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import { cleanPublicText } from "../utils/publicText.ts";
+import { publicSiteOrigin } from "./publicBusinessController.ts";
+import {
+  bannerUrl,
+  CHALLENGE_COLUMNS,
+  challengePageUrl,
+  challengePhase,
+  isMissingRelation,
+  prizePool,
+  readPrizes,
+} from "../services/challengeService.ts";
 
 /**
  * Curated opportunities (migration 0024). Staff create and maintain them;
  * the public only reads published ones. Open / closing soon / closed is
  * computed from the dates on every read, never stored.
+ *
+ * The public list also carries the challenges PitchNest hosts itself
+ * (migration 0038), first and marked source "pitchnest": they open a page on
+ * PitchNest instead of an organizer's site. External listings are marked
+ * source "external" and otherwise unchanged.
  */
 
 export const OPPORTUNITY_KINDS = [
@@ -190,6 +205,84 @@ export function validateOpportunityInput(
   return { values, errors: [...new Set(errors)] };
 }
 
+// ─── Hosted challenges in the hub ────────────────────────────────────────────
+
+const isoOrNull = (value: unknown): string | null =>
+  typeof value === "string" && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null;
+
+/**
+ * Listed (non-draft, non-cancelled) hosted challenges in the shape of an
+ * opportunity, with the challenge facts the hub card shows. Never throws:
+ * without migration 0038, or on any error, the hub shows its external
+ * listings alone.
+ */
+export async function listHostedChallengeOpportunities(
+  filters: { kind?: string; region?: string; q?: string; includeClosed?: boolean },
+  now = new Date(),
+): Promise<any[]> {
+  if (filters.kind && filters.kind !== "competition") return [];
+  try {
+    const { data, error } = await supabase
+      .from("challenges")
+      .select(CHALLENGE_COLUMNS)
+      .neq("status", "draft")
+      .neq("status", "cancelled")
+      .order("submission_deadline", { ascending: true })
+      .limit(20);
+    if (error) {
+      if (!isMissingRelation(error)) console.error("Hosted challenges read failed:", error.message);
+      return [];
+    }
+    const today = todayIso(now);
+    const cutoff = now.getTime() - 60 * 86_400_000;
+    const q = (filters.q ?? "").trim().toLowerCase();
+    const region = (filters.region ?? "").trim().toLowerCase();
+    const origin = publicSiteOrigin();
+    return ((data as any[] | null) ?? [])
+      .filter((row) => Date.parse(row.submission_deadline) >= cutoff)
+      .filter((row) => !q || [row.title, row.organizer, row.tagline, row.description].some((v) => String(v ?? "").toLowerCase().includes(q)))
+      .filter((row) => !region || String(row.region ?? "").toLowerCase().includes(region))
+      .map((row) => {
+        const phase = challengePhase(row, now);
+        const closesOn = dateOnly(row.submission_deadline);
+        const timing =
+          phase === "upcoming" ? { state: "upcoming" as const, daysLeft: null }
+          : phase === "open" ? opportunityState(null, closesOn, today)
+          : { state: "closed" as const, daysLeft: null };
+        const prizes = readPrizes(row.prizes);
+        return {
+          id: String(row.id),
+          title: String(row.title),
+          organizer: String(row.organizer),
+          kind: "competition" as const,
+          summary: String(row.description ?? "").split(/\n\s*\n/)[0].slice(0, 400),
+          eligibility: "",
+          region: String(row.region ?? ""),
+          sector: "",
+          sourceUrl: challengePageUrl(origin, row.slug),
+          opensOn: dateOnly(row.starts_at),
+          closesOn,
+          lastCheckedAt: isoOrNull(row.updated_at),
+          ...timing,
+          source: "pitchnest" as const,
+          challenge: {
+            slug: String(row.slug),
+            tagline: String(row.tagline ?? ""),
+            phase,
+            prizePool: prizePool(prizes),
+            prizeCurrency: String(row.prize_currency ?? "NGN"),
+            submissionDeadline: isoOrNull(row.submission_deadline),
+            imageUrl: bannerUrl(row),
+          },
+        };
+      })
+      .filter((item) => filters.includeClosed || item.state !== "closed");
+  } catch (error) {
+    console.error("Hosted challenges read threw:", error);
+    return [];
+  }
+}
+
 // ─── Public ──────────────────────────────────────────────────────────────────
 
 export async function listPublicOpportunities(req: Request, res: Response) {
@@ -201,20 +294,28 @@ export async function listPublicOpportunities(req: Request, res: Response) {
   const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 100) : "";
   const includeClosed = req.query.includeClosed === "true";
   try {
-    const { data, error } = await supabase.rpc("list_public_opportunities", {
-      p_kind: kind || null,
-      p_region: region || null,
-      p_query: q || null,
-      p_include_closed: includeClosed,
-      p_limit: 60,
-    });
+    const [{ data, error }, hosted] = await Promise.all([
+      supabase.rpc("list_public_opportunities", {
+        p_kind: kind || null,
+        p_region: region || null,
+        p_query: q || null,
+        p_include_closed: includeClosed,
+        p_limit: 60,
+      }),
+      listHostedChallengeOpportunities({ kind, region, q, includeClosed }),
+    ]);
     if (error) {
       console.error("Public opportunities read failed:", error);
       return res.status(500).json({ error: "Failed to load opportunities." });
     }
     const today = todayIso();
     res.set("Cache-Control", "public, max-age=60, s-maxage=300");
-    return res.json({ data: (Array.isArray(data) ? data : []).map((row) => toPublicOpportunity(row, today)) });
+    return res.json({
+      data: [
+        ...hosted,
+        ...(Array.isArray(data) ? data : []).map((row) => ({ ...toPublicOpportunity(row, today), source: "external" as const })),
+      ],
+    });
   } catch (error) {
     console.error("Public opportunities read threw:", error);
     return res.status(500).json({ error: "Failed to load opportunities." });

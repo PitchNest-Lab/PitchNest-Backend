@@ -28,6 +28,7 @@ import staffRoutes from "./routes/staffRoutes.ts";
 import practiceRoutes from "./routes/practiceRoutes.ts";
 import notificationRoutes from "./routes/notificationRoutes.ts";
 import communityRoutes from "./routes/communityRoutes.ts";
+import challengeRoutes from "./routes/challengeRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 import router from "./routes/organization/organizationRoutes.ts";
 
@@ -133,6 +134,7 @@ app.use("/api/staff", staffRoutes);
 app.use("/api/practice", practiceRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/community", communityRoutes);
+app.use("/api/challenges", challengeRoutes);
 app.use("/api/decks", deckRoutes);
 app.use("/api", uploadRoutes); // Hooks /api/upload-video and /api/upload-deck directly
 app.use("/api/sessions", sessionRoutes);

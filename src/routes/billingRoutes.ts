@@ -8,6 +8,7 @@ import {
   confirmCheckout,
   handleWebhook,
   cancelSubscription,
+  previewDiscount,
 } from "../controllers/billingController.ts";
 
 const router = express.Router();
@@ -37,7 +38,21 @@ const checkoutLimiter = rateLimit({
  */
 router.get("/price", getPrice);
 
+/**
+ * Discount previews read redemption counts, so they are capped per user: enough
+ * to retype a code a few times, too few to try codes at scale.
+ */
+const discountPreviewLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => String(req.user?.id ?? "anon"),
+  message: { error: "Too many code checks. Please wait a few minutes." },
+});
+
 router.get("/plan", authMiddleware, getPlan);
+router.get("/discount", authMiddleware, discountPreviewLimiter, previewDiscount);
 router.post("/checkout", authMiddleware, checkoutLimiter, startCheckout);
 // These share the checkout budget: all call out to Flutterwave on the user's behalf.
 router.post("/confirm", authMiddleware, checkoutLimiter, confirmCheckout);

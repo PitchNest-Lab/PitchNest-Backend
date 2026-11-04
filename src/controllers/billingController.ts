@@ -35,6 +35,14 @@ import {
   SubscriptionError,
 } from "../services/subscriptionService.ts";
 import { checkoutPrice, isBillingModeAvailable, priceListIn } from "../services/localPriceService.ts";
+import {
+  DISCOUNT_REFUSAL_MESSAGES,
+  discountedAmount,
+  normalizeDiscountCode,
+  quoteDiscount,
+  type DiscountQuote,
+  type DiscountRefusal,
+} from "../services/discountService.ts";
 
 /**
  * The featured price (Pro, monthly) plus the full purchasable catalog, in the
@@ -90,11 +98,46 @@ function parseCurrency(body: any): string | null {
   return raw.trim().toUpperCase();
 }
 
-function parseBillingMode(body: any): BillingMode | null {
+function parseBillingMode(body: any, fallback: BillingMode = "auto_renew"): BillingMode | null {
   const raw = body?.billingMode;
-  if (raw === undefined) return "auto_renew";
+  if (raw === undefined) return fallback;
   return raw === "auto_renew" || raw === "manual" ? raw : null;
 }
+
+function discountRefused(res: Response, reason: DiscountRefusal) {
+  return res.status(409).json({
+    error: "discount_unavailable",
+    reason,
+    message: DISCOUNT_REFUSAL_MESSAGES[reason] ?? DISCOUNT_REFUSAL_MESSAGES.unavailable,
+  });
+}
+
+/**
+ * GET /api/billing/discount?code=PCHU01&plan=pro&term=monthly&currency=NGN —
+ * what checkout would charge this founder with the code, or why it doesn't
+ * apply. The same quote checkout uses, so the price shown is the price charged.
+ */
+export const previewDiscount = async (req: Request, res: Response) => {
+  const userId = req.user?.id;
+  if (!userId) return res.status(401).json({ error: "Authentication required" });
+  const code = normalizeDiscountCode(req.query?.code);
+  if (!code) return discountRefused(res, "unknown");
+  const selection = parseSelection({ plan: req.query?.plan, term: req.query?.term });
+  if (!selection) return res.status(400).json({ error: "Please choose a valid plan and billing term." });
+  const currency = parseCurrency({ currency: req.query?.currency });
+  if (!currency) return res.status(400).json({ error: "Please choose a valid currency." });
+  if (!hasBillingConfig()) return discountRefused(res, "unavailable");
+
+  try {
+    const result = await quoteDiscount({ code, userId, ...selection, currency });
+    if ("reason" in result) return discountRefused(res, result.reason);
+    const { codeId: _internalId, ...quote } = result.quote;
+    return res.json({ data: quote });
+  } catch (err: any) {
+    console.error("❌ previewDiscount:", err?.message || err);
+    return discountRefused(res, "unavailable");
+  }
+};
 
 /**
  * GET /api/billing/price?currency=NGN — public price + purchasable catalog.
@@ -281,10 +324,17 @@ export const startCheckout = async (req: Request, res: Response) => {
     if (!currency) {
       return res.status(400).json({ error: "Please choose a valid currency." });
     }
-    const billingMode = parseBillingMode(req.body);
+    // A discount code makes this a one-time payment: never a payment plan,
+    // which would renew at the discounted amount.
+    const rawCode = req.body?.discountCode;
+    const wantsDiscount = rawCode !== undefined && rawCode !== null && rawCode !== "";
+    const discountCode = wantsDiscount ? normalizeDiscountCode(rawCode) : null;
+    if (wantsDiscount && !discountCode) return discountRefused(res, "unknown");
+    const billingMode = parseBillingMode(req.body, discountCode ? "manual" : "auto_renew");
     if (!billingMode) {
       return res.status(400).json({ error: "Please choose a valid renewal option." });
     }
+    if (discountCode && billingMode !== "manual") return discountRefused(res, "manual_only");
     if (!isBillingModeAvailable(currency, billingMode)) {
       return res.status(409).json({
         error: "billing_mode_unavailable",
@@ -337,8 +387,20 @@ export const startCheckout = async (req: Request, res: Response) => {
       });
     }
 
+    // Re-validated here whatever the preview said; reserve_discount_redemption
+    // checks it once more under a lock when the payment row is written.
+    let discount: DiscountQuote | null = null;
+    if (discountCode) {
+      const quoted = await quoteDiscount({ code: discountCode, userId, ...selection, currency });
+      if ("reason" in quoted) return discountRefused(res, quoted.reason);
+      discount = quoted.quote;
+    }
+    const charged = discount
+      ? { ...price, amount: discountedAmount(price.amount, discount.percentOff) }
+      : price;
+
     const paymentPlanId = billingMode === "auto_renew" ? await ensureProviderPlan(price) : undefined;
-    const freeMonths = offer.eligible ? offer.freeMonths : 0;
+    const freeMonths = offer.eligible && (!discount || discount.combineWithOffer) ? offer.freeMonths : 0;
     const now = new Date();
     const grantedDays = initialGrantDays(selection.term, freeMonths, now);
     const bonusDays = grantedDays - initialGrantDays(selection.term, 0, now);
@@ -349,8 +411,16 @@ export const startCheckout = async (req: Request, res: Response) => {
         email: (user as any).email,
         name: (user as any).name,
       },
-      price,
-      { paymentPlanId, grantedDays, bonusDays, billingMode },
+      charged,
+      {
+        paymentPlanId,
+        grantedDays,
+        bonusDays,
+        billingMode,
+        ...(discount
+          ? { discount: { codeId: discount.codeId, code: discount.code, listAmount: price.amount, percentOff: discount.percentOff } }
+          : {}),
+      },
     );
 
     res.json({ paymentLink: session.paymentLink, txRef: session.txRef });
@@ -360,6 +430,11 @@ export const startCheckout = async (req: Request, res: Response) => {
     // the operator can tell WHICH failure this is from logs alone, without ever
     // leaking a raw provider/DB message to the browser.
     const code: string = err?.code ?? "UNKNOWN";
+    if (code === "DISCOUNT_UNAVAILABLE") {
+      const reason = (Object.hasOwn(DISCOUNT_REFUSAL_MESSAGES, err?.detail) ? err.detail : "unavailable") as DiscountRefusal;
+      console.warn(`ℹ️ startCheckout: discount refused (${reason})`);
+      return discountRefused(res, reason);
+    }
     const status =
       code === "BILLING_NOT_CONFIGURED" ? 503 :
       code === "PLAN_NOT_AVAILABLE" ? 400 :

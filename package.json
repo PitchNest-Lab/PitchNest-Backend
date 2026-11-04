@@ -12,7 +12,7 @@
     "build": "echo 'Skipping Vite build for Express backend'",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:analytics && npm run test:pitch && npm run test:ai-models && npm run test:ai-stage &&npm run test:speech && npm run test:business-media && npm run test:founders && npm run test:billing && npm run test:local-prices && npm run test:ws-admission && npm run test:aws",
+    "test": "npm run test:core && npm run test:organization-security && npm run test:business-security && npm run test:public-business && npm run test:discover-engagement && npm run test:session-security && npm run test:practice-bridge && npm run test:activity && npm run test:community && npm run test:opportunities && npm run test:challenges && npm run test:analytics && npm run test:pitch && npm run test:ai-models && npm run test:ai-stage &&npm run test:speech && npm run test:business-media && npm run test:founders && npm run test:billing && npm run test:local-prices && npm run test:ws-admission && npm run test:aws",
     "test:core": "tsx src/tests/run_tests.ts",
     "test:organization-security": "tsx src/tests/organization_security_test.ts",
     "test:business-security": "tsx src/tests/business_security_test.ts",
@@ -23,6 +23,7 @@
     "test:activity": "tsx src/tests/activity_notifications_test.ts",
     "test:community": "tsx src/tests/community_test.ts",
     "test:opportunities": "tsx src/tests/opportunities_test.ts",
+    "test:challenges": "tsx src/tests/challenges_test.ts",
     "test:analytics": "tsx src/tests/analytics_test.ts",
     "test:pitch": "tsx src/tests/pitch_test.ts",
     "test:ai-models": "tsx src/tests/ai_models_test.ts",
@@ -39,7 +40,7 @@
     "build:lambda:prod": "node scripts/build-lambda-prod.mjs",
     "verify:lambda:prod": "node scripts/verify-lambda-artifact.mjs",
     "migrations:combined": "node scripts/migrations/build-combined.mjs",
-    "test:migrations": "node scripts/migrations/test-combined.mjs"
+    "test:migrations": "node scripts/migrations/test-combined.mjs && node scripts/migrations/test-challenges.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ssm": "^3.1147.0",

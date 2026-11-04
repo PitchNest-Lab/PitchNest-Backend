@@ -58,7 +58,8 @@ export class CheckoutError extends Error {
       | "BILLING_NOT_CONFIGURED"
       | "PLAN_NOT_AVAILABLE"
       | "PAYMENT_RECORD_FAILED"
-      | "CHECKOUT_INIT_FAILED",
+      | "CHECKOUT_INIT_FAILED"
+      | "DISCOUNT_UNAVAILABLE",
     public detail?: string,
   ) {
     super(code);
@@ -85,6 +86,11 @@ function mintTxRef(userId: number): string {
  * made for this same price, so Flutterwave renews it every period until it is
  * cancelled. `grantedDays` covers the first period (plus any free months,
  * recorded separately as `bonusDays`).
+ *
+ * With a `discount`, `price.amount` is already the discounted amount (one-time
+ * checkouts only). The code is reserved by reserve_discount_redemption right
+ * after the row is written, which re-checks it under a lock; a refusal fails
+ * the row and throws DISCOUNT_UNAVAILABLE with the reason as its detail.
  */
 export async function createCheckout(
   user: {
@@ -98,6 +104,7 @@ export async function createCheckout(
     grantedDays: number;
     bonusDays: number;
     billingMode?: BillingMode;
+    discount?: { codeId: string; code: string; listAmount: number; percentOff: number };
   },
 ): Promise<CheckoutSession> {
   // Same gates as the controller, enforced again here so no other caller can
@@ -116,6 +123,10 @@ export async function createCheckout(
     throw new CheckoutError("PLAN_NOT_AVAILABLE", "automatic renewal requires a provider payment plan");
   }
   const providerPlanId = billingMode === "auto_renew" ? subscription.paymentPlanId : undefined;
+  const discount = subscription.discount;
+  if (discount && billingMode !== "manual") {
+    throw new CheckoutError("DISCOUNT_UNAVAILABLE", "manual_only");
+  }
 
   const planLabel = price.plan === "pro" ? "Pro Founder" : "Founder";
   const termLabel = price.term === "annual" ? "year" : "month";
@@ -143,6 +154,27 @@ export async function createCheckout(
     throw new CheckoutError("PAYMENT_RECORD_FAILED", insertErr.message);
   }
 
+  if (discount) {
+    const { data: reserved, error: reserveErr } = await supabase.rpc("reserve_discount_redemption", {
+      p_code_id: discount.codeId,
+      p_user_id: user.id,
+      p_tx_ref: txRef,
+      p_list_amount: discount.listAmount,
+      p_amount: amount,
+      p_currency: currency,
+    });
+    if (reserveErr || reserved !== "reserved") {
+      await markPaymentFailed(txRef).catch((error: any) => {
+        console.error("❌ Could not finalize refused discount checkout:", error?.message || error);
+      });
+      if (reserveErr) {
+        console.error("❌ createCheckout: discount reservation failed:", reserveErr.message);
+        throw new CheckoutError("PAYMENT_RECORD_FAILED", `discount: ${reserveErr.message}`);
+      }
+      throw new CheckoutError("DISCOUNT_UNAVAILABLE", String(reserved || "unavailable"));
+    }
+  }
+
   let res: Response;
   try {
     res = await providerFetch(`${FLW_API}/payments`, {
@@ -168,9 +200,16 @@ export async function createCheckout(
           title: `PitchNest ${planLabel}`,
           description:
             `PitchNest ${planLabel}, ${billingMode === "auto_renew" ? `renews every ${termLabel} until you cancel` : "one-time payment; renew manually"}` +
+            (discount ? `, ${discount.percentOff}% off with ${discount.code}` : "") +
             (subscription.bonusDays > 0 ? ". Your free month is added on top." : "."),
         },
-        meta: { user_id: user.id, plan: price.plan, term: price.term, billing_mode: billingMode },
+        meta: {
+          user_id: user.id,
+          plan: price.plan,
+          term: price.term,
+          billing_mode: billingMode,
+          ...(discount ? { discount_code: discount.code } : {}),
+        },
       }),
     });
   } catch (err: any) {

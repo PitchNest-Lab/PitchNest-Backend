@@ -17,7 +17,25 @@ export type NotificationType =
   | "business_update"
   | "community_reply"
   | "founder_update"
-  | "founder_business";
+  | "founder_business"
+  | "challenge_joined"
+  | "challenge_eligible"
+  | "challenge_submitted"
+  | "challenge_correction"
+  | "challenge_approved"
+  | "challenge_rejected"
+  | "challenge_results";
+
+/** A founder's own challenge entry (migration 0038); the row names the challenge only. */
+const CHALLENGE_TITLES: Record<string, (challenge: string) => string> = {
+  challenge_joined: (c) => `You joined the ${c}`,
+  challenge_eligible: (c) => `Your ${c} entry meets every requirement — submit it`,
+  challenge_submitted: (c) => `We received your ${c} entry`,
+  challenge_correction: (c) => `Your ${c} entry needs a correction`,
+  challenge_approved: (c) => `Your ${c} entry is approved`,
+  challenge_rejected: (c) => `Your ${c} entry wasn't accepted`,
+  challenge_results: (c) => `${c} winners are announced`,
+};
 
 export interface NotificationView {
   id: string;
@@ -31,6 +49,21 @@ export interface NotificationView {
 
 export function toNotificationView(row: any): NotificationView | null {
   const type = row?.type;
+  if (typeof type === "string" && Object.hasOwn(CHALLENGE_TITLES, type)) {
+    const slug = typeof row?.challenge_slug === "string" ? row.challenge_slug : "";
+    if (!slug) return null;
+    const title = typeof row?.challenge_title === "string" && row.challenge_title ? row.challenge_title : "challenge";
+    const created = new Date(row?.created_at);
+    return {
+      id: String(row?.notification_id ?? ""),
+      type: type as NotificationType,
+      title: CHALLENGE_TITLES[type](title),
+      excerpt: typeof row?.excerpt === "string" ? row.excerpt : "",
+      link: `/opportunities/challenges/${encodeURIComponent(slug)}${type === "challenge_results" ? "#results" : "#my-entry"}`,
+      createdAt: Number.isNaN(created.getTime()) ? "" : created.toISOString(),
+      read: Boolean(row?.read_at),
+    };
+  }
   if (type === "community_reply") {
     const threadId = typeof row?.thread_id === "string" ? row.thread_id : "";
     const threadTitle = typeof row?.thread_title === "string" ? row.thread_title : "your discussion";
