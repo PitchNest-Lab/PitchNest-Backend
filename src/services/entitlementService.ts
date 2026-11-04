@@ -30,11 +30,36 @@ export const PREP_DURATIONS = [10, 20] as const;
 export const PRO_DURATIONS = [10, 20, 30, 40] as const;
 
 /**
- * Full-access Pro trial for NEW accounts, in days (was 30 during testing). The
- * end date is stored at signup, so changing this never shortens a trial that
- * was already granted.
+ * Length of the full-access Pro trial accounts were given (was 30 during
+ * testing). The end date is stored at signup, so this only reads older rows
+ * that carry a start date and no end date. New accounts: NEW_ACCOUNT_TRIAL_DAYS.
  */
 export const FREE_TRIAL_DAYS = 3;
+
+/**
+ * Pro trial for accounts created from now on, in days. 0: new accounts start on
+ * the Free plan (owner's decision, 4 Nov 2026). Trials already granted keep
+ * their stored end date. A positive number gives new accounts a trial again.
+ */
+export const NEW_ACCOUNT_TRIAL_DAYS: number = 0;
+
+/** The trial columns a new account is created with. */
+export function newAccountTrialFields(now = new Date()): {
+  trial_started_at: string | null;
+  trial_expires_at: string | null;
+  trial_status: "active" | "none";
+} {
+  if (NEW_ACCOUNT_TRIAL_DAYS <= 0) {
+    // No dates at all: isTrialActive reads this as no trial, and the trial
+    // reminder sweep (trial_status = 'active' only) never emails the account.
+    return { trial_started_at: null, trial_expires_at: null, trial_status: "none" };
+  }
+  return {
+    trial_started_at: now.toISOString(),
+    trial_expires_at: new Date(now.getTime() + NEW_ACCOUNT_TRIAL_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+    trial_status: "active",
+  };
+}
 
 export interface Entitlement {
   plan: Plan;
@@ -107,7 +132,7 @@ export function isTrialActive(
   trialStatus?: string | null,
   trialStartedAt?: string | Date | null,
 ): { active: boolean; daysRemaining: number } {
-  if (trialStatus === "expired" || trialStatus === "cancelled") {
+  if (trialStatus === "expired" || trialStatus === "cancelled" || trialStatus === "none") {
     return { active: false, daysRemaining: 0 };
   }
 

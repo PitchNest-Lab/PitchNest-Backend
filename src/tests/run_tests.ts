@@ -19,7 +19,8 @@ import {
   isTrialActive,
   entitlementsForPlan,
   getTrialEntitlement,
-  FREE_TRIAL_DAYS,
+  NEW_ACCOUNT_TRIAL_DAYS,
+  newAccountTrialFields,
 } from "../services/entitlementService.ts";
 import { reminderSlot } from "../jobs/trialLifecycle.ts";
 import { sanitizeUploadName, signLocalFileUrl, verifyLocalFileToken } from "../services/storageService.ts";
@@ -123,7 +124,15 @@ assert(slideMapping.activeSlide?.slideNumber === 2, "Semantic slide-to-speech ma
 const futureDate = new Date(Date.now() + 25 * 86400000).toISOString();
 const trialCheck = isTrialActive(futureDate, "active");
 assert(trialCheck.active === true && trialCheck.daysRemaining >= 24, "Stored trial end date honoured (25 days left)");
-assert(FREE_TRIAL_DAYS === 3, "New accounts get a 3-day trial");
+assert(NEW_ACCOUNT_TRIAL_DAYS === 0, "New accounts start on the Free plan, with no trial");
+const newAccount = newAccountTrialFields(new Date("2026-11-04T10:00:00Z"));
+assert(
+  newAccount.trial_status === "none" && newAccount.trial_started_at === null && newAccount.trial_expires_at === null,
+  "A new account is stored with no trial dates and trial_status 'none' (never picked up by the trial reminder sweep)",
+);
+const newAccountAccess = entitlementsForPlan("free", null, newAccount.trial_expires_at, newAccount.trial_status, newAccount.trial_started_at);
+assert(newAccountAccess.plan === "free" && newAccountAccess.isTrial === false && newAccountAccess.maxWeeklySessions === 2, "A new account gets the Free tier");
+assert(isTrialActive(new Date(Date.now() + 86400000).toISOString(), "none").active === false, "trial_status 'none' is never a trial, whatever the dates say");
 
 // 6b. Fix 4 Verification: Null trial timestamps must NOT grant perpetual access
 const nullTrialCheck = isTrialActive(null, null, null);

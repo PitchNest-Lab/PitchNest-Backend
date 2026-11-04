@@ -99,7 +99,7 @@ const ALLOWED_SECTORS = [
 
 import {
   isTrialActive,
-  FREE_TRIAL_DAYS,
+  newAccountTrialFields,
 } from "../services/entitlementService.ts";
 import { isSupportedSttLocale } from "../utils/transcriptionLocales.ts";
 import { stopRenewalsForDeletion } from "../services/subscriptionService.ts";
@@ -407,10 +407,6 @@ export const signup = async (req: Request, res: Response) => {
     }
     // Hash password before storing
     const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const now = new Date();
-    const trialEnd = new Date(
-      now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
-    );
 
     const newUserPayload = {
       name: name.trim(),
@@ -418,9 +414,7 @@ export const signup = async (req: Request, res: Response) => {
       password: hashedPassword,
       role: role || "Founder",
       auth_provider: "form",
-      trial_started_at: now.toISOString(),
-      trial_expires_at: trialEnd.toISOString(),
-      trial_status: "active",
+      ...newAccountTrialFields(),
       enrolled_at: null,
       ...(cleanReferralCode ? { pending_org_code: cleanReferralCode } : {}),
     };
@@ -845,10 +839,6 @@ export const googleAuth = async (req: Request, res: Response) => {
         crypto.randomBytes(32).toString("hex"),
         4,
       );
-      const now = new Date();
-      const trialEnd = new Date(
-        now.getTime() + FREE_TRIAL_DAYS * 24 * 60 * 60 * 1000,
-      );
 
       const { data: created, error } = await supabase
         .from("users")
@@ -860,9 +850,7 @@ export const googleAuth = async (req: Request, res: Response) => {
             isEmailVerified: true,
             role: "Founder",
             auth_provider: "google",
-            trial_started_at: now.toISOString(),
-            trial_expires_at: trialEnd.toISOString(),
-            trial_status: "active",
+            ...newAccountTrialFields(),
           },
         ])
         .select()

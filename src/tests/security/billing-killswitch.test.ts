@@ -113,9 +113,10 @@ test("free trial preserved: an expired trial falls back to the free tier", async
   assert.equal(r.json.isTrial, false);
 });
 
-test("trial length is independent of PRO_PLAN_DAYS (3 days for new accounts)", async () => {
-  const { FREE_TRIAL_DAYS, entitlementsForPlan } = await import("../../services/entitlementService.ts");
-  assert.equal(FREE_TRIAL_DAYS, 3);
+test("new accounts get no trial; trials granted before keep their end date", async () => {
+  const { NEW_ACCOUNT_TRIAL_DAYS, newAccountTrialFields, entitlementsForPlan } = await import("../../services/entitlementService.ts");
+  assert.equal(NEW_ACCOUNT_TRIAL_DAYS, 0);
+  assert.deepEqual(newAccountTrialFields(), { trial_started_at: null, trial_expires_at: null, trial_status: "none" });
   // A trial granted before the change keeps its stored end date.
   const ent = entitlementsForPlan("free", null, inDays(10), "active", inDays(-20));
   assert.equal(ent.isTrial, true);
