@@ -581,7 +581,7 @@ test("discount: the preview and the checkout charge the same discounted, one-tim
 
   // Once redeemed, the same founder can't use a first-month code again.
   db.rows("discount_redemptions").find((r) => r.tx_ref === payment.tx_ref)!.status = "redeemed";
-  const reuse = await call(base, "GET", "/api/billing/discount?code=PCHU01", { token });
+  const reuse = await call(base, "GET", "/api/billing/discount?code=PCHU01&plan=prep&term=monthly", { token });
   assert.equal(reuse.json.reason, "already_used");
   db.rows("discount_codes")[0].active = false;
   const inactive = await call(base, "POST", "/api/billing/checkout", { token: tokenB, body: { discountCode: "PCHU01" } });
