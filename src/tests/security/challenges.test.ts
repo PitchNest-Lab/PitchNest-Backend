@@ -1,5 +1,5 @@
 import "../helpers/testEnv.ts";
-import "../helpers/billingEnvEnabled.ts";
+import "../helpers/billingFounderEnvEnabled.ts";
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -10,7 +10,7 @@ import { signUserToken } from "../helpers/tokens.ts";
 import { config } from "../../config/env.ts";
 
 /**
- * Hosted challenges end to end over HTTP (migration 0038), against the real
+ * Hosted challenges end to end over HTTP (migrations 0038 and 0039), against the real
  * app and an in-memory database: who can see and change what, that every
  * requirement is verified on the server, and the discounted checkout.
  * The SQL functions themselves are proven in scripts/migrations/test-challenges.mjs.
@@ -205,7 +205,7 @@ before(async () => {
   ]);
   db.seed("subscriptions", []);
   db.seed("discount_codes", [{
-    id: CODE_ID, code: "PCHU01", description: null, percent_off: 50, plans: ["pro"], terms: ["monthly"], periods: 1,
+    id: CODE_ID, code: "PCHU01", description: null, percent_off: 50, plans: ["prep"], terms: ["monthly"], periods: 1,
     starts_at: null, ends_at: null, max_redemptions: null, new_customers_only: false, combine_with_offer: false, active: true,
   }]);
   db.seed("discount_redemptions", []);
@@ -213,7 +213,7 @@ before(async () => {
     organizer: "PitchNest", description: "Practice with AI investors.\n\nSecond paragraph.", region: "Online · open to founders everywhere",
     banner_file: null, promo_enabled: true, website_url: "https://www.pitchnest.app", prize_currency: "NGN",
     winners_announced_on: iso(20).slice(0, 10), eligibility: "Founders.", requirements: "", judging_criteria: "60/40.",
-    terms: "Terms.", pitch_weight: 60, eligible_session_modes: ["solo", "panel"], min_completed_sessions: 1, required_plan: "pro",
+    terms: "Terms.", pitch_weight: 60, eligible_session_modes: ["solo", "panel"], min_completed_sessions: 1, required_plan: "prep",
     social_handles: { instagram: { handle: "@pitchnestapp", url: "https://instagram.com/pitchnestapp" } },
     discount_code_id: CODE_ID, confirmations: {}, results_published_at: null, created_at: iso(-5), updated_at: iso(-1),
   };
@@ -271,7 +271,8 @@ test("public: a draft is a 404; a listed challenge shows its rules and nothing p
   assert.equal(r.status, 200);
   assert.equal(r.json.data.phase, "open");
   assert.equal(r.json.data.prizePool, 160000);
-  assert.deepEqual(r.json.data.discount, { code: "PCHU01", percentOff: 50, plans: ["pro"], terms: ["monthly"], periods: 1, endsAt: null, active: true });
+  assert.deepEqual(r.json.data.discount, { code: "PCHU01", percentOff: 50, plans: ["prep"], terms: ["monthly"], periods: 1, endsAt: null, active: true });
+  assert.equal(r.json.data.requiredPlan, "prep");
   for (const key of ["confirmations", "created_by", "discount_code_id", "status", "promo_enabled"]) {
     assert.equal(key in r.json.data, false, `${key} is private`);
   }
@@ -357,11 +358,11 @@ test("the social link must be a real post on the chosen platform", async () => {
 test("submission is refused until the server has verified every requirement", async () => {
   let r = await call(base, "POST", `${SLUG}/entry/submit`, { token: tokenA, body: { acceptRules: true } });
   assert.equal(r.status, 422);
-  assert.ok(r.json.missing.some((m: string) => m.includes("Pro Founder")), JSON.stringify(r.json));
+  assert.ok(r.json.missing.some((m: string) => m.includes("Founder")), JSON.stringify(r.json));
 
-  // A paid, settled Pro plan.
-  Object.assign(db.rows("users").find((u) => u.id === FOUNDER_A.id)!, { plan: "pro", plan_expires_at: iso(30) });
-  db.rows("payments").push({ id: 3, user_id: FOUNDER_A.id, tx_ref: "pn-401-1", status: "successful", amount: 7.5, currency: "USD", plan: "pro", term: "monthly", created_at: iso(-0.01) });
+  // A paid, settled Founder plan (Pro also qualifies as a higher plan).
+  Object.assign(db.rows("users").find((u) => u.id === FOUNDER_A.id)!, { plan: "prep", plan_expires_at: iso(30) });
+  db.rows("payments").push({ id: 3, user_id: FOUNDER_A.id, tx_ref: "pn-401-1", status: "successful", amount: 9.99, currency: "USD", plan: "prep", term: "monthly", created_at: iso(-0.01) });
   r = await call(base, "POST", `${SLUG}/entry/submit`, { token: tokenA, body: {} });
   assert.equal(r.status, 422, "the rules must be accepted");
   r = await call(base, "POST", `${SLUG}/entry/submit`, { token: tokenA, body: { acceptRules: true } });
@@ -550,30 +551,30 @@ test("images: the poster is public, the founder's screenshot is private", async 
 test("discount: the preview and the checkout charge the same discounted, one-time price", async () => {
   const token = signUserToken({ id: 410, email: "dee@x.test" });
   db.rows("users").push({ id: 410, email: "dee@x.test", name: "Dee", isEmailVerified: true, plan: "free", plan_expires_at: null });
-  const preview = await call(base, "GET", "/api/billing/discount?code=pchu01&plan=pro&term=monthly&currency=USD", { token });
+  const preview = await call(base, "GET", "/api/billing/discount?code=pchu01&plan=prep&term=monthly&currency=USD", { token });
   assert.equal(preview.status, 200, JSON.stringify(preview.json));
   assert.deepEqual(
     { list: preview.json.data.listAmount, amount: preview.json.data.amount, mode: preview.json.data.billingMode, id: "codeId" in preview.json.data },
-    { list: 15, amount: 7.5, mode: "manual", id: false },
+    { list: 9.99, amount: 5, mode: "manual", id: false },
   );
-  assert.equal((await call(base, "GET", "/api/billing/discount?code=pchu01&plan=pro&term=annual", { token })).json.reason, "not_applicable");
+  assert.equal((await call(base, "GET", "/api/billing/discount?code=pchu01&plan=prep&term=annual", { token })).json.reason, "not_applicable");
   assert.equal((await call(base, "GET", "/api/billing/discount?code=NOPE99", { token })).json.reason, "unknown");
 
-  const autoRenew = await call(base, "POST", "/api/billing/checkout", { token, body: { plan: "pro", term: "monthly", discountCode: "PCHU01", billingMode: "auto_renew" } });
+  const autoRenew = await call(base, "POST", "/api/billing/checkout", { token, body: { plan: "prep", term: "monthly", discountCode: "PCHU01", billingMode: "auto_renew" } });
   assert.equal(autoRenew.status, 409);
   assert.equal(autoRenew.json.reason, "manual_only", "a code never discounts an automatic renewal");
 
   flutterwave.length = 0;
-  const checkout = await call(base, "POST", "/api/billing/checkout", { token, body: { plan: "pro", term: "monthly", discountCode: "PCHU01" } });
+  const checkout = await call(base, "POST", "/api/billing/checkout", { token, body: { plan: "prep", term: "monthly", discountCode: "PCHU01" } });
   assert.equal(checkout.status, 200, JSON.stringify(checkout.json));
   const payment = db.rows("payments").find((p) => p.user_id === 410)!;
   assert.deepEqual(
     { amount: payment.amount, mode: payment.billing_mode, plan: payment.plan, term: payment.term, providerPlan: payment.provider_plan_id },
-    { amount: 7.5, mode: "manual", plan: "pro", term: "monthly", providerPlan: null },
+    { amount: 5, mode: "manual", plan: "prep", term: "monthly", providerPlan: null },
     "the payment row records the discounted, one-time charge",
   );
   const init = flutterwave.find((c) => c.path === "/v3/payments")!;
-  assert.equal(init.body.amount, 7.5);
+  assert.equal(init.body.amount, 5);
   assert.equal("payment_plan" in init.body, false, "no Flutterwave payment plan, so it can never renew at half price");
   assert.equal(db.rows("discount_redemptions").find((r) => r.tx_ref === payment.tx_ref)?.status, "pending");
   assert.equal(flutterwave.some((c) => c.path === "/v3/payment-plans"), false);

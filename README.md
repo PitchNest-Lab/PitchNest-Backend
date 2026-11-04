@@ -148,7 +148,7 @@ FLW_SECRET_KEY=FLWSECK-your-key
 FLW_PUBLIC_KEY=FLWPUBK-your-key
 FLW_WEBHOOK_HASH=your-webhook-hash
 BILLING_CHECKOUT_ENABLED=false
-BILLING_PURCHASABLE_SKUS=pro:monthly
+BILLING_PURCHASABLE_SKUS=pro:monthly,prep:monthly
 BILLING_LOCAL_CURRENCIES=NGN,KES,GHS,ZAR,GBP
 # Optional: restrict card-based automatic renewal to enabled currencies.
 BILLING_AUTO_RENEW_CURRENCIES=NGN,GBP,USD

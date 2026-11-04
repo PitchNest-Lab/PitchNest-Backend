@@ -259,6 +259,7 @@ export interface ChecklistItem {
 
 export function entryChecklist(input: {
   subscription: SubscriptionCheck["state"];
+  requiredPlan: string | null;
   completedSessions: number;
   minSessions: number;
   bestScore: number | null;
@@ -279,7 +280,7 @@ export function entryChecklist(input: {
     { key: "joined", label: "Joined the challenge", status: "completed" },
     {
       key: "subscription",
-      label: "Eligible Pro Founder subscription verified",
+      label: `Eligible ${input.requiredPlan === "prep" ? "Founder" : "Pro Founder"} subscription verified`,
       status:
         input.subscription === "verified" || input.subscription === "not_required" ? "completed"
         : input.subscription === "pending" ? "pending_verification"
@@ -330,6 +331,7 @@ export function entryChecklist(input: {
 /** What still blocks submission, in the founder's words. */
 export function submissionBlockers(input: {
   subscription: SubscriptionCheck["state"];
+  requiredPlan: string | null;
   completedSessions: number;
   minSessions: number;
   bestScore: number | null;
@@ -338,8 +340,9 @@ export function submissionBlockers(input: {
   profileLinkConfirmed: boolean;
 }): string[] {
   const missing: string[] = [];
-  if (input.subscription === "pending") missing.push("Your Pro Founder payment is still being confirmed.");
-  else if (input.subscription === "missing") missing.push("Subscribe to Pro Founder.");
+  const planLabel = input.requiredPlan === "prep" ? "Founder" : "Pro Founder";
+  if (input.subscription === "pending") missing.push(`Your ${planLabel} payment is still being confirmed.`);
+  else if (input.subscription === "missing") missing.push(`Subscribe to ${planLabel}.`);
   if (input.completedSessions < input.minSessions) missing.push("Complete a full AI investor pitch session.");
   else if (input.bestScore === null) missing.push("Get a valid readiness score from a complete session.");
   if (!input.business) missing.push("Choose the Discover business you are entering.");
@@ -421,6 +424,7 @@ function toEntryView(context: EntryContext) {
   const status = entry.status as EntryStatus;
   const shared = {
     subscription: subscription.state,
+    requiredPlan: challenge.required_plan ?? null,
     completedSessions: Number(entry.completed_sessions) || 0,
     minSessions,
     bestScore: entry.best_score ?? null,

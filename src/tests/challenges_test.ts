@@ -148,11 +148,11 @@ const challengeRow: any = {
   terms: "Terms.",
   eligibility: "Founders.",
   requirements: "",
-  required_plan: "pro",
+  required_plan: "prep",
   confirmations: {},
 };
 const code: DiscountCodeRow = {
-  id: "c1", code: "PCHU01", description: null, percent_off: 50, plans: ["pro"], terms: ["monthly"], periods: 1,
+  id: "c1", code: "PCHU01", description: null, percent_off: 50, plans: ["prep"], terms: ["monthly"], periods: 1,
   starts_at: null, ends_at: null, max_redemptions: null, new_customers_only: false, combine_with_offer: false, active: false,
 };
 assert.ok(confirmationStates(challengeRow, code).every((s) => !s.confirmed && !s.stale), "nothing is confirmed by default");
@@ -225,12 +225,12 @@ assert.equal(discountedAmount(69.97, 50), 34.99, "half a kobo rounds up, as Post
 assert.equal(discountedAmount(1990, 33), 1333.3);
 const activeCode = { ...code, active: true };
 assert.equal(staticRefusal(code, { plan: "pro", term: "monthly" }), "inactive", "a code is off until an admin activates it");
-assert.equal(staticRefusal(activeCode, { plan: "pro", term: "monthly" }), null);
-assert.equal(staticRefusal(activeCode, { plan: "prep", term: "monthly" }), "not_applicable", "Pro Founder only");
-assert.equal(staticRefusal(activeCode, { plan: "pro", term: "annual" }), "not_applicable", "first month only, not a discounted year");
-assert.equal(staticRefusal({ ...activeCode, starts_at: "2026-11-20T00:00:00Z" }, { plan: "pro", term: "monthly" }, NOW), "not_started");
-assert.equal(staticRefusal({ ...activeCode, ends_at: "2026-11-09T00:00:00Z" }, { plan: "pro", term: "monthly" }, NOW), "expired");
-assert.deepEqual(toPublicDiscount(code, NOW), { code: "PCHU01", percentOff: 50, plans: ["pro"], terms: ["monthly"], periods: 1, endsAt: null, active: false });
+assert.equal(staticRefusal(activeCode, { plan: "prep", term: "monthly" }), null);
+assert.equal(staticRefusal(activeCode, { plan: "pro", term: "monthly" }), "not_applicable", "Founder only");
+assert.equal(staticRefusal(activeCode, { plan: "prep", term: "annual" }), "not_applicable", "first month only, not a discounted year");
+assert.equal(staticRefusal({ ...activeCode, starts_at: "2026-11-20T00:00:00Z" }, { plan: "prep", term: "monthly" }, NOW), "not_started");
+assert.equal(staticRefusal({ ...activeCode, ends_at: "2026-11-09T00:00:00Z" }, { plan: "prep", term: "monthly" }, NOW), "expired");
+assert.deepEqual(toPublicDiscount(code, NOW), { code: "PCHU01", percentOff: 50, plans: ["prep"], terms: ["monthly"], periods: 1, endsAt: null, active: false });
 assert.equal("max_redemptions" in toPublicDiscount(code), false);
 const discountInput = validateDiscountInput({ code: "pchu02", percentOff: 50, plans: ["pro"], terms: ["monthly"], maxRedemptions: "", active: true });
 assert.deepEqual(discountInput.errors, []);
@@ -245,13 +245,13 @@ const business = {
   missingRequired: [], missingRecommended: [], complete: true, percent: 100, eligible: true,
 };
 const ready = {
-  subscription: "verified" as const, completedSessions: 2, minSessions: 1, bestScore: 78,
+  subscription: "verified" as const, requiredPlan: "prep", completedSessions: 2, minSessions: 1, bestScore: 78,
   business, socialUrl: "https://x.com/a/status/1855012345678901234", profileLinkConfirmed: true,
 };
 assert.deepEqual(submissionBlockers(ready), []);
 assert.deepEqual(
   submissionBlockers({ ...ready, subscription: "pending" }),
-  ["Your Pro Founder payment is still being confirmed."],
+  ["Your Founder payment is still being confirmed."],
   "a pending payment never counts as a subscription",
 );
 assert.ok(submissionBlockers({ ...ready, bestScore: null, completedSessions: 0 }).some((b) => b.includes("session")));

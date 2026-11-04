@@ -42,7 +42,7 @@ function purchasableSkusEnv(name: string): string[] {
     .split(",")
     .map((sku) => sku.trim().toLowerCase())
     .filter((sku) => SKU_PATTERN.test(sku));
-  return skus.length > 0 ? [...new Set(skus)] : ["pro:monthly"];
+  return skus.length > 0 ? [...new Set(skus)] : ["pro:monthly", "prep:monthly"];
 }
 
 function currencyEnv(name: string, fallback: string): string {
@@ -151,9 +151,9 @@ export const config = {
   // present — so loading the keys (e.g. granting the Lambda SSM access) can
   // never turn checkout on by itself. Anything else, including unset, is off.
   billingCheckoutEnabled: process.env.BILLING_CHECKOUT_ENABLED === "true",
-  // Which "plan:term" SKUs checkout may sell. Unset means Pro monthly only, the
-  // launch default. Widening the list is a config change (for example
-  // "pro:monthly,pro:annual,prep:monthly,prep:annual"); unknown entries are
+  // Which "plan:term" SKUs checkout may sell. Unset means Pro and Founder
+  // monthly. Widening the list is a config change (for example
+  // "pro:monthly,prep:monthly,prep:annual"); unknown entries are
   // ignored, and an empty result falls back to the default.
   purchasableSkus: purchasableSkusEnv("BILLING_PURCHASABLE_SKUS"),
   // Price is config, not code, so a currency or amount change is a deploy env

@@ -1,5 +1,5 @@
-// Proves migrations 0037 (no trial for new accounts) and 0038 (hosted
-// challenges, verified scores, winners and discount codes) against real
+// Proves migrations 0037 (no trial for new accounts), 0038 (hosted challenges)
+// and 0039 (Founder plan for the challenge) against real
 // Postgres (PGlite), on top of 0000 + 0015-0036.
 // usage: node scripts/migrations/test-challenges.mjs [backend dir]
 import fs from "node:fs";
@@ -12,6 +12,7 @@ const migDir = path.join(repo, "migrations");
 const fileFor = (v) => fs.readdirSync(migDir).find((f) => f.startsWith(`${v}_`) && f.endsWith(".sql"));
 const VERSIONS = Array.from({ length: 24 }, (_, i) => String(15 + i).padStart(4, "0"));
 const CHALLENGE_SQL = readSql(path.join(migDir, fileFor("0038")));
+const FOUNDER_CHALLENGE_SQL = readSql(path.join(migDir, fileFor("0039")));
 
 let failures = 0;
 const check = (name, ok, detail = "") => {
@@ -69,6 +70,43 @@ check("PCHU01 is 50% off Pro monthly, first period, and NOT active",
     JSON.stringify(seeded?.terms) === '["monthly"]' && seeded?.periods === 1);
 const challengeId = seeded.id;
 const codeId = seeded.discount_code_id;
+
+// â”€â”€ 0039: Founder plan, preserving the staff's other saved settings â”€â”€â”€â”€â”€â”€
+await db.exec(`
+  UPDATE challenges
+     SET promo_enabled = TRUE,
+         confirmations = '{"discount":{"by":5,"at":"2026-11-05T00:00:00Z","hash":"old"},"terms":{"by":5,"at":"2026-11-05T00:00:00Z","hash":"old"},"prizes":{"by":5,"at":"2026-11-05T00:00:00Z","hash":"unchanged"}}'::jsonb
+   WHERE id = '${challengeId}';
+  UPDATE discount_codes SET active = TRUE, max_redemptions = 8 WHERE id = '${codeId}';
+`);
+await run(db, "0039", FOUNDER_CHALLENGE_SQL);
+const founderChallenge = await one(db, `
+  SELECT c.status, c.promo_enabled, c.required_plan, c.eligibility, c.terms, c.confirmations,
+         d.active, d.percent_off, d.plans, d.terms AS discount_terms, d.periods, d.max_redemptions, d.description
+    FROM challenges c JOIN discount_codes d ON d.id = c.discount_code_id
+   WHERE c.id = '${challengeId}'`);
+check("0039 switches the challenge requirement to paid Founder", founderChallenge?.required_plan === "prep");
+check("0039 limits PCHU01 to Founder and updates its label",
+  JSON.stringify(founderChallenge?.plans) === '["prep"]' && founderChallenge?.description?.includes("Founder") && !founderChallenge?.description?.includes("Pro Founder"));
+check("0039 updates eligibility and terms to Founder",
+  founderChallenge?.eligibility?.includes("Founder") && !founderChallenge?.eligibility?.includes("Pro Founder") &&
+    founderChallenge?.terms?.includes("Founder") && !founderChallenge?.terms?.includes("Pro Founder"));
+check("0039 clears only the confirmations affected by its changes",
+  !founderChallenge?.confirmations?.discount && !founderChallenge?.confirmations?.terms && !!founderChallenge?.confirmations?.prizes);
+check("0039 preserves publication, promotion and discount settings",
+  founderChallenge?.status === "draft" && founderChallenge?.promo_enabled === true && founderChallenge?.active === true &&
+    founderChallenge?.percent_off === 50 && JSON.stringify(founderChallenge?.discount_terms) === '["monthly"]' &&
+    founderChallenge?.periods === 1 && founderChallenge?.max_redemptions === 8);
+check("ledger records 0039", !!(await one(db, `SELECT 1 AS ok FROM schema_migrations WHERE version = '0039'`)));
+const founderSnap = await snapshot(db);
+await run(db, "0039 (second run)", FOUNDER_CHALLENGE_SQL);
+const founderAgain = diff(founderSnap, await snapshot(db));
+check("a second run of 0039 changes nothing", founderAgain.onlyA.length === 0 && founderAgain.onlyB.length === 0,
+  `${founderAgain.onlyA.length + founderAgain.onlyB.length} differences`);
+await db.exec(`
+  UPDATE challenges SET promo_enabled = FALSE WHERE id = '${challengeId}';
+  UPDATE discount_codes SET active = FALSE, max_redemptions = NULL WHERE id = '${codeId}';
+`);
 
 // ── Accounts, businesses, entries ──────────────────────────────────────────
 await db.exec(`
@@ -206,14 +244,14 @@ check("an empty list clears every placement", cleared?.n === 0 &&
 
 // ── Discount redemption ────────────────────────────────────────────────────
 let payN = 0;
-const pay = async (userId, { amount = 10400, mode = "manual", plan = "pro", term = "monthly", currency = "NGN" } = {}) => {
+const pay = async (userId, { amount = 5000, mode = "manual", plan = "prep", term = "monthly", currency = "NGN" } = {}) => {
   const ref = `pn-${userId}-${Date.now()}${String(payN++).padStart(3, "0")}-${"a".repeat(16)}`;
   await db.query(`
     INSERT INTO payments (user_id, tx_ref, status, amount, currency, plan, term, granted_days, kind, billing_mode)
     VALUES ($1, $2, 'pending', $3, $4, $5, $6, 32, 'subscription_initial', $7)`, [userId, ref, amount, currency, plan, term, mode]);
   return ref;
 };
-const reserve = async (userId, ref, list = 20800, amount = 10400, currency = "NGN") =>
+const reserve = async (userId, ref, list = 10000, amount = 5000, currency = "NGN") =>
   (await one(db, `SELECT reserve_discount_redemption($1, $2, $3, $4, $5, $6) AS r`, [codeId, userId, ref, list, amount, currency])).r;
 const redemption = async (ref) => one(db, `SELECT status, redeemed_at, released_at FROM discount_redemptions WHERE tx_ref = $1`, [ref]);
 
@@ -226,11 +264,11 @@ await db.exec(`UPDATE discount_codes SET starts_at = NOW() - INTERVAL '2 days', 
 check("an expired code is refused", (await reserve(1, await pay(1))) === "expired");
 await db.exec(`UPDATE discount_codes SET starts_at = NULL, ends_at = NULL WHERE id = '${codeId}'`);
 check("automatic renewal is refused (manual checkout only)", (await reserve(1, await pay(1, { mode: "auto_renew" }))) === "manual_only");
-check("another plan is refused", (await reserve(1, await pay(1, { plan: "prep" }))) === "not_applicable");
+check("another plan is refused", (await reserve(1, await pay(1, { plan: "pro" }))) === "not_applicable");
 check("another term is refused", (await reserve(1, await pay(1, { term: "annual" }))) === "not_applicable");
-const wrongAmount = await fails(db, `SELECT reserve_discount_redemption('${codeId}', 1, '${await pay(1, { amount: 5000 })}', 20800, 5000, 'NGN')`, /INVALID_DISCOUNT_AMOUNT/);
+const wrongAmount = await fails(db, `SELECT reserve_discount_redemption('${codeId}', 1, '${await pay(1, { amount: 3000 })}', 10000, 3000, 'NGN')`, /INVALID_DISCOUNT_AMOUNT/);
 check("an amount that is not exactly 50% off is refused", wrongAmount.ok, wrongAmount.message);
-const otherUser = await fails(db, `SELECT reserve_discount_redemption('${codeId}', 2, '${await pay(1)}', 20800, 10400, 'NGN')`, /DISCOUNT_PAYMENT_MISMATCH/);
+const otherUser = await fails(db, `SELECT reserve_discount_redemption('${codeId}', 2, '${await pay(1)}', 10000, 5000, 'NGN')`, /DISCOUNT_PAYMENT_MISMATCH/);
 check("a payment of another founder cannot be discounted", otherUser.ok, otherUser.message);
 
 const firstRef = await pay(1);
@@ -240,13 +278,13 @@ const secondRef = await pay(1);
 check("a second attempt by the same founder is allowed", (await reserve(1, secondRef)) === "reserved");
 check("…and releases their earlier unfinished one", (await redemption(firstRef))?.status === "released");
 
-const granted = await one(db, `SELECT grant_pro_access($1, '9001', 10400, 'NGN') AS ok`, [secondRef]);
+const granted = await one(db, `SELECT grant_pro_access($1, '9001', 5000, 'NGN') AS ok`, [secondRef]);
 const u1 = await one(db, `SELECT plan, plan_expires_at > NOW() + INTERVAL '30 days' AS covered FROM users WHERE id = 1`);
-check("grant_pro_access settles the discounted amount", granted?.ok === true && u1?.plan === "pro" && u1?.covered === true);
+check("grant_pro_access settles the discounted Founder amount", granted?.ok === true && u1?.plan === "prep" && u1?.covered === true);
 check("settling the payment marks the redemption redeemed", (await redemption(secondRef))?.status === "redeemed");
 const shortPay = await pay(3);
 await reserve(3, shortPay);
-const short = await fails(db, `SELECT grant_pro_access('${shortPay}', '9002', 10000, 'NGN')`, /PAYMENT_AMOUNT_MISMATCH/);
+const short = await fails(db, `SELECT grant_pro_access('${shortPay}', '9002', 4000, 'NGN')`, /PAYMENT_AMOUNT_MISMATCH/);
 check("paying less than the discounted amount still grants nothing", short.ok, short.message);
 check("…and the redemption stays pending", (await redemption(shortPay))?.status === "pending");
 check("the same founder cannot use a first-period code again", (await reserve(1, await pay(1))) === "already_used");
@@ -265,11 +303,11 @@ check("pending checkouts hold a place against the limit", (await reserve(2, awai
 await db.exec(`UPDATE discount_redemptions SET created_at = NOW() - INTERVAL '3 hours' WHERE tx_ref = '${holdRef}'`);
 check("an abandoned checkout stops holding a place after two hours", (await reserve(2, await pay(2))) === "reserved");
 await db.exec(`UPDATE discount_codes SET max_redemptions = NULL, new_customers_only = TRUE WHERE id = '${codeId}'`);
-await db.exec(`UPDATE payments SET status = 'successful', provider_ref = '9100', completed_at = NOW() WHERE tx_ref = '${await pay(3, { amount: 20800 })}'`);
+await db.exec(`UPDATE payments SET status = 'successful', provider_ref = '9100', completed_at = NOW() WHERE tx_ref = '${await pay(3, { amount: 10000 })}'`);
 check("a first-time-customers code refuses a founder who has paid before", (await reserve(3, await pay(3))) === "new_customers_only");
 await db.exec(`UPDATE discount_codes SET new_customers_only = FALSE WHERE id = '${codeId}'`);
 
-const plainRef = await pay(4, { amount: 20800 });
+const plainRef = await pay(4, { amount: 10000 });
 await db.exec(`UPDATE payments SET status = 'failed' WHERE tx_ref = '${plainRef}'`);
 check("payments without a code settle and fail exactly as before",
   (await one(db, `SELECT status FROM payments WHERE tx_ref = $1`, [plainRef]))?.status === "failed" &&
