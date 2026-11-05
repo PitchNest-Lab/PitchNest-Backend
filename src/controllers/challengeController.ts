@@ -4,6 +4,8 @@ import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
 import { MediaError, reencodeImage } from "../services/businessMediaService.ts";
 import { countOf, toPublicDiscount, type DiscountCodeRow } from "../services/discountService.ts";
+import { renderChallengeShareDocument, type ChallengeShare } from "../utils/publicChallengeMetadata.ts";
+import { publicSiteOrigin } from "./publicBusinessController.ts";
 import {
   bannerUrl,
   businessesForChallenge,
@@ -24,6 +26,7 @@ import {
   readPrizes,
   readSocialHandles,
   refreshChallengeScores,
+  shareImageUrl,
   validateSocialPostUrl,
   type ChallengePhase,
   type EligibleBusiness,
@@ -203,6 +206,34 @@ export async function getPublicChallenge(req: Request, res: Response) {
     console.error("Public challenge read failed:", error);
     return res.status(500).json({ error: "Failed to load the challenge." });
   }
+}
+
+/**
+ * GET /api/public/challenges/:slug/share-html — the link preview for a shared
+ * challenge page (utils/publicChallengeMetadata.ts). vercel.json sends only
+ * link-preview crawlers here; drafts and unknown slugs get a "not found" card.
+ */
+export async function getChallengeShareHtml(req: Request, res: Response) {
+  const slug = String(req.params.slug || "").trim().toLowerCase().slice(0, 80);
+  const origin = publicSiteOrigin();
+  let share: ChallengeShare | null = null;
+  try {
+    const row = await loadListedChallenge(slug);
+    if (row) {
+      share = {
+        slug: String(row.slug),
+        title: String(row.title ?? ""),
+        tagline: String(row.tagline ?? ""),
+        description: String(row.description ?? ""),
+        imageUrl: shareImageUrl(row, origin),
+      };
+    }
+  } catch (error) {
+    console.error("Challenge share preview lookup failed:", error);
+  }
+  const html = renderChallengeShareDocument(share, origin, share?.slug ?? (isChallengeSlug(slug) ? slug : "unavailable"));
+  res.set("Cache-Control", share ? "public, max-age=300, s-maxage=600" : "public, max-age=60");
+  return res.status(share ? 200 : 404).type("html").send(html);
 }
 
 /**

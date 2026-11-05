@@ -544,6 +544,29 @@ export function bannerUrl(row: any): string | null {
   return data?.publicUrl || null;
 }
 
+/** The poster's 1200 × 630 link-preview card, stored next to it at upload. */
+export function shareCardFile(bannerFile: string): string {
+  return bannerFile.replace(/\.webp$/, "-share.jpg");
+}
+
+// Cards for posters that ship with the website (PitchNest-Frontend/public),
+// shown until staff upload a poster. Mirrors challengePosterUrl there.
+const BUNDLED_SHARE_CARDS: Record<string, string> = {
+  "pitchnest-challenge": "/pitchnest-challenge-share.jpg",
+};
+
+/** The link-preview image for a challenge: its uploaded poster's card, the bundled one, or null. */
+export function shareImageUrl(row: any, origin: string): string | null {
+  if (bannerUrl(row)) {
+    const { data } = supabase.storage
+      .from(config.publicMediaBucket)
+      .getPublicUrl(`challenge-media/${row.id}/${shareCardFile(row.banner_file)}`);
+    return data?.publicUrl || null;
+  }
+  const bundled = BUNDLED_SHARE_CARDS[String(row?.slug ?? "")];
+  return bundled ? `${origin}${bundled}` : null;
+}
+
 export function challengePageUrl(origin: string, slug: string): string {
   return `${origin}/opportunities/challenges/${encodeURIComponent(slug)}`;
 }

@@ -15,6 +15,9 @@ export interface StorageCall {
   op: "upload" | "createSignedUrl" | "remove" | "getPublicUrl" | "download";
   bucket: string;
   paths: string[];
+  /** Uploads only: what was stored, and as what. */
+  body?: unknown;
+  contentType?: string;
 }
 
 export class FakeSupabase {
@@ -43,8 +46,8 @@ export class FakeSupabase {
 
   storage = {
     from: (bucket: string) => ({
-      upload: async (path: string) => {
-        this.storageCalls.push({ op: "upload", bucket, paths: [path] });
+      upload: async (path: string, body?: unknown, options?: { contentType?: string }) => {
+        this.storageCalls.push({ op: "upload", bucket, paths: [path], body, contentType: options?.contentType });
         return { data: { path }, error: null };
       },
       createSignedUrl: async (path: string, ttl: number) => {

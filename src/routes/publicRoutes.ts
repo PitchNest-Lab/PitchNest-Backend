@@ -15,7 +15,7 @@ import {
 import { optionalUserAuth } from "../middleware/authMiddleware.ts";
 import { listPublicBusinessUpdates } from "../controllers/businessActivityController.ts";
 import { listPublicOpportunities } from "../controllers/opportunityController.ts";
-import { getChallengePromo, getPublicChallenge } from "../controllers/challengeController.ts";
+import { getChallengePromo, getChallengeShareHtml, getPublicChallenge } from "../controllers/challengeController.ts";
 import { getPublicFounder } from "../controllers/founderController.ts";
 import { recordClientEvent } from "../services/eventService.ts";
 import {
@@ -92,6 +92,9 @@ router.get("/opportunities", discoverReadLimiter, listPublicOpportunities);
 // Hosted challenges: drafts are a 404; entries and private data never appear.
 router.get("/challenges/promo", discoverReadLimiter, getChallengePromo);
 router.get("/challenges/:slug", discoverReadLimiter, getPublicChallenge);
+// Link-preview HTML for crawlers on /opportunities/challenges/:slug (vercel.json),
+// like the business one below: title, tagline and the poster card.
+router.get("/challenges/:slug/share-html", discoverReadLimiter, getChallengeShareHtml);
 router.get("/businesses", discoverReadLimiter, listPublicBusinesses);
 router.get("/businesses/:slug", discoverReadLimiter, getPublicBusiness);
 // Link-preview HTML for social crawlers, because the static SPA shell cannot

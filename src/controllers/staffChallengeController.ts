@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import type { Request, Response } from "express";
 import { supabase } from "../config/supabase.ts";
 import { config } from "../config/env.ts";
-import { MediaError, reencodeImage } from "../services/businessMediaService.ts";
+import { MediaError, reencodeImage, shareCardJpeg } from "../services/businessMediaService.ts";
 import {
   DISCOUNT_COLUMNS,
   toStaffDiscount,
@@ -30,6 +30,7 @@ import {
   readPrizes,
   recordAdminAudit,
   refreshChallengeScores,
+  shareCardFile,
   slugifyChallengeTitle,
   subscriptionStates,
   validateChallengeInput,
@@ -395,11 +396,17 @@ function challengeImagePath(challengeId: string, file: string): string {
   return `challenge-media/${challengeId}/${file}`;
 }
 
+/** The poster and its link-preview card (they are added and removed together). */
+function challengeImagePaths(challengeId: string, bannerFile: string): string[] {
+  return [challengeImagePath(challengeId, bannerFile), challengeImagePath(challengeId, shareCardFile(bannerFile))];
+}
+
 /**
  * PUT /api/staff/challenges/:id/image — the challenge poster. Decoded and
  * re-encoded as WebP with no metadata, kept whole (never cropped, at most
  * 1600 px a side), and stored in the public media bucket the site's image
- * policy already allows.
+ * policy already allows. A 1200 × 630 JPEG card of it is stored alongside
+ * for link previews (publicChallengeMetadata.ts).
  */
 export async function uploadStaffChallengeImage(req: Request, res: Response) {
   if (!req.file?.buffer?.length) return res.status(400).json({ error: "Choose an image to upload." });
@@ -407,24 +414,27 @@ export async function uploadStaffChallengeImage(req: Request, res: Response) {
     const row = await requireChallenge(req, res);
     if (!row) return;
     let buffer: Buffer;
+    let card: Buffer;
     try {
       buffer = await reencodeImage(req.file.buffer, { width: 1600, height: 1600, fit: "inside", minWidth: 400, minHeight: 400 });
+      card = await shareCardJpeg(buffer);
     } catch (error) {
       if (error instanceof MediaError) return res.status(error.status).json({ error: error.message });
       throw error;
     }
     const file = `banner-${crypto.createHash("sha256").update(buffer).digest("hex").slice(0, 32)}.webp`;
-    const { error: uploadError } = await supabase.storage
-      .from(config.publicMediaBucket)
-      .upload(challengeImagePath(row.id, file), buffer, {
-        contentType: "image/webp",
-        cacheControl: "31536000",
-        upsert: true,
-        duplex: "half",
-      });
-    if (uploadError) {
-      console.error("Challenge image upload failed:", uploadError.message);
-      return res.status(500).json({ error: "Failed to save the image." });
+    const uploads: Array<[string, Buffer, string]> = [
+      [challengeImagePath(row.id, file), buffer, "image/webp"],
+      [challengeImagePath(row.id, shareCardFile(file)), card, "image/jpeg"],
+    ];
+    for (const [path, body, contentType] of uploads) {
+      const { error: uploadError } = await supabase.storage
+        .from(config.publicMediaBucket)
+        .upload(path, body, { contentType, cacheControl: "31536000", upsert: true, duplex: "half" });
+      if (uploadError) {
+        console.error("Challenge image upload failed:", uploadError.message);
+        return res.status(500).json({ error: "Failed to save the image." });
+      }
     }
     const { data, error } = await supabase
       .from("challenges")
@@ -437,7 +447,7 @@ export async function uploadStaffChallengeImage(req: Request, res: Response) {
       return res.status(500).json({ error: "Failed to save the image." });
     }
     if (row.banner_file && row.banner_file !== file) {
-      await supabase.storage.from(config.publicMediaBucket).remove([challengeImagePath(row.id, row.banner_file)]);
+      await supabase.storage.from(config.publicMediaBucket).remove(challengeImagePaths(row.id, row.banner_file));
     }
     await recordAdminAudit({ actorId: req.user!.id, action: "challenge.image", subjectType: "challenge", subjectId: row.id, challengeId: row.id });
     return res.json({ data: toStaffChallenge(data, { discount: await loadDiscountForChallenge(data) }) });
@@ -458,7 +468,7 @@ export async function removeStaffChallengeImage(req: Request, res: Response) {
       .select(CHALLENGE_COLUMNS)
       .maybeSingle();
     if (error || !data) return res.status(500).json({ error: "Failed to remove the image." });
-    if (row.banner_file) await supabase.storage.from(config.publicMediaBucket).remove([challengeImagePath(row.id, row.banner_file)]);
+    if (row.banner_file) await supabase.storage.from(config.publicMediaBucket).remove(challengeImagePaths(row.id, row.banner_file));
     await recordAdminAudit({ actorId: req.user!.id, action: "challenge.image_removed", subjectType: "challenge", subjectId: row.id, challengeId: row.id });
     return res.json({ data: toStaffChallenge(data, { discount: await loadDiscountForChallenge(data) }) });
   } catch (error) {

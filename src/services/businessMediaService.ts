@@ -97,6 +97,29 @@ export function sniffImageType(buffer: Buffer): "png" | "jpeg" | "webp" | "gif" 
 }
 
 /**
+ * A 1200 × 630 JPEG for link previews: the whole image, centred on a blurred,
+ * darkened copy of itself, so no app crops a poster's text and the sides
+ * match it. JPEG because not every preview (LinkedIn, some WhatsApp versions)
+ * shows WebP. Takes an image that reencodeImage has already checked.
+ */
+export async function shareCardJpeg(input: Buffer): Promise<Buffer> {
+  const sharp = await loadSharp();
+  const open = () => sharp(input, { failOn: "error", limitInputPixels: 50_000_000 }).flatten({ background: "#ffffff" });
+  try {
+    const [backdrop, image] = await Promise.all([
+      open().resize({ width: 1200, height: 630, fit: "cover" }).blur(30).modulate({ brightness: 0.8 }).toBuffer(),
+      open().resize({ width: 1200, height: 630, fit: "inside" }).toBuffer(),
+    ]);
+    return await sharp(backdrop)
+      .composite([{ input: image, gravity: "center" }])
+      .jpeg({ quality: 82, mozjpeg: true })
+      .toBuffer();
+  } catch {
+    throw new MediaError("That image could not be processed. Try another file.", 415);
+  }
+}
+
+/**
  * Decodes, orients and resizes an image, and re-encodes it as WebP with no
  * metadata. Throws MediaError (with an HTTP status) for anything unusable.
  */

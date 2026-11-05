@@ -1,6 +1,6 @@
 import type { PublicBusinessProfile } from "../controllers/publicBusinessController.ts";
 
-function escapeHtml(value: string): string {
+export function escapeHtml(value: string): string {
   return value
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -9,7 +9,7 @@ function escapeHtml(value: string): string {
     .replace(/'/g, "&#39;");
 }
 
-function replaceMeta(html: string, key: string, value: string, property = false): string {
+export function replaceMeta(html: string, key: string, value: string, property = false): string {
   const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const pattern = new RegExp(
     `<meta\\s+[^>]*(?:name|property)=["']${escapedKey}["'][^>]*>`,
@@ -20,7 +20,7 @@ function replaceMeta(html: string, key: string, value: string, property = false)
   return pattern.test(html) ? html.replace(pattern, tag) : html.replace("</head>", `  ${tag}\n</head>`);
 }
 
-function replaceCanonical(html: string, url: string): string {
+export function replaceCanonical(html: string, url: string): string {
   const tag = `<link rel="canonical" href="${escapeHtml(url)}" />`;
   const pattern = /<link\s+[^>]*rel=["']canonical["'][^>]*>/i;
   return pattern.test(html) ? html.replace(pattern, tag) : html.replace("</head>", `  ${tag}\n</head>`);

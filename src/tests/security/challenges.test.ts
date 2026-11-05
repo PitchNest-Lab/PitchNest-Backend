@@ -279,6 +279,28 @@ test("public: a draft is a 404; a listed challenge shows its rules and nothing p
   assert.equal(r.json.data.results, null, "no results before they are published");
 });
 
+test("link previews: a shared challenge shows its title, tagline and poster; a draft shows nothing", async () => {
+  const r = await fetch(`${base}/api/public/challenges/pitchnest-challenge/share-html`);
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get("content-type") || "", /^text\/html/);
+  const html = await r.text();
+  assert.match(html, /<meta property="og:title" content="PitchNest Challenge" \/>/);
+  assert.match(html, /<meta property="og:description" content="Practice\. Pitch\. Showcase\. Win! Practice with AI investors\. Second paragraph\." \/>/);
+  assert.match(html, /<meta property="og:image" content="https?:\/\/[^"]+\/pitchnest-challenge-share\.jpg" \/>/, "before an upload, the card that ships with the website");
+  assert.match(html, /<meta name="twitter:card" content="summary_large_image" \/>/);
+  assert.match(html, /<link rel="canonical" href="https?:\/\/[^"]+\/opportunities\/challenges\/pitchnest-challenge" \/>/);
+  assert.match(html, /<meta name="robots" content="index, follow" \/>/);
+
+  const draft = await fetch(`${base}/api/public/challenges/secret-draft/share-html`);
+  assert.equal(draft.status, 404);
+  const draftHtml = await draft.text();
+  assert.match(draftHtml, /<meta name="robots" content="noindex, follow" \/>/);
+  assert.doesNotMatch(draftHtml, /Secret Draft|Not announced/, "a draft's title and tagline never leak");
+  const odd = await fetch(`${base}/api/public/challenges/${encodeURIComponent("<script>")}/share-html`);
+  assert.equal(odd.status, 404);
+  assert.doesNotMatch(await odd.text(), /<script>/, "nothing from the address is echoed unescaped");
+});
+
 test("hub: the hosted challenge comes first; external listings are unchanged", async () => {
   const r = await call(base, "GET", "/api/public/opportunities");
   assert.equal(r.status, 200);
@@ -528,9 +550,18 @@ test("images: the poster is public, the founder's screenshot is private", async 
   db.storageCalls.length = 0;
   const poster = await call(base, "PUT", `/api/staff/challenges/${CHALLENGE_ID}/image`, { token: tokenStaff, form: form() });
   assert.equal(poster.status, 200, JSON.stringify(poster.json));
-  const upload = db.storageCalls.find((c) => c.op === "upload")!;
+  const upload = db.storageCalls.find((c) => c.op === "upload" && c.paths[0].endsWith(".webp"))!;
   assert.match(upload.paths[0], new RegExp(`^challenge-media/${CHALLENGE_ID}/banner-[a-f0-9]{32}\\.webp$`));
   assert.ok(poster.json.data.imageUrl);
+  // Its link-preview card: a wide JPEG beside it, which previews then use.
+  const card = db.storageCalls.find((c) => c.op === "upload" && c.paths[0].endsWith("-share.jpg"))!;
+  assert.equal(card.paths[0], upload.paths[0].replace(/\.webp$/, "-share.jpg"));
+  assert.equal(card.bucket, config.publicMediaBucket);
+  assert.equal(card.contentType, "image/jpeg");
+  const cardMeta = await sharp(card.body as Buffer).metadata();
+  assert.deepEqual([cardMeta.format, cardMeta.width, cardMeta.height], ["jpeg", 1200, 630]);
+  const preview = await (await fetch(`${base}/api/public/challenges/pitchnest-challenge/share-html`)).text();
+  assert.ok(preview.includes(`<meta property="og:image" content="https://public.test/${config.publicMediaBucket}/${card.paths[0]}" />`), preview);
   const hub = await call(base, "GET", "/api/public/opportunities");
   assert.equal(hub.json.data[0].challenge.imageUrl, poster.json.data.imageUrl, "the hub card shows the poster");
   assert.equal((await call(base, "GET", "/api/public/challenges/promo")).json.data.imageUrl, poster.json.data.imageUrl, "so does the pop-up");
@@ -546,6 +577,21 @@ test("images: the poster is public, the founder's screenshot is private", async 
   const detail = await call(base, "GET", `/api/staff/challenges/${CHALLENGE_ID}/participants/${entryOf(FOUNDER_B.id)!.id}`, { token: tokenStaff });
   assert.equal(detail.status, 200);
   assert.match(detail.json.data.evidenceUrl, /^https:\/\/signed\.test\//, "reviewers get a short-lived signed link");
+
+  // A new poster replaces the old one and its card; removing it removes both.
+  const yellow = await sharp({ create: { width: 900, height: 600, channels: 3, background: "#facc15" } }).png().toBuffer();
+  const replaceForm = new FormData();
+  replaceForm.append("image", new Blob([yellow], { type: "image/png" }), "poster-2.png");
+  db.storageCalls.length = 0;
+  const replaced = await call(base, "PUT", `/api/staff/challenges/${CHALLENGE_ID}/image`, { token: tokenStaff, form: replaceForm });
+  assert.equal(replaced.status, 200, JSON.stringify(replaced.json));
+  assert.deepEqual(db.storageCalls.find((c) => c.op === "remove")?.paths, [upload.paths[0], card.paths[0]]);
+  const current = db.storageCalls.filter((c) => c.op === "upload").map((c) => c.paths[0]);
+  db.storageCalls.length = 0;
+  assert.equal((await call(base, "DELETE", `/api/staff/challenges/${CHALLENGE_ID}/image`, { token: tokenStaff })).status, 200);
+  assert.deepEqual(db.storageCalls.find((c) => c.op === "remove")?.paths, current);
+  const bundled = await (await fetch(`${base}/api/public/challenges/pitchnest-challenge/share-html`)).text();
+  assert.match(bundled, /\/pitchnest-challenge-share\.jpg" \/>/, "without an upload, previews fall back to the bundled card");
 });
 
 test("discount: the preview and the checkout charge the same discounted, one-time price", async () => {

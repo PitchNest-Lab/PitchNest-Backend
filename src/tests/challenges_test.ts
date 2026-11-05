@@ -29,6 +29,7 @@ import {
 } from "../services/discountService.ts";
 import { entryChecklist, submissionBlockers, toPublicChallenge } from "../controllers/challengeController.ts";
 import { toNotificationView } from "../controllers/notificationController.ts";
+import { challengeShareDescription, renderChallengeShareDocument } from "../utils/publicChallengeMetadata.ts";
 
 // ─── Phase: status plus the deadline, read on every request ──────────────────
 const NOW = new Date("2026-11-10T12:00:00Z");
@@ -313,6 +314,29 @@ assert.match(migration, /REVOKE ALL ON FUNCTION reserve_discount_redemption\([^)
 assert.match(migration, /REVOKE ALL ON FUNCTION refresh_challenge_scores\(UUID, UUID\) FROM PUBLIC, anon, authenticated;/);
 assert.match(migration, /INSERT INTO schema_migrations[\s\S]*'0038'/);
 assert.doesNotMatch(migration, /evaluation_report\s*->\s*'transcript'/, "scores only; transcripts are never read");
+
+// ─── Link previews: title, tagline and opening sentences, escaped ────────────
+const longDescription = `The PitchNest Challenge gives startup founders an opportunity to strengthen their pitching skills, showcase their businesses, and compete for cash prizes.\n\nPractice with AI investors, improve your pitch readiness score, publish your business on PitchNest Discover, and share your progress.`;
+const shareText = challengeShareDescription({ title: "PitchNest Challenge", tagline: "Practice. Pitch. Showcase. Win!", description: longDescription });
+assert.equal(
+  shareText,
+  "Practice. Pitch. Showcase. Win! The PitchNest Challenge gives startup founders an opportunity to strengthen their pitching skills, showcase their businesses, and compete for cash prizes.",
+  "the tagline, then whole sentences that fit",
+);
+assert.ok(shareText.length <= 200);
+assert.equal(challengeShareDescription({ title: "Demo Day", tagline: "", description: "" }), "Demo Day: a pitch competition hosted by PitchNest.");
+const hostile = renderChallengeShareDocument(
+  { slug: "demo", title: `"><script>alert(1)</script>`, tagline: "Win & <b>grow</b>", description: "", imageUrl: "https://cdn.example/card.jpg?a=1&b=2" },
+  "https://www.pitchnest.app",
+  "demo",
+);
+assert.doesNotMatch(hostile, /<script>|<b>/, "staff text is escaped");
+assert.match(hostile, /<meta property="og:title" content="&quot;&gt;&lt;script&gt;alert\(1\)&lt;\/script&gt;" \/>/);
+assert.match(hostile, /<meta property="og:image" content="https:\/\/cdn\.example\/card\.jpg\?a=1&amp;b=2" \/>/);
+assert.match(hostile, /<meta property="og:url" content="https:\/\/www\.pitchnest\.app\/opportunities\/challenges\/demo" \/>/);
+const missing = renderChallengeShareDocument(null, "https://www.pitchnest.app", "unavailable");
+assert.match(missing, /<meta property="og:image" content="https:\/\/www\.pitchnest\.app\/og-image\.png" \/>/, "the site image when there is nothing to show");
+assert.match(missing, /<title>Challenge not found — PitchNest<\/title>/);
 
 console.log("Challenge tests passed.");
 process.exit(0);
