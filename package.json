@@ -40,7 +40,7 @@
     "build:lambda:prod": "node scripts/build-lambda-prod.mjs",
     "verify:lambda:prod": "node scripts/verify-lambda-artifact.mjs",
     "migrations:combined": "node scripts/migrations/build-combined.mjs",
-    "test:migrations": "node scripts/migrations/test-combined.mjs && node scripts/migrations/test-challenges.mjs"
+    "test:migrations": "node scripts/migrations/test-combined.mjs && node scripts/migrations/test-challenges.mjs && node scripts/migrations/test-organization-lifecycle.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-ssm": "^3.1147.0",

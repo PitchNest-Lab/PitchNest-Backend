@@ -48,6 +48,7 @@ Apply in order, staging first:
 | `0037` | No Pro trial for new accounts: `users.trial_started_at` and `trial_expires_at` default to NULL and `trial_status` to `'none'`. Trials already granted keep their end date | Order does not matter: the backend writes these columns explicitly (`NEW_ACCOUNT_TRIAL_DAYS = 0`) |
 | `0038` | Hosted challenges in the Opportunities hub: `challenges`, `challenge_participants` (one entry per founder; one winner per place; one entry per business), `admin_audit_log`, `discount_codes` and `discount_redemptions`; `refresh_challenge_scores` (verified best score from the founder's own sessions, frozen after the deadline), `set_challenge_placements`, `reserve_discount_redemption` and a trigger that settles or releases a redemption with its payment; challenge notifications in `list_user_notifications`. Seeds the PitchNest Challenge as a **draft** and code `PCHU01` **inactive** | Apply before deploying the backend that uses it; without it the hub, checkout and notifications work exactly as before. Staff confirm the rules, publish and activate the code at `/staff/challenges`. `npm run test:migrations` proves it on PGlite |
 | `0039` | Changes the seeded PitchNest Challenge entry requirement and `PCHU01` discount to the paid Founder plan; updates the matching eligibility and terms text, and clears only the affected staff confirmations | Apply in DEV and PROD before deploying the matching backend/frontend. Keeps the challenge's publication and promo settings, code activation and discount terms unchanged |
+| `0040` | Named organization administrator accounts, one-use email-bound cohort invitations, organization password recovery, and durable organization reports | Apply to DEV and PROD before deploying the organization lifecycle release. Existing shared organization passwords are disabled; each seeded owner sets a private password with the organization recovery link. Public numeric-code enrollment is no longer accepted. |
 
 Grant moderation access to a trusted account:
 
@@ -60,9 +61,10 @@ the next request.
 
 ## Organization credentials
 
-Organization credentials created or updated after `0018` must contain bcrypt
-hashes. Existing non-bcrypt credentials are deliberately not auto-converted:
-their plaintext values must not be exported or re-saved.
+Before `0040`, organization login used the shared `"Organizations".password`
+column. Credentials created or updated after `0018` must contain bcrypt hashes.
+Existing non-bcrypt credentials are deliberately not auto-converted: their
+plaintext values must not be exported or re-saved.
 
 `0030` updates every organization row, and each update re-checks the bcrypt
 rule, so a database still holding a non-bcrypt value cannot apply `0030`.
@@ -88,6 +90,20 @@ UPDATE "Organizations"
 SET password = '<hash>', auth_version = auth_version + 1,
     failed_login_attempts = 0, locked_until = NULL
 WHERE email = 'organization@example.com';
+```
+
+After `0040`, organization sign-in uses named accounts in
+`pitchnest_org_staff_accounts`; the shared password above is disabled and changing it
+does not restore access. Owners should use `/organization-forgot-password` to
+set an individual password. If email delivery is unavailable during setup,
+create a bcrypt hash with the command above and set it directly on the owner
+membership:
+
+```sql
+UPDATE pitchnest_org_staff_accounts
+SET password_hash = '<hash>', auth_version = auth_version + 1,
+    failed_login_attempts = 0, locked_until = NULL
+WHERE email = 'organization@example.com' AND role = 'owner';
 ```
 
 ## Upgrading an existing database from 0014

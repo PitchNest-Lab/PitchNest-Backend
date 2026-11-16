@@ -1,7 +1,12 @@
 import crypto from "node:crypto";
 import { config } from "../config/env.ts";
 
-export type AuthTokenPurpose = "email-link" | "email-code" | "password-reset";
+export type AuthTokenPurpose =
+  | "email-link"
+  | "email-code"
+  | "password-reset"
+  | "organization-password-reset"
+  | "organization-invite";
 
 /**
  * Store only a keyed digest of email/reset credentials. A database read leak

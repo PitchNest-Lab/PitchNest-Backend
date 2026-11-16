@@ -12,6 +12,7 @@ export interface AuthenticatedIdentity {
   authVersion?: number;
   accountType: AccountType;
   orgCode?: string;
+  organizationMemberId?: number;
 }
 
 export interface AuthenticatedOrganization {
@@ -19,6 +20,8 @@ export interface AuthenticatedOrganization {
   email: string;
   orgCode: string;
   role: OrganizationRole;
+  memberId?: number;
+  memberName?: string;
 }
 
 declare global {
@@ -59,47 +62,57 @@ function createAuthMiddleware(requiredType: RequiredAccountType) {
       }
 
       if (accountType === "organization") {
-        const { data: organization, error } = await supabase
-          .from("Organizations")
-          .select("id, email, org_code, auth_version")
-          .eq("id", decoded.id)
+        const memberId = Number.isInteger(decoded.organizationMemberId)
+          ? Number(decoded.organizationMemberId)
+          : null;
+        if (memberId === null) {
+          return res.status(401).json({ error: "This organization session was revoked. Please log in again." });
+        }
+        const { data: member, error: memberError } = await supabase
+          .from("pitchnest_org_staff_accounts")
+          .select("id, organization_id, name, email, role, status, auth_version")
+          .eq("id", memberId)
           .maybeSingle();
-
-        if (error) {
-          console.error("Organization authentication lookup failed:", error.message);
+        if (memberError) {
+          console.error("Organization member authentication lookup failed:", memberError.message);
           return res.status(503).json({ error: "Authentication service is temporarily unavailable." });
         }
-        if (!organization || organization.org_code == null) {
-          return res.status(401).json({
-            error: "Organization access was revoked. Please log in again.",
-          });
-        }
-
         const tokenAuthVersion = Number.isInteger(decoded.authVersion)
           ? Number(decoded.authVersion)
           : 0;
-        if ((organization.auth_version ?? 0) !== tokenAuthVersion) {
-          return res.status(401).json({
-            error: "This session was revoked. Please log in again.",
-          });
+        if (!member || member.status !== "active" || member.auth_version !== tokenAuthVersion
+          || member.organization_id !== decoded.id) {
+          return res.status(401).json({ error: "This organization session was revoked. Please log in again." });
         }
-
+        const { data: organization, error: organizationError } = await supabase
+          .from("Organizations")
+          .select("id, org_code")
+          .eq("id", member.organization_id)
+          .maybeSingle();
+        if (organizationError) {
+          console.error("Organization member tenant lookup failed:", organizationError.message);
+          return res.status(503).json({ error: "Authentication service is temporarily unavailable." });
+        }
+        if (!organization || organization.org_code == null) {
+          return res.status(401).json({ error: "Organization access was revoked. Please log in again." });
+        }
         const identity: AuthenticatedIdentity = {
           id: organization.id,
-          email: organization.email,
+          email: member.email,
           rememberMe: decoded.rememberMe === true,
-          authVersion: organization.auth_version ?? 0,
+          authVersion: member.auth_version,
           accountType: "organization",
           orgCode: String(organization.org_code),
+          organizationMemberId: member.id,
         };
         req.user = identity;
-        // The legacy organization credential represents the organization owner.
-        // Phase 7 will replace this with normal user accounts plus memberships.
         req.organization = {
           id: organization.id,
-          email: organization.email,
+          email: member.email,
           orgCode: String(organization.org_code),
-          role: "owner",
+          role: member.role,
+          memberId: member.id,
+          memberName: member.name,
         };
         return next();
       }
@@ -229,13 +242,12 @@ export async function requireStaff(req: Request, res: Response, next: NextFuncti
 /** Login-session endpoints such as /auth/me and /auth/refresh. */
 export const accountAuthMiddleware = createAuthMiddleware("any");
 
-/** Legacy organization dashboard endpoints. Normal user tokens are rejected. */
+/** Organization member endpoints. Normal user tokens are rejected. */
 export const organizationAuthMiddleware = createAuthMiddleware("organization");
 
 /**
- * Role gate for organization routes. The current legacy credential is assigned
- * the owner role; the same middleware can accept membership roles once the
- * organization_members model replaces shared organization credentials.
+ * Role gate for organization routes. Each request is scoped to the role read
+ * from the authenticated organization staff account row.
  */
 export const requireOrgRole = (...allowedRoles: OrganizationRole[]) =>
   (req: Request, res: Response, next: NextFunction) => {

@@ -18,6 +18,7 @@ export interface AccessTokenPayload extends JwtPayload {
   authVersion?: number;
   accountType?: "user" | "organization";
   orgCode?: string;
+  organizationMemberId?: number;
 }
 
 /** Accept only login-session JWTs, not another token class sharing the key. */

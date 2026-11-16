@@ -2,6 +2,8 @@ import { Request, Response } from "express";
 import { supabase } from "../../config/supabase.ts";
 import { config } from "../../config/env.ts";
 import { safeAvatarUrl } from "../../utils/storagePath.ts";
+import { authorizedRecordingTarget } from "../../utils/recordingAuth.ts";
+import { signLocalFileUrl } from "../../services/storageService.ts";
 import {
   pitchScoreFromReport,
   isCompletePitch,
@@ -13,7 +15,6 @@ import {
 const ANALYTICS_CACHE_MS = 20_000;
 const MAX_ANALYTICS_CACHE_ENTRIES = 25;
 const DATABASE_PAGE_SIZE = 1_000;
-const MAX_ANALYTICS_ROWS = 25_000;
 const analyticsCache = new Map<string, { expiresAt: number; value: Promise<any[]> }>();
 
 async function cachedRows(key: string, load: () => Promise<any[]>): Promise<any[]> {
@@ -36,14 +37,13 @@ async function loadAllPages(
   makeQuery: (from: number, to: number) => PromiseLike<{ data: any[] | null; error: any }>,
 ): Promise<any[]> {
   const rows: any[] = [];
-  for (let from = 0; from < MAX_ANALYTICS_ROWS; from += DATABASE_PAGE_SIZE) {
+  for (let from = 0; ; from += DATABASE_PAGE_SIZE) {
     const { data, error } = await makeQuery(from, from + DATABASE_PAGE_SIZE - 1);
     if (error) throw error;
     const page = data ?? [];
     rows.push(...page);
     if (page.length < DATABASE_PAGE_SIZE) return rows;
   }
-  throw new Error(`Organization analytics exceeded the ${MAX_ANALYTICS_ROWS}-row safety limit.`);
 }
 
 const getOrgUsers = async (orgId: string) => cachedRows(`users:${orgId}`, async () => {
@@ -90,7 +90,7 @@ const getOrg = async (orgId: string) => {
   return org;
 };
 
-/* ---------------- ORGANIZATION DETAILS (full profile + QR link) ---------------- */
+/* ---------------- ORGANIZATION DETAILS (full profile) ---------------- */
 export const orgDetails = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
@@ -99,8 +99,6 @@ export const orgDetails = async (req: Request, res: Response) => {
     if (!org) {
       return res.status(404).json({ error: "Organization not found" });
     }
-
-    const baseUrl = config.appBaseUrl.replace(/\/+$/, "");
 
     res.status(200).json({
       data: {
@@ -118,8 +116,6 @@ export const orgDetails = async (req: Request, res: Response) => {
         trialExpiresAt: org.trial_expires_at ?? null,
         trialStatus: org.trial_status ?? "Active",
         createdAt: org.created_at,
-        // The link the QR code encodes and the text shown underneath it.
-        enrollLink: `${baseUrl}/signup?referralCode=${encodeURIComponent(String(org.org_code))}`,
       },
       message: "Organization details fetched successfully",
     });
@@ -203,6 +199,13 @@ export const seats = async (req: Request, res: Response) => {
     const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
     const users = await getOrgUsers(orgId);
+    const { data: pendingInvites, error: inviteError } = await supabase.from("pitchnest_org_cohort_invites")
+      .select("id")
+      .eq("organization_id", req.organization!.id)
+      .is("accepted_at", null)
+      .is("revoked_at", null)
+      .gt("expires_at", new Date().toISOString());
+    if (inviteError) throw inviteError;
 
     const seatsByRoleMap: Record<string, number> = {};
     users.forEach((u) => {
@@ -224,7 +227,7 @@ export const seats = async (req: Request, res: Response) => {
       data: {
         totalSeats: org?.org_users_capacity ?? 0,
         usedSeats: org?.org_users_enrolled ?? users.filter((u) => u.enrolled_at).length,
-        pendingInvites: users.filter((u) => !u.enrolled_at).length,
+        pendingInvites: pendingInvites?.length ?? 0,
         planName: org?.plan ?? "—",
         seatsByRole: Object.entries(seatsByRoleMap).map(([role, count]) => ({ role, count })),
         history,
@@ -295,11 +298,18 @@ export const founderDrill = async (req: Request, res: Response) => {
     const orgId = req.organization!.orgCode;
     const users = await getOrgUsers(orgId);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
+    const sessionsByUser = new Map<string, any[]>();
+    for (const session of sessions) {
+      const key = String(session.user_id);
+      const own = sessionsByUser.get(key);
+      if (own) own.push(session);
+      else sessionsByUser.set(key, [session]);
+    }
 
     const founders = users
       .filter((u) => (u.role ?? "Founder") === "Founder")
       .map((u) => {
-        const own = sessions.filter((s) => s.user_id === u.id); // already newest-first
+        const own = sessionsByUser.get(String(u.id)) ?? []; // session query is already newest-first
         const chronological = [...own].reverse(); // oldest-first for trend/improvement
 
         const scoredChrono = chronological
@@ -459,6 +469,71 @@ const buildReport = (sessions: any[], users: any[], rangeStart: Date, rangeEnd: 
   };
 };
 
+async function persistOrganizationReport(
+  req: Request,
+  reportType: "weekly" | "monthly",
+  title: string,
+  rangeStart: Date,
+  rangeEnd: Date,
+  report: Record<string, unknown>,
+) {
+  const { data, error } = await supabase.from("pitchnest_org_reports").insert({
+    organization_id: req.organization!.id,
+    report_type: reportType,
+    title,
+    range_start: rangeStart.toISOString(),
+    range_end: rangeEnd.toISOString(),
+    generated_by: req.organization!.memberId ?? null,
+    report,
+  }).select("id, generated_at").single();
+  if (error || !data) throw error || new Error("Organization report was not saved");
+  return data;
+}
+
+export const listReports = async (req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabase.from("pitchnest_org_reports")
+      .select("id, report_type, title, range_start, range_end, report, generated_at")
+      .eq("organization_id", req.organization!.id)
+      .order("generated_at", { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    return res.json({ data: { reports: (data ?? []).map((row) => ({
+      ...row.report,
+      id: row.id,
+      type: row.report_type === "weekly" ? "Weekly" : "Monthly",
+      status: "ready",
+      title: row.title,
+      rangeStart: row.range_start,
+      rangeEnd: row.range_end,
+      generatedAt: row.generated_at,
+    })) } });
+  } catch (error) {
+    console.error("Organization report history failed:", error);
+    return res.status(500).json({ error: "Could not load report history." });
+  }
+};
+
+export const downloadReport = async (req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabase.from("pitchnest_org_reports")
+      .select("id, title, report, generated_at")
+      .eq("id", req.params.reportId)
+      .eq("organization_id", req.organization!.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ error: "Report not found." });
+    const safeTitle = String(data.title).replace(/[^a-z0-9-_]+/gi, "-").replace(/^-|-$/g, "").slice(0, 80) || "organization-report";
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename=\"${safeTitle}.json\"`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.status(200).send(JSON.stringify({ id: data.id, title: data.title, generatedAt: data.generated_at, ...data.report }, null, 2));
+  } catch (error) {
+    console.error("Organization report download failed:", error);
+    return res.status(500).json({ error: "Could not download this report." });
+  }
+};
+
 // weekly: pass any date inside the target week (defaults to current week)
 export const weeklyReport = async (req: Request, res: Response) => {
   try {
@@ -481,11 +556,15 @@ export const weeklyReport = async (req: Request, res: Response) => {
     end.setDate(start.getDate() + 7);
 
     const report = buildReport(sessions, users, start, end);
+    const title = `Weekly cohort summary — ${start.toDateString()} to ${end.toDateString()}`;
+    const saved = await persistOrganizationReport(req, "weekly", title, start, end, report);
     res.status(200).json({
       data: {
+        id: saved.id,
         type: "Weekly",
-        title: `Weekly cohort summary — ${start.toDateString()} to ${end.toDateString()}`,
-        generatedAt: new Date().toISOString(),
+        status: "ready",
+        title,
+        generatedAt: saved.generated_at,
         ...report,
       },
       message: "Weekly report generated successfully",
@@ -514,11 +593,15 @@ export const monthlyReport = async (req: Request, res: Response) => {
     const end = new Date(y, m + 1, 1);
 
     const report = buildReport(sessions, users, start, end);
+    const title = `${start.toLocaleString(undefined, { month: "long", year: "numeric" })} performance report`;
+    const saved = await persistOrganizationReport(req, "monthly", title, start, end, report);
     res.status(200).json({
       data: {
+        id: saved.id,
         type: "Monthly",
-        title: `${start.toLocaleString(undefined, { month: "long", year: "numeric" })} performance report`,
-        generatedAt: new Date().toISOString(),
+        status: "ready",
+        title,
+        generatedAt: saved.generated_at,
         ...report,
       },
       message: "Monthly report generated successfully",
@@ -529,7 +612,57 @@ export const monthlyReport = async (req: Request, res: Response) => {
   }
 };
 
-/* ---------------- REPLAYS (not implemented yet) ---------------- */
-export const replays = async (_req: Request, res: Response) => {
-  res.status(200).json({ data: { replays: [], comingSoon: true }, message: "Replays coming soon" });
+/* ---------------- REPLAYS ---------------- */
+export const replays = async (req: Request, res: Response) => {
+  try {
+    const { data, error } = await supabase.from("session_list_safe")
+      .select("id, user_id, created_at, business_name, mode, evaluation_report, has_recording")
+      .eq("org_id", req.organization!.orgCode)
+      .eq("visibility", "organization")
+      .eq("has_recording", true)
+      .order("created_at", { ascending: false })
+      .limit(100);
+    if (error) throw error;
+    const userIds = [...new Set((data ?? []).map((session) => session.user_id))];
+    const sessionIds = (data ?? []).map((session) => session.id);
+    const { data: recordings, error: recordingsError } = sessionIds.length
+      ? await supabase.from("sessions").select("id, user_id, video_url")
+        .in("id", sessionIds).eq("org_id", req.organization!.orgCode).eq("visibility", "organization")
+      : { data: [], error: null };
+    if (recordingsError) throw recordingsError;
+    const recordingById = new Map((recordings ?? []).map((row) => [String(row.id), row.video_url]));
+    const { data: users, error: usersError } = userIds.length
+      ? await supabase.from("users").select("id, name").in("id", userIds)
+      : { data: [], error: null };
+    if (usersError) throw usersError;
+    const names = new Map((users ?? []).map((user) => [String(user.id), user.name]));
+    const records = await Promise.all((data ?? []).map(async (session) => {
+      const storedRecording = recordingById.get(String(session.id));
+      const target = await authorizedRecordingTarget(storedRecording, session.user_id);
+      let replayUrl: string | null = null;
+      if (target?.kind === "storage") {
+        const { data: signed, error: signedError } = await supabase.storage
+          .from(config.storageBucket)
+          .createSignedUrl(target.path, 15 * 60);
+        if (!signedError) replayUrl = signed?.signedUrl ?? null;
+      } else if (target?.kind === "local") {
+        replayUrl = signLocalFileUrl(target.name, session.user_id, 15 * 60);
+      }
+      const score = pitchScoreFromReport(session.evaluation_report);
+      return {
+        id: String(session.id),
+        founderName: names.get(String(session.user_id)) ?? "Founder",
+        pitchTitle: session.business_name ?? "Untitled pitch",
+        date: session.created_at,
+        panelType: panelTypeLabel(session.mode),
+        status: pitchStatusFromSession(session),
+        score,
+        replayUrl,
+      };
+    }));
+    return res.json({ data: { replays: records } });
+  } catch (error) {
+    console.error("Organization replays failed:", error);
+    return res.status(500).json({ error: "Could not load organization replays." });
+  }
 };

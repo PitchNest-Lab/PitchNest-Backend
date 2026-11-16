@@ -4,10 +4,15 @@ import {
   signup,
   login,
   orgLogin,
+  forgotOrganizationPassword,
+  resetOrganizationPassword,
+  getOrganizationStaffInvite,
+  acceptOrganizationStaffInvite,
   googleAuth,
   updateMe,
   updateSettings,
   toPublicUser,
+  toPublicUserWithOrganizationPlan,
   toPublicOrganization,
   forgotPassword,
   resetPassword,
@@ -56,6 +61,10 @@ const sessionMaintenanceLimiter = rateLimit({
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
 router.post("/organization-login", authLimiter, orgLogin);
+router.post("/organization-forgot-password", authLimiter, forgotOrganizationPassword);
+router.post("/organization-reset-password", authLimiter, resetOrganizationPassword);
+router.get("/organization-invite", authLimiter, getOrganizationStaffInvite);
+router.post("/organization-invite/accept", authLimiter, acceptOrganizationStaffInvite);
 router.post("/google", authLimiter, googleAuth);
 router.post("/forgot-password", authLimiter, forgotPassword);
 router.post("/reset-password", authLimiter, resetPassword);
@@ -81,6 +90,15 @@ router.get("/me", accountAuthMiddleware, async (req, res) => {
       }
 
       if (organization) {
+        if (req.organization?.memberId) {
+          return res.json({
+            ...toPublicOrganization(organization),
+            name: req.organization.memberName ?? organization.org_name ?? "Organization administrator",
+            email: req.organization.email,
+            organizationRole: req.organization.role,
+            organizationMemberId: req.organization.memberId,
+          });
+        }
         return res.json(toPublicOrganization(organization));
       }
 
@@ -100,7 +118,7 @@ router.get("/me", accountAuthMiddleware, async (req, res) => {
 
     if (user) {
       return res.json({
-        ...toPublicUser(user),
+        ...await toPublicUserWithOrganizationPlan(user),
         isEmailVerified: user.isEmailVerified,
       });
     }

@@ -169,7 +169,7 @@ export const getPlan = async (req: Request, res: Response) => {
 
     let { data: user, error: userError } = await supabase
       .from("users")
-      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
+      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, orgCode")
       .eq("id", userId)
       .maybeSingle();
     if (userError) {
@@ -213,7 +213,7 @@ export const getPlan = async (req: Request, res: Response) => {
               // Refresh user status
               const { data: updatedUser } = await supabase
                 .from("users")
-                .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
+                .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, orgCode")
                 .eq("id", userId)
                 .maybeSingle();
 
@@ -232,8 +232,35 @@ export const getPlan = async (req: Request, res: Response) => {
     }
 
     const trial = isTrialActive((user as any)?.trial_expires_at, (user as any)?.trial_status, (user as any)?.trial_started_at);
-    const effectivePlan = active ? ((user as any).plan as string) : (trial.active ? "pro" : "free");
-    const unlimited = active && !expiry;
+    let effectivePlan = active ? ((user as any).plan as string) : (trial.active ? "pro" : "free");
+    let effectiveExpiry = active ? expiry : null;
+    let organizationSeat = false;
+    let organizationTrial: { active: boolean; daysRemaining: number } | null = null;
+    let organizationTrialActive = false;
+    if (effectivePlan === "free" && /^\d{1,18}$/.test(String((user as any)?.orgCode ?? ""))) {
+      const { data: organization, error: organizationError } = await supabase
+        .from("Organizations")
+        .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
+        .eq("org_code", Number((user as any).orgCode))
+        .maybeSingle();
+      if (organizationError) {
+        console.error("Organization plan lookup failed:", organizationError.message);
+        return res.status(503).json({ error: "Plan status is temporarily unavailable." });
+      }
+      const organizationExpiry = organization?.validity ? new Date(organization.validity) : null;
+      const orgPaid = ["enterprise", "pro", "prep", "founder"].includes(organization?.plan ?? "")
+        && (!organizationExpiry || organizationExpiry.getTime() > Date.now());
+      organizationTrial = isTrialActive(organization?.trial_expires_at, organization?.trial_status, organization?.trial_started_at);
+      if (orgPaid || organizationTrial.active) {
+        effectivePlan = "enterprise";
+        effectiveExpiry = orgPaid
+          ? organizationExpiry
+          : organization?.trial_expires_at ? new Date(organization.trial_expires_at) : null;
+        organizationSeat = true;
+        organizationTrialActive = !orgPaid && organizationTrial.active;
+      }
+    }
+    const unlimited = (active && !expiry) || organizationSeat;
 
     // A plan switch or an earlier failed cancel can leave a retired renewal
     // still live at Flutterwave; every plan read is a chance to finish it.
@@ -250,10 +277,17 @@ export const getPlan = async (req: Request, res: Response) => {
 
     res.json({
       plan: effectivePlan,
-      expiresAt: active && expiry ? expiry.toISOString() : null,
-      isTrial: trial.active,
-      trialDaysRemaining: trial.daysRemaining,
-      trialExpiresAt: (user as any)?.trial_expires_at ? new Date((user as any).trial_expires_at).toISOString() : null,
+      expiresAt: effectiveExpiry?.toISOString() ?? null,
+      organizationSeat,
+      isTrial: trial.active || organizationTrialActive,
+      trialDaysRemaining: trial.active
+        ? trial.daysRemaining
+        : organizationTrialActive ? organizationTrial?.daysRemaining ?? 0 : 0,
+      trialExpiresAt: trial.active && (user as any)?.trial_expires_at
+        ? new Date((user as any).trial_expires_at).toISOString()
+        : organizationTrialActive
+          ? effectiveExpiry?.toISOString() ?? null
+          : null,
       billingEnabled: hasBillingConfig(),
       subscription,
       ...(await pricingPayload(req.query?.currency)),

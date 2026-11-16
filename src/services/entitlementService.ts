@@ -236,7 +236,7 @@ export async function getEntitlements(userId: number): Promise<Entitlement> {
   try {
     const { data, error } = await supabase
       .from("users")
-      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status")
+      .select("plan, plan_expires_at, trial_started_at, trial_expires_at, trial_status, orgCode")
       .eq("id", userId)
       .maybeSingle();
 
@@ -248,12 +248,34 @@ export async function getEntitlements(userId: number): Promise<Entitlement> {
       return FREE;
     }
 
-    return entitlementsForPlan(
+    const personal = entitlementsForPlan(
       (data as any)?.plan,
       (data as any)?.plan_expires_at,
       (data as any)?.trial_expires_at,
       (data as any)?.trial_status,
       (data as any)?.trial_started_at,
+    );
+    // A founder's own active purchase or trial is always retained. An active
+    // organization seat supplies Enterprise capabilities only when personal
+    // access has expired or is Free; it never overwrites the founder's plan.
+    if (personal.plan !== "free") return personal;
+    const orgCode = typeof (data as any)?.orgCode === "string" ? (data as any).orgCode : "";
+    if (!/^\d{1,18}$/.test(orgCode)) return personal;
+    const { data: organization, error: organizationError } = await supabase
+      .from("Organizations")
+      .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
+      .eq("org_code", Number(orgCode))
+      .maybeSingle();
+    if (organizationError || !organization) {
+      if (organizationError) console.warn(`Organization entitlement lookup failed for user ${userId}:`, organizationError.message);
+      return personal;
+    }
+    return entitlementsForPlan(
+      organization.plan,
+      organization.validity,
+      organization.trial_expires_at,
+      organization.trial_status,
+      organization.trial_started_at,
     );
   } catch (err: any) {
     console.warn(`⚠️ getEntitlements(${userId}) threw, failing CLOSED to free:`, err?.message || err);

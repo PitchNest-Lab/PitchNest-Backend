@@ -37,22 +37,41 @@ const BCRYPT_HASH_PATTERN = /^\$2[aby]\$\d{2}\$.{53}$/;
 const DUMMY_PASSWORD_HASH = "$2b$12$kFlQPn/NVygvSVn3YgGLfOEaKPwEO0Ls5BRjKBpQIZqO7aCSazdia";
 const PASSWORD_MIN_LENGTH = 10;
 const PASSWORD_MAX_LENGTH = 72;
-const REFERRAL_CODE_PATTERN = /^\d{1,18}$/;
+const ORG_INVITE_TOKEN_PATTERN = /^[a-f0-9]{64}$/i;
 const googleClient = new OAuth2Client(config.googleClientId);
 
 async function enrollInOrganization(
   userId: number,
-  referralCode?: string | null,
+  tokenHash?: string | null,
 ): Promise<string | null> {
-  const { data, error } = await supabase.rpc("enroll_user_in_organization", {
+  if (!tokenHash) return null;
+  const { data, error } = await supabase.rpc("accept_organization_invite", {
     p_user_id: userId,
-    p_org_code: referralCode || null,
+    p_token_hash: tokenHash,
   });
   if (error) {
     console.error("Organization enrollment failed:", error.message);
     return null;
   }
   return typeof data === "string" && data ? data : null;
+}
+
+async function validateOrganizationInvite(token: unknown, email: string): Promise<string | null> {
+  if (typeof token !== "string" || !ORG_INVITE_TOKEN_PATTERN.test(token)) return null;
+  const tokenHash = hashAuthToken("organization-invite", token);
+  const { data, error } = await supabase.from("pitchnest_org_cohort_invites")
+    .select("id")
+    .eq("token_hash", tokenHash)
+    .eq("email", email)
+    .is("accepted_at", null)
+    .is("revoked_at", null)
+    .gt("expires_at", new Date().toISOString())
+    .maybeSingle();
+  if (error) {
+    console.error("Organization invitation validation failed:", error.message);
+    throw new Error("Organization invitation could not be checked.");
+  }
+  return data ? tokenHash : null;
 }
 
 async function verifyGoogleCredential(credential: unknown): Promise<any | null> {
@@ -99,6 +118,7 @@ const ALLOWED_SECTORS = [
 
 import {
   isTrialActive,
+  entitlementsForPlan,
   newAccountTrialFields,
 } from "../services/entitlementService.ts";
 import { isSupportedSttLocale } from "../utils/transcriptionLocales.ts";
@@ -147,6 +167,41 @@ export function toPublicUser(u: any) {
     // browser's localStorage survived. Always the owner's own bag: sanitizeSettings
     // is the sole writer, so the shape is bounded and nothing raw lands here.
     settings: u?.settings && typeof u.settings === "object" ? u.settings : {},
+  };
+}
+
+/** Public plan state includes an active organization seat without changing the
+ * founder's stored personal plan. The entitlement service remains authoritative
+ * for every server-side capability check. */
+export async function toPublicUserWithOrganizationPlan(u: any) {
+  const publicUser = toPublicUser(u);
+  if (publicUser.plan !== "free" || typeof u?.orgCode !== "string" || !/^\d{1,18}$/.test(u.orgCode)) {
+    return publicUser;
+  }
+  const { data: organization, error } = await supabase.from("Organizations")
+    .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
+    .eq("org_code", Number(u.orgCode))
+    .maybeSingle();
+  if (error) throw error;
+  if (!organization) return publicUser;
+  const entitlement = entitlementsForPlan(
+    organization.plan,
+    organization.validity,
+    organization.trial_expires_at,
+    organization.trial_status,
+    organization.trial_started_at,
+  );
+  if (entitlement.plan === "free") return publicUser;
+  return {
+    ...publicUser,
+    plan: "enterprise" as const,
+    planExpiresAt: organization.validity ? new Date(organization.validity).toISOString() : null,
+    isTrial: entitlement.isTrial,
+    trialDaysRemaining: entitlement.isTrial ? entitlement.trialDaysRemaining ?? 0 : 0,
+    trialExpiresAt: entitlement.isTrial && organization.trial_expires_at
+      ? new Date(organization.trial_expires_at).toISOString()
+      : null,
+    organizationSeat: true,
   };
 }
 
@@ -264,6 +319,7 @@ function signToken(
     accountType?: "user" | "organization";
     orgCode?: string;
     authVersion?: number;
+    organizationMemberId?: number;
   },
   rememberMe = false,
 ): string {
@@ -275,6 +331,7 @@ function signToken(
       accountType: user.accountType ?? "user",
       authVersion: user.authVersion ?? 0,
       ...(user.orgCode ? { orgCode: user.orgCode } : {}),
+      ...(user.organizationMemberId ? { organizationMemberId: user.organizationMemberId } : {}),
     },
     config.jwtSecret,
     {
@@ -300,6 +357,7 @@ export const refreshToken = (req: Request, res: Response) => {
         accountType: user.accountType,
         orgCode: user.orgCode,
         authVersion: user.authVersion,
+        organizationMemberId: user.organizationMemberId,
       },
       user.rememberMe === true,
     ),
@@ -311,9 +369,14 @@ export const logout = async (req: Request, res: Response) => {
   try {
     const userId = req.user!.id;
     const isOrganization = req.user!.accountType === "organization";
+    const organizationMemberId = req.user!.organizationMemberId;
     const { error } = await supabase.rpc(
-      isOrganization ? "revoke_organization_sessions" : "revoke_user_sessions",
-      isOrganization ? { p_org_id: userId } : { p_user_id: userId },
+      isOrganization
+        ? organizationMemberId ? "revoke_organization_member_sessions" : "revoke_organization_sessions"
+        : "revoke_user_sessions",
+      isOrganization
+        ? organizationMemberId ? { p_member_id: organizationMemberId } : { p_org_id: userId }
+        : { p_user_id: userId },
     );
     if (error) throw error;
     if (!isOrganization) revokeUserSockets(userId, "Logged out");
@@ -330,7 +393,7 @@ export const signup = async (req: Request, res: Response) => {
       requiresVerification: true,
       message: "If this address can be registered, check your email for the verification link.",
     };
-    const { name, email, password, role, referralCode } = req.body;
+    const { name, email, password, role, organizationInviteToken } = req.body;
     if (
       typeof name !== "string" ||
       typeof email !== "string" ||
@@ -371,10 +434,10 @@ export const signup = async (req: Request, res: Response) => {
     }
 
     const cleanEmail = email.toLowerCase().trim();
-    const cleanReferralCode =
-      typeof referralCode === "string" ? referralCode.trim() : "";
-    if (cleanReferralCode && !REFERRAL_CODE_PATTERN.test(cleanReferralCode)) {
-      return res.status(400).json({ error: "That organization invitation is invalid." });
+    let pendingOrgInviteHash: string | null = null;
+    if (organizationInviteToken !== undefined && organizationInviteToken !== null && organizationInviteToken !== "") {
+      pendingOrgInviteHash = await validateOrganizationInvite(organizationInviteToken, cleanEmail);
+      if (!pendingOrgInviteHash) return res.status(400).json({ error: "This invitation is invalid, expired, or addressed to another email." });
     }
 
     // Every outcome from here replies with genericSignup after at least the
@@ -392,6 +455,15 @@ export const signup = async (req: Request, res: Response) => {
     }
 
     if (existingUser) {
+      if (pendingOrgInviteHash) {
+        const { error: pendingInviteError } = await supabase.from("users")
+          .update({ pending_org_invite_hash: pendingOrgInviteHash })
+          .eq("id", existingUser.id);
+        if (pendingInviteError) {
+          console.error("Could not attach organization invitation to existing account:", pendingInviteError.message);
+          return res.status(503).json({ error: "Signup is temporarily unavailable." });
+        }
+      }
       // Send a fresh code so a genuinely stuck owner can still verify. A
       // verified account gets no email, only the same reply. Best-effort.
       if (!existingUser.isEmailVerified) {
@@ -416,7 +488,7 @@ export const signup = async (req: Request, res: Response) => {
       auth_provider: "form",
       ...newAccountTrialFields(),
       enrolled_at: null,
-      ...(cleanReferralCode ? { pending_org_code: cleanReferralCode } : {}),
+      ...(pendingOrgInviteHash ? { pending_org_invite_hash: pendingOrgInviteHash } : {}),
     };
 
     const { data: newUser, error } = await supabase
@@ -549,13 +621,21 @@ export const login = async (req: Request, res: Response) => {
       }
     }
 
+    if (user.pending_org_invite_hash) {
+      const enrolledCode = await enrollInOrganization(user.id, user.pending_org_invite_hash);
+      if (enrolledCode) {
+        user.orgCode = enrolledCode;
+        user.pending_org_invite_hash = null;
+      }
+    }
+
     const token = signToken(
       { id: user.id, email: user.email, authVersion: user.auth_version ?? 0 },
       rememberMe === true,
     );
 
     res.status(200).json({
-      user: toPublicUser(user),
+      user: await toPublicUserWithOrganizationPlan(user),
       token,
     });
   } catch (error) {
@@ -581,33 +661,33 @@ export const orgLogin = async (req: Request, res: Response) => {
     }
     const cleanEmail = email.toLowerCase().trim();
 
-    const { data: user, error } = await supabase
-      .from("Organizations")
+    const { data: member, error } = await supabase
+      .from("pitchnest_org_staff_accounts")
       .select("*")
       .eq("email", cleanEmail)
       .maybeSingle();
-    if (error || !user) {
+    if (error) {
+      console.error("Organization member lookup failed:", error.message);
+      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
+      return res.status(503).json({ error: "Organization sign-in is temporarily unavailable." });
+    }
+    if (!member || member.status !== "active") {
       await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    if (user.locked_until && new Date(user.locked_until) > new Date()) {
+    if (member.locked_until && new Date(member.locked_until) > new Date()) {
       return res.status(429).json({ error: "Too many failed attempts. Try again later." });
     }
 
-    if (
-      typeof user.password !== "string" ||
-      !BCRYPT_HASH_PATTERN.test(user.password)
-    ) {
-      await bcrypt.compare(password, DUMMY_PASSWORD_HASH);
-      return res.status(401).json({ error: "Invalid credentials." });
-    }
-
-    const isValidPassword = await bcrypt.compare(password, user.password);
+    const hasValidHash = typeof member.password_hash === "string" && BCRYPT_HASH_PATTERN.test(member.password_hash);
+    const isValidPassword = hasValidHash
+      ? await bcrypt.compare(password, member.password_hash)
+      : await bcrypt.compare(password, DUMMY_PASSWORD_HASH).then(() => false);
     if (!isValidPassword) {
       const { data: failedState, error: failedError } = await supabase.rpc(
-        "record_failed_org_login",
-        { p_org_id: user.id },
+        "record_failed_organization_member_login",
+        { p_member_id: member.id },
       );
       if (failedError) {
         console.error("Organization lockout update failed:", failedError.message);
@@ -620,40 +700,231 @@ export const orgLogin = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Invalid credentials." });
     }
 
-    if (user.failed_login_attempts > 0 || user.locked_until) {
-      const { error: resetErr } = await supabase
-        .from("Organizations")
-        .update({ failed_login_attempts: 0, locked_until: null })
-        .eq("id", user.id);
-      if (resetErr) {
-        console.error("Organization lockout reset failed:", resetErr.message);
-        return res.status(503).json({ error: "Login is temporarily unavailable." });
-      }
+    const { error: resetErr } = await supabase
+      .from("pitchnest_org_staff_accounts")
+      .update({ failed_login_attempts: 0, locked_until: null, last_login_at: new Date().toISOString() })
+      .eq("id", member.id);
+    if (resetErr) {
+      console.error("Organization member login state could not be updated:", resetErr.message);
+      return res.status(503).json({ error: "Login is temporarily unavailable." });
     }
 
-    if (user.org_code == null) {
-      console.error(`Organization ${user.id} has no org_code and cannot sign in.`);
-      return res.status(503).json({ error: "Organization account is not configured." });
+    const { data: organization, error: organizationError } = await supabase
+      .from("Organizations")
+      .select("id, org_code, org_name, plan, validity, trial_started_at, trial_expires_at, trial_status")
+      .eq("id", member.organization_id)
+      .maybeSingle();
+    if (organizationError || !organization || organization.org_code == null) {
+      console.error("Organization member's organization could not be loaded:", organizationError?.message);
+      return res.status(503).json({ error: "Organization account is temporarily unavailable." });
     }
 
     const token = signToken(
       {
-        id: user.id,
-        email: user.email,
+        id: organization.id,
+        email: member.email,
         accountType: "organization",
-        orgCode: String(user.org_code),
-        authVersion: user.auth_version ?? 0,
+        orgCode: String(organization.org_code),
+        authVersion: member.auth_version ?? 0,
+        organizationMemberId: member.id,
       },
       rememberMe === true,
     );
 
     res.status(200).json({
-      user: toPublicOrganization(user),
+      user: {
+        ...toPublicOrganization(organization),
+        id: organization.id,
+        name: member.name,
+        email: member.email,
+        organizationRole: member.role,
+        organizationMemberId: member.id,
+      },
       token,
     });
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
+  }
+};
+
+const ORG_RESET_GENERIC = "If an organization administrator account exists for that email, a reset link has been sent.";
+
+export const forgotOrganizationPassword = async (req: Request, res: Response) => {
+  const replyFloor = startResponseFloor();
+  try {
+    const { email } = req.body;
+    if (typeof email !== "string" || !email.trim() || email.length > 254) {
+      return res.status(400).json({ error: "A valid email is required." });
+    }
+    const cleanEmail = email.toLowerCase().trim();
+    const { data: member, error } = await supabase
+      .from("pitchnest_org_staff_accounts")
+      .select("id, email, name")
+      .eq("email", cleanEmail)
+      .eq("status", "active")
+      .maybeSingle();
+    if (error) throw error;
+    if (member) await sendOrganizationPasswordReset(member);
+  } catch (error) {
+    console.error("Organization forgot-password error:", error);
+  }
+  await replyFloor();
+  return res.status(200).json({ message: ORG_RESET_GENERIC });
+};
+
+async function sendOrganizationPasswordReset(member: { id: number; email: string; name: string }): Promise<void> {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashAuthToken("organization-password-reset", rawToken);
+  const { error: clearError } = await supabase
+    .from("pitchnest_org_password_resets")
+    .delete()
+    .eq("member_id", member.id);
+  if (clearError) throw clearError;
+  const { error: insertError } = await supabase.from("pitchnest_org_password_resets").insert({
+    member_id: member.id,
+    token_hash: tokenHash,
+    expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+  });
+  if (insertError) throw insertError;
+  if (!resend) {
+    await supabase.from("pitchnest_org_password_resets").delete().eq("token_hash", tokenHash);
+    console.error("Organization reset email unavailable: RESEND_API_KEY is not configured.");
+    return;
+  }
+  const safeName = member.name.replace(/[&<>\"']/g, "").slice(0, 120);
+  const resetLink = `${config.clientUrl}/organization-reset-password?token=${rawToken}`;
+  try {
+    const { error } = await withTimeout(resend.emails.send({
+      from: config.emailFrom,
+      replyTo: config.emailReplyTo,
+      to: member.email,
+      subject: "Reset your PitchNest organization password",
+      html: `<div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px"><h2>Reset your organization password</h2><p>Hello ${safeName},</p><p>Use the link below to set a new password for your organization account.</p><a href="${resetLink}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:#3b82f6;color:#fff;border-radius:12px;text-decoration:none;font-weight:700">Reset password</a><p style="font-size:12px;color:#6b7280">This link expires in one hour. Ignore this email if you did not request it.</p></div>`,
+    }, { idempotencyKey: `organization-password-reset/${member.id}/${tokenHash.slice(0, 32)}` }), 15_000, "Organization password reset email request");
+    if (!error) return;
+    console.error("Organization reset email send failed:", error.message);
+  } catch (mailError: any) {
+    console.error("Organization reset email send failed:", mailError?.message || mailError);
+  }
+  await supabase.from("pitchnest_org_password_resets").delete().eq("token_hash", tokenHash);
+}
+
+export const resetOrganizationPassword = async (req: Request, res: Response) => {
+  try {
+    const { token, password } = req.body;
+    if (!isLongAuthToken(token) || typeof password !== "string") {
+      return res.status(400).json({ error: "Token and new password are required." });
+    }
+    if (password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH || Buffer.byteLength(password, "utf8") > 72) {
+      return res.status(400).json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
+    }
+    const tokenHash = hashAuthToken("organization-password-reset", token);
+    const { data: record, error } = await supabase
+      .from("pitchnest_org_password_resets")
+      .select("id, member_id, expires_at")
+      .eq("token_hash", tokenHash)
+      .maybeSingle();
+    if (error) throw error;
+    if (!record || new Date(record.expires_at) <= new Date()) {
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    }
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const { data: nextAuthVersion, error: consumeError } = await supabase.rpc(
+      "consume_organization_password_reset",
+      { p_reset_id: record.id, p_member_id: record.member_id, p_password_hash: passwordHash },
+    );
+    if (consumeError) throw consumeError;
+    if (!Number.isInteger(nextAuthVersion)) {
+      return res.status(400).json({ error: "Invalid or expired reset token." });
+    }
+    return res.status(200).json({ message: "Organization password updated. You can now sign in." });
+  } catch (error) {
+    console.error("Organization password reset error:", error);
+    return res.status(500).json({ error: "Failed to reset organization password." });
+  }
+};
+
+export const getOrganizationStaffInvite = async (req: Request, res: Response) => {
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  if (!isLongAuthToken(token)) return res.status(400).json({ error: "Invalid or expired invitation." });
+  const { data: member, error } = await supabase
+    .from("pitchnest_org_staff_accounts")
+    .select("id, email, role, organization_id, invite_expires_at")
+    .eq("invite_token_hash", hashAuthToken("organization-invite", token))
+    .eq("status", "invited")
+    .maybeSingle();
+  if (error) {
+    console.error("Organization invitation lookup failed:", error.message);
+    return res.status(503).json({ error: "Invitation is temporarily unavailable." });
+  }
+  if (!member || !member.invite_expires_at || new Date(member.invite_expires_at) <= new Date()) {
+    return res.status(400).json({ error: "This invitation has expired or was already used." });
+  }
+  const { data: organization, error: orgError } = await supabase
+    .from("Organizations")
+    .select("org_name")
+    .eq("id", member.organization_id)
+    .maybeSingle();
+  if (orgError || !organization) return res.status(503).json({ error: "Invitation is temporarily unavailable." });
+  return res.json({ data: { email: member.email, role: member.role, organizationName: organization.org_name ?? "Organization" } });
+};
+
+export const acceptOrganizationStaffInvite = async (req: Request, res: Response) => {
+  try {
+    const { token, password, name } = req.body;
+    if (!isLongAuthToken(token) || typeof password !== "string" || typeof name !== "string") {
+      return res.status(400).json({ error: "Invitation, name, and password are required." });
+    }
+    if (name.trim().length < 2 || name.trim().length > 120) return res.status(400).json({ error: "Name must be 2-120 characters." });
+    if (password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH || Buffer.byteLength(password, "utf8") > 72) {
+      return res.status(400).json({ error: `Password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters.` });
+    }
+    const tokenHash = hashAuthToken("organization-invite", token);
+    const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const { data: member, error } = await supabase
+      .from("pitchnest_org_staff_accounts")
+      .update({
+        name: name.trim(),
+        password_hash: passwordHash,
+        status: "active",
+        accepted_at: new Date().toISOString(),
+        invite_token_hash: null,
+        invite_expires_at: null,
+      })
+      .eq("invite_token_hash", tokenHash)
+      .eq("status", "invited")
+      .gt("invite_expires_at", new Date().toISOString())
+      .select("id, organization_id, email, role, auth_version")
+      .maybeSingle();
+    if (error) throw error;
+    if (!member) return res.status(400).json({ error: "This invitation has expired or was already used." });
+    const { data: organization, error: orgError } = await supabase
+      .from("Organizations")
+      .select("id, org_code, org_name, plan, validity, trial_started_at, trial_expires_at, trial_status")
+      .eq("id", member.organization_id)
+      .maybeSingle();
+    if (orgError || !organization || organization.org_code == null) throw orgError || new Error("Organization is unavailable");
+    const publicUser = {
+      ...toPublicOrganization(organization),
+      id: organization.id,
+      name: name.trim(),
+      email: member.email,
+      organizationRole: member.role,
+      organizationMemberId: member.id,
+    };
+    const accessToken = signToken({
+      id: organization.id,
+      email: member.email,
+      accountType: "organization",
+      orgCode: String(organization.org_code),
+      authVersion: member.auth_version,
+      organizationMemberId: member.id,
+    });
+    return res.status(200).json({ user: publicUser, token: accessToken });
+  } catch (error) {
+    console.error("Organization invitation acceptance failed:", error);
+    return res.status(500).json({ error: "Could not accept organization invitation." });
   }
 };
 
@@ -713,7 +984,7 @@ export const updateMe = async (req: Request, res: Response) => {
       return res.status(500).json({ error: "Failed to update profile." });
     }
 
-    res.status(200).json({ user: toPublicUser(updated) });
+    res.status(200).json({ user: await toPublicUserWithOrganizationPlan(updated) });
   } catch (error) {
     console.error("updateMe error:", error);
     res.status(500).json({ error: "Failed to update profile." });
@@ -795,13 +1066,9 @@ export const googleAuth = async (req: Request, res: Response) => {
         .json({ error: "Google sign-in is not configured on the server." });
     }
 
-    const { credential, rememberMe, referralCode } = req.body;
+    const { credential, rememberMe, organizationInviteToken } = req.body;
     if (!credential || typeof credential !== "string" || credential.length > 16_384) {
       return res.status(400).json({ error: "Missing Google credential." });
-    }
-    const cleanReferralCode = typeof referralCode === "string" ? referralCode.trim() : "";
-    if (cleanReferralCode && !REFERRAL_CODE_PATTERN.test(cleanReferralCode)) {
-      return res.status(400).json({ error: "That organization invitation is invalid." });
     }
 
     const payload = await verifyGoogleCredential(credential);
@@ -816,6 +1083,11 @@ export const googleAuth = async (req: Request, res: Response) => {
     }
 
     const email = payload.email.toLowerCase().trim();
+    let inviteHash: string | null = null;
+    if (organizationInviteToken !== undefined && organizationInviteToken !== null && organizationInviteToken !== "") {
+      inviteHash = await validateOrganizationInvite(organizationInviteToken, email);
+      if (!inviteHash) return res.status(400).json({ error: "This invitation is invalid, expired, or addressed to another email." });
+    }
     const name = String(
       payload.name || payload.given_name || email.split("@")[0] || "Founder",
     ).trim().slice(0, 120) || "Founder";
@@ -866,9 +1138,11 @@ export const googleAuth = async (req: Request, res: Response) => {
       return res.status(401).json({ error: "Google sign-in could not be completed." });
     }
 
-    if (cleanReferralCode) {
-      const enrolledCode = await enrollInOrganization(user.id, cleanReferralCode);
-      if (enrolledCode) user = { ...user, orgCode: enrolledCode, enrolled_at: new Date().toISOString() };
+    const invitationToAccept = inviteHash || user.pending_org_invite_hash || null;
+    if (invitationToAccept) {
+      const enrolledCode = await enrollInOrganization(user.id, invitationToAccept);
+      if (enrolledCode) user = { ...user, orgCode: enrolledCode, enrolled_at: new Date().toISOString(), pending_org_invite_hash: null };
+      else if (inviteHash) return res.status(400).json({ error: "This invitation is no longer available." });
     }
 
     const token = signToken(
@@ -876,7 +1150,7 @@ export const googleAuth = async (req: Request, res: Response) => {
       rememberMe === true,
     );
     res.status(200).json({
-      user: toPublicUser(user),
+      user: await toPublicUserWithOrganizationPlan(user),
       token,
       // New (or not-yet-onboarded) Google users go through onboarding, exactly
       // like email users do after verifying. Returning users skip to dashboard.
@@ -1046,7 +1320,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
     const { data: existingUser, error: userReadError } = await supabase
       .from("users")
       .select(
-        "id, email, name, onboardingCompleted, role, bio, isEmailVerified, auth_version, orgCode, pending_org_code",
+        "id, email, name, onboardingCompleted, role, bio, isEmailVerified, auth_version, orgCode, pending_org_invite_hash",
       )
       .eq("id", record.user_id)
       .single();
@@ -1074,7 +1348,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
       return res.status(400).json({ message: "Invalid or expired link." });
     }
 
-    const enrolledCode = await enrollInOrganization(record.user_id);
+    const enrolledCode = await enrollInOrganization(record.user_id, existingUser.pending_org_invite_hash);
     const verifiedUser = {
       ...existingUser!,
       isEmailVerified: true,
@@ -1088,7 +1362,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
     });
 
     res.json({
-      user: toPublicUser(verifiedUser),
+      user: await toPublicUserWithOrganizationPlan(verifiedUser),
       token: JwtToken,
       message: "Email verified successfully",
       redirectTo: verifiedUser.onboardingCompleted
@@ -1133,7 +1407,7 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
 
     const { data: user, error: userError } = await supabase
       .from("users")
-      .select("id, email, name, onboardingCompleted, isEmailVerified, auth_version, orgCode, pending_org_code")
+      .select("id, email, name, onboardingCompleted, isEmailVerified, auth_version, orgCode, pending_org_invite_hash")
       .eq("email", cleanEmail)
       .maybeSingle();
 
@@ -1220,7 +1494,7 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
       return res.status(400).json({ message: GENERIC });
     }
 
-    const enrolledCode = await enrollInOrganization(user.id);
+    const enrolledCode = await enrollInOrganization(user.id, user.pending_org_invite_hash);
     const verifiedUser = {
       ...user,
       isEmailVerified: true,
@@ -1233,7 +1507,7 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
       authVersion: verifiedUser.auth_version ?? 0,
     });
     return res.json({
-      user: toPublicUser(verifiedUser),
+      user: await toPublicUserWithOrganizationPlan(verifiedUser),
       token,
       message: "Email verified successfully",
       redirectTo: verifiedUser.onboardingCompleted ? "/dashboard" : "/onboarding",
