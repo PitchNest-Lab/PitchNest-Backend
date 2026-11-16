@@ -160,7 +160,7 @@ export const getPrice = async (req: Request, res: Response) => {
  * GET /api/billing/plan?currency=NGN — user plan status and pricing in the
  * requested currency.
  */
-import { isTrialActive } from "../services/entitlementService.ts";
+import { getOrganizationSeatEntitlement, isTrialActive } from "../services/entitlementService.ts";
 
 export const getPlan = async (req: Request, res: Response) => {
   try {
@@ -237,27 +237,21 @@ export const getPlan = async (req: Request, res: Response) => {
     let organizationSeat = false;
     let organizationTrial: { active: boolean; daysRemaining: number } | null = null;
     let organizationTrialActive = false;
-    if (effectivePlan === "free" && /^\d{1,18}$/.test(String((user as any)?.orgCode ?? ""))) {
-      const { data: organization, error: organizationError } = await supabase
-        .from("Organizations")
-        .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
-        .eq("org_code", Number((user as any).orgCode))
-        .maybeSingle();
-      if (organizationError) {
-        console.error("Organization plan lookup failed:", organizationError.message);
+    if (effectivePlan === "free") {
+      try {
+        const seat = await getOrganizationSeatEntitlement(userId);
+        if (seat) {
+          organizationTrial = { active: seat.entitlement.isTrial, daysRemaining: seat.entitlement.trialDaysRemaining ?? 0 };
+          effectivePlan = "enterprise";
+          effectiveExpiry = seat.organization.validity
+            ? new Date(seat.organization.validity)
+            : seat.organization.trial_expires_at ? new Date(seat.organization.trial_expires_at) : null;
+          organizationSeat = true;
+          organizationTrialActive = seat.entitlement.isTrial;
+        }
+      } catch (organizationError: any) {
+        console.error("Organization plan lookup failed:", organizationError?.message || organizationError);
         return res.status(503).json({ error: "Plan status is temporarily unavailable." });
-      }
-      const organizationExpiry = organization?.validity ? new Date(organization.validity) : null;
-      const orgPaid = ["enterprise", "pro", "prep", "founder"].includes(organization?.plan ?? "")
-        && (!organizationExpiry || organizationExpiry.getTime() > Date.now());
-      organizationTrial = isTrialActive(organization?.trial_expires_at, organization?.trial_status, organization?.trial_started_at);
-      if (orgPaid || organizationTrial.active) {
-        effectivePlan = "enterprise";
-        effectiveExpiry = orgPaid
-          ? organizationExpiry
-          : organization?.trial_expires_at ? new Date(organization.trial_expires_at) : null;
-        organizationSeat = true;
-        organizationTrialActive = !orgPaid && organizationTrial.active;
       }
     }
     const unlimited = (active && !expiry) || organizationSeat;

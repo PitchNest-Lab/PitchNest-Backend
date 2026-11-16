@@ -836,6 +836,8 @@ export function initRestSocket(wss: WebSocketServer) {
     let currentBusinessName = "Unknown Pitch";
     let currentUserId: number | null = authenticatedUserId;
     let currentOrganizationCode: string | null = null;
+    let currentOrganizationReplayShared = false;
+    let currentProgramSelectionExplicit = false;
     let hasSentSetup = false;
     const clientReadyTimer = setTimeout(() => {
       if (!hasSentSetup && ws.readyState === WebSocket.OPEN) {
@@ -2106,6 +2108,62 @@ export function initRestSocket(wss: WebSocketServer) {
               ? (dbUser as any).orgCode.trim().slice(0, 18) || null
               : null;
 
+            // New clients explicitly select the program whose data should
+            // receive this session. A null selection means personal practice;
+            // older clients keep their historical primary-org default.
+            if (Object.prototype.hasOwnProperty.call(clientConfig, "programOrganizationId")) {
+              currentProgramSelectionExplicit = true;
+              currentOrganizationCode = null;
+              currentOrganizationReplayShared = false;
+              const selectedOrganizationId = clientConfig.programOrganizationId;
+              if (selectedOrganizationId !== null && selectedOrganizationId !== "") {
+                const organizationId = Number(selectedOrganizationId);
+                if (!Number.isSafeInteger(organizationId) || organizationId <= 0) {
+                  sendJson(ws, { type: "error", message: "Choose a valid organization program.", code: "INVALID_PROGRAM" });
+                  ws.close(4001, "Invalid organization program");
+                  return;
+                }
+                const { data: membership, error: membershipError } = await supabase
+                  .from("pitchnest_org_founder_memberships")
+                  .select("organization_id")
+                  .eq("user_id", currentUserId)
+                  .eq("organization_id", organizationId)
+                  .eq("status", "active")
+                  .maybeSingle();
+                if (membershipError || !membership) {
+                  sendJson(ws, { type: "error", message: "You are no longer an active member of that program.", code: "PROGRAM_MEMBERSHIP_REQUIRED" });
+                  ws.close(4001, "Program membership required");
+                  return;
+                }
+                const { data: organization, error: organizationError } = await supabase
+                  .from("Organizations")
+                  .select("org_code, validity, plan, trial_started_at, trial_expires_at, trial_status")
+                  .eq("id", organizationId)
+                  .maybeSingle();
+                if (organizationError || !organization?.org_code
+                  || (organization.validity && new Date(organization.validity).getTime() <= Date.now())) {
+                  sendJson(ws, { type: "error", message: "That organization program is no longer active.", code: "PROGRAM_UNAVAILABLE" });
+                  ws.close(4001, "Program unavailable");
+                  return;
+                }
+                currentOrganizationCode = String(organization.org_code).slice(0, 18);
+                currentOrganizationReplayShared = clientConfig.shareProgramReplay === true;
+                // A valid program seat grants that organization's plan for
+                // this session only. Personal practice uses the founder's own
+                // plan and never inherits another organization's seat.
+                if (entitlement.plan === "free") {
+                  const organizationEntitlement = entitlementsForPlan(
+                    organization.plan,
+                    organization.validity,
+                    organization.trial_expires_at,
+                    organization.trial_status,
+                    organization.trial_started_at,
+                  );
+                  if (organizationEntitlement.plan !== "free") entitlement = organizationEntitlement;
+                }
+              }
+            }
+
             // Recognition language, from this same row. resolveSttLocale is the
             // read-side half of the allowlist (sanitizeSettings is the write-side
             // half): a value that is missing, hand-edited in the DB, or written by
@@ -3194,6 +3252,9 @@ export function initRestSocket(wss: WebSocketServer) {
             if (currentOrganizationCode) {
               insertPayload.org_id = currentOrganizationCode;
               insertPayload.visibility = "organization";
+              if (currentProgramSelectionExplicit) {
+                insertPayload.organization_replay_shared = currentOrganizationReplayShared;
+              }
             }
             // Only set when a verified practice draft linked this session, so
             // ordinary sessions never depend on migration 0019's column.

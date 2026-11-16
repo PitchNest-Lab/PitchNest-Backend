@@ -259,28 +259,66 @@ export async function getEntitlements(userId: number): Promise<Entitlement> {
     // organization seat supplies Enterprise capabilities only when personal
     // access has expired or is Free; it never overwrites the founder's plan.
     if (personal.plan !== "free") return personal;
-    const orgCode = typeof (data as any)?.orgCode === "string" ? (data as any).orgCode : "";
-    if (!/^\d{1,18}$/.test(orgCode)) return personal;
-    const { data: organization, error: organizationError } = await supabase
-      .from("Organizations")
-      .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
-      .eq("org_code", Number(orgCode))
-      .maybeSingle();
-    if (organizationError || !organization) {
-      if (organizationError) console.warn(`Organization entitlement lookup failed for user ${userId}:`, organizationError.message);
-      return personal;
-    }
-    return entitlementsForPlan(
+    const organizationSeat = await getOrganizationSeatEntitlement(userId);
+    return organizationSeat?.entitlement ?? personal;
+  } catch (err: any) {
+    console.warn(`⚠️ getEntitlements(${userId}) threw, failing CLOSED to free:`, err?.message || err);
+    return FREE;
+  }
+}
+
+export async function getOrganizationSeatEntitlement(userId: number): Promise<{
+  entitlement: Entitlement;
+  organization: any;
+} | null> {
+  if (!userId) return null;
+  const { data: memberships, error: membershipError } = await supabase
+    .from("pitchnest_org_founder_memberships")
+    .select("organization_id, joined_at")
+    .eq("user_id", userId)
+    .eq("status", "active")
+    .order("joined_at", { ascending: true });
+  if (membershipError) {
+    const missingMembershipTable = membershipError.code === "42P01" || membershipError.code === "PGRST205"
+      || (String(membershipError.message || "").includes("pitchnest_org_founder_memberships")
+        && /not find|does not exist|schema cache/i.test(membershipError.message));
+    if (!missingMembershipTable) throw membershipError;
+    const { data: user, error: userError } = await supabase.from("users").select("orgCode").eq("id", userId).maybeSingle();
+    if (userError) throw userError;
+    const orgCode = typeof user?.orgCode === "string" ? user.orgCode : "";
+    if (!/^\d{1,18}$/.test(orgCode)) return null;
+    const { data: organization, error: organizationError } = await supabase.from("Organizations")
+      .select("id, plan, validity, trial_started_at, trial_expires_at, trial_status")
+      .eq("org_code", Number(orgCode)).maybeSingle();
+    if (organizationError) throw organizationError;
+    if (!organization) return null;
+    return {
+      organization,
+      entitlement: entitlementsForPlan(organization.plan, organization.validity, organization.trial_expires_at, organization.trial_status, organization.trial_started_at),
+    };
+  }
+  const ids = [...new Set((memberships ?? []).map((item) => item.organization_id))];
+  if (!ids.length) return null;
+  const { data: organizations, error: organizationError } = await supabase
+    .from("Organizations")
+    .select("id, plan, validity, trial_started_at, trial_expires_at, trial_status")
+    .in("id", ids);
+  if (organizationError) throw organizationError;
+  const rank: Record<Plan, number> = { free: 0, prep: 1, pro: 2, founder: 3, enterprise: 4 };
+  let best: { entitlement: Entitlement; organization: any } | null = null;
+  for (const organization of organizations ?? []) {
+    const entitlement = entitlementsForPlan(
       organization.plan,
       organization.validity,
       organization.trial_expires_at,
       organization.trial_status,
       organization.trial_started_at,
     );
-  } catch (err: any) {
-    console.warn(`⚠️ getEntitlements(${userId}) threw, failing CLOSED to free:`, err?.message || err);
-    return FREE;
+    if (entitlement.plan !== "free" && (!best || rank[entitlement.plan] > rank[best.entitlement.plan])) {
+      best = { entitlement, organization };
+    }
   }
+  return best;
 }
 
 export interface CapacityResult {

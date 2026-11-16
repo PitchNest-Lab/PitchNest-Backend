@@ -3,6 +3,7 @@ import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import {
   signup,
   login,
+  acceptFounderOrganizationInvite,
   orgLogin,
   orgGoogleLogin,
   forgotOrganizationPassword,
@@ -61,6 +62,7 @@ const sessionMaintenanceLimiter = rateLimit({
 
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
+router.post("/organization-invite/accept-founder", authMiddleware, authLimiter, acceptFounderOrganizationInvite);
 router.post("/organization-login", authLimiter, orgLogin);
 router.post("/organization-google", authLimiter, orgGoogleLogin);
 router.post("/organization-forgot-password", authLimiter, forgotOrganizationPassword);

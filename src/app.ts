@@ -31,6 +31,7 @@ import communityRoutes from "./routes/communityRoutes.ts";
 import challengeRoutes from "./routes/challengeRoutes.ts";
 import { handleWaitlist, handleSurvey } from "./controllers/waitlistController.ts";
 import router from "./routes/organization/organizationRoutes.ts";
+import founderProgramRoutes from "./routes/founderProgramRoutes.ts";
 
 const app = express();
 
@@ -128,6 +129,7 @@ app.use("/api/files", fileRoutes);
 // API Routers
 app.use("/api/auth", authRoutes);
 app.use("/api/organization", router);
+app.use("/api/founder/programs", founderProgramRoutes);
 app.use("/api/businesses", businessRoutes);
 app.use("/api/discover", discoverRoutes);
 app.use("/api/staff", staffRoutes);

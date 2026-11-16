@@ -201,8 +201,23 @@ export const createOrganizationInvite = async (req: Request, res: Response) => {
       .eq("email", email)
       .maybeSingle();
     if (userError) throw userError;
-    if (existingUser?.orgCode && existingUser.orgCode !== String(organization.org_code)) {
-      return res.status(409).json({ error: "This founder already belongs to another organization." });
+    if (existingUser) {
+      const { data: existingMembership, error: membershipError } = await supabase.from("pitchnest_org_founder_memberships")
+        .select("id")
+        .eq("organization_id", orgId)
+        .eq("user_id", existingUser.id)
+        .eq("status", "active")
+        .maybeSingle();
+      if (membershipError) {
+        const missingMembershipTable = membershipError.code === "42P01" || membershipError.code === "PGRST205"
+          || (String(membershipError.message || "").includes("pitchnest_org_founder_memberships")
+            && /not find|does not exist|schema cache/i.test(membershipError.message));
+        if (!missingMembershipTable) throw membershipError;
+        if (existingUser.orgCode && existingUser.orgCode === String(organization.org_code)) {
+          return res.status(409).json({ error: "This founder is already in your organization." });
+        }
+      }
+      if (existingMembership) return res.status(409).json({ error: "This founder is already in your organization." });
     }
     const { data: oldInvite, error: inviteLookupError } = await supabase.from("pitchnest_org_cohort_invites")
       .select("id")

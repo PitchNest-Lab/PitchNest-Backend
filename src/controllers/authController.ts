@@ -21,6 +21,7 @@ import {
 import { withTimeout } from "../utils/withTimeout.ts";
 import { startResponseFloor } from "../utils/responseFloor.ts";
 import { revokeUserSockets } from "../sockets/restSocket.ts";
+import { getOrganizationSeatEntitlement } from "../services/entitlementService.ts";
 import {
   ACCESS_TOKEN_AUDIENCE,
   ACCESS_TOKEN_ISSUER,
@@ -38,6 +39,8 @@ const DUMMY_PASSWORD_HASH = "$2b$12$kFlQPn/NVygvSVn3YgGLfOEaKPwEO0Ls5BRjKBpQIZqO
 const PASSWORD_MIN_LENGTH = 10;
 const PASSWORD_MAX_LENGTH = 72;
 const ORG_INVITE_TOKEN_PATTERN = /^[a-f0-9]{64}$/i;
+const isMissingDatabaseRelation = (error: any, table: string) => error?.code === "42P01" || error?.code === "PGRST205"
+  || (String(error?.message || "").includes(table) && /not find|does not exist|schema cache/i.test(error.message));
 const googleClient = new OAuth2Client(config.googleClientId);
 
 async function enrollInOrganization(
@@ -56,22 +59,22 @@ async function enrollInOrganization(
   return typeof data === "string" && data ? data : null;
 }
 
-async function validateOrganizationInvite(token: unknown, email: string): Promise<string | null> {
+async function validateOrganizationInvite(token: unknown, email: string, userId?: number): Promise<string | null> {
   if (typeof token !== "string" || !ORG_INVITE_TOKEN_PATTERN.test(token)) return null;
   const tokenHash = hashAuthToken("organization-invite", token);
   const { data, error } = await supabase.from("pitchnest_org_cohort_invites")
-    .select("id")
+    .select("id, accepted_by, accepted_at, revoked_at, expires_at")
     .eq("token_hash", tokenHash)
     .eq("email", email)
-    .is("accepted_at", null)
-    .is("revoked_at", null)
-    .gt("expires_at", new Date().toISOString())
     .maybeSingle();
   if (error) {
     console.error("Organization invitation validation failed:", error.message);
     throw new Error("Organization invitation could not be checked.");
   }
-  return data ? tokenHash : null;
+  if (!data || data.revoked_at) return null;
+  if (data.accepted_at) return userId && data.accepted_by === userId ? tokenHash : null;
+  if (new Date(data.expires_at).getTime() <= Date.now()) return null;
+  return tokenHash;
 }
 
 async function verifyGoogleCredential(credential: unknown): Promise<any | null> {
@@ -175,22 +178,10 @@ export function toPublicUser(u: any) {
  * for every server-side capability check. */
 export async function toPublicUserWithOrganizationPlan(u: any) {
   const publicUser = toPublicUser(u);
-  if (publicUser.plan !== "free" || typeof u?.orgCode !== "string" || !/^\d{1,18}$/.test(u.orgCode)) {
-    return publicUser;
-  }
-  const { data: organization, error } = await supabase.from("Organizations")
-    .select("plan, validity, trial_started_at, trial_expires_at, trial_status")
-    .eq("org_code", Number(u.orgCode))
-    .maybeSingle();
-  if (error) throw error;
-  if (!organization) return publicUser;
-  const entitlement = entitlementsForPlan(
-    organization.plan,
-    organization.validity,
-    organization.trial_expires_at,
-    organization.trial_status,
-    organization.trial_started_at,
-  );
+  if (publicUser.plan !== "free" || !u?.id) return publicUser;
+  const organizationSeat = await getOrganizationSeatEntitlement(Number(u.id));
+  if (!organizationSeat) return publicUser;
+  const { organization, entitlement } = organizationSeat;
   if (entitlement.plan === "free") return publicUser;
   return {
     ...publicUser,
@@ -534,7 +525,7 @@ const MAX_FAILED_LOGINS = 5;
 
 export const login = async (req: Request, res: Response) => {
   try {
-    const { email, password, rememberMe } = req.body;
+    const { email, password, rememberMe, organizationInviteToken } = req.body;
     if (
       typeof email !== "string" ||
       typeof password !== "string" ||
@@ -621,11 +612,19 @@ export const login = async (req: Request, res: Response) => {
       }
     }
 
-    if (user.pending_org_invite_hash) {
-      const enrolledCode = await enrollInOrganization(user.id, user.pending_org_invite_hash);
+    let explicitInviteHash: string | null = null;
+    if (organizationInviteToken !== undefined && organizationInviteToken !== null && organizationInviteToken !== "") {
+      explicitInviteHash = await validateOrganizationInvite(organizationInviteToken, cleanEmail, user.id);
+      if (!explicitInviteHash) return res.status(400).json({ error: "This invitation is invalid, expired, or addressed to another email." });
+    }
+    const inviteHashToAccept = explicitInviteHash || user.pending_org_invite_hash;
+    if (inviteHashToAccept) {
+      const enrolledCode = await enrollInOrganization(user.id, inviteHashToAccept);
       if (enrolledCode) {
-        user.orgCode = enrolledCode;
+        user.orgCode = user.orgCode || enrolledCode;
         user.pending_org_invite_hash = null;
+      } else if (explicitInviteHash) {
+        return res.status(400).json({ error: "This invitation is no longer available." });
       }
     }
 
@@ -641,6 +640,22 @@ export const login = async (req: Request, res: Response) => {
   } catch (error) {
     console.error("Login error:", error);
     res.status(500).json({ error: "Login failed" });
+  }
+};
+
+export const acceptFounderOrganizationInvite = async (req: Request, res: Response) => {
+  try {
+    const user = req.user;
+    const token = req.body?.organizationInviteToken;
+    if (!user || user.accountType !== "user") return res.status(401).json({ error: "Founder sign-in is required." });
+    const tokenHash = await validateOrganizationInvite(token, user.email, user.id);
+    if (!tokenHash) return res.status(400).json({ error: "This invitation is invalid, expired, or addressed to another email." });
+    const orgCode = await enrollInOrganization(user.id, tokenHash);
+    if (!orgCode) return res.status(409).json({ error: "This invitation is no longer available." });
+    return res.json({ data: { joined: true, orgCode } });
+  } catch (error) {
+    console.error("Authenticated founder invitation acceptance failed:", error);
+    return res.status(500).json({ error: "Could not accept this organization invitation." });
   }
 };
 
@@ -1219,7 +1234,7 @@ export const googleAuth = async (req: Request, res: Response) => {
     const invitationToAccept = inviteHash || user.pending_org_invite_hash || null;
     if (invitationToAccept) {
       const enrolledCode = await enrollInOrganization(user.id, invitationToAccept);
-      if (enrolledCode) user = { ...user, orgCode: enrolledCode, enrolled_at: new Date().toISOString(), pending_org_invite_hash: null };
+      if (enrolledCode) user = { ...user, orgCode: user.orgCode || enrolledCode, pending_org_invite_hash: null };
       else if (inviteHash) return res.status(400).json({ error: "This invitation is no longer available." });
     }
 
@@ -1430,7 +1445,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
     const verifiedUser = {
       ...existingUser!,
       isEmailVerified: true,
-      ...(enrolledCode ? { orgCode: enrolledCode } : {}),
+      ...(enrolledCode ? { orgCode: existingUser!.orgCode || enrolledCode } : {}),
     };
 
     const JwtToken = signToken({
@@ -1576,7 +1591,7 @@ export const verifyEmailOtp = async (req: Request, res: Response) => {
     const verifiedUser = {
       ...user,
       isEmailVerified: true,
-      ...(enrolledCode ? { orgCode: enrolledCode } : {}),
+      ...(enrolledCode ? { orgCode: user.orgCode || enrolledCode } : {}),
     };
 
     const token = signToken({
@@ -1719,6 +1734,45 @@ async function purgeUserAccount(userId: number): Promise<void> {
   const mediaPaths = new Set<string>();
   const publicMediaPaths = new Set<string>();
   const localPaths = new Set<string>();
+  const submissionIds: string[] = [];
+  for (let offset = 0; offset < 10_000; offset += 500) {
+    const { data: founderSubmissions, error: submissionDiscoveryError } = await supabase
+      .from("pitchnest_org_submissions")
+      .select("id")
+      .eq("user_id", userId)
+      .order("id", { ascending: true })
+      .range(offset, offset + 499);
+    if (submissionDiscoveryError) {
+      if (isMissingDatabaseRelation(submissionDiscoveryError, "pitchnest_org_submissions") && offset === 0) break;
+      throw new Error("ACCOUNT_DELETE_SUBMISSION_DISCOVERY_FAILED");
+    }
+    const page = founderSubmissions ?? [];
+    submissionIds.push(...page.map((submission: any) => submission.id));
+    if (page.length < 500) break;
+    if (offset === 9_500) throw new Error("ACCOUNT_DELETE_TOO_MANY_SUBMISSIONS");
+  }
+  for (let offset = 0; offset < submissionIds.length; offset += 500) {
+    const batch = submissionIds.slice(offset, offset + 500);
+    for (let fileOffset = 0; fileOffset < 10_000; fileOffset += 500) {
+      const { data: files, error: filesError } = await supabase.from("pitchnest_org_submission_files")
+        .select("object_path")
+        .in("submission_id", batch)
+        .order("id", { ascending: true })
+        .range(fileOffset, fileOffset + 499);
+      if (filesError) {
+        if (isMissingDatabaseRelation(filesError, "pitchnest_org_submission_files") && offset === 0 && fileOffset === 0) break;
+        throw new Error("ACCOUNT_DELETE_SUBMISSION_FILE_DISCOVERY_FAILED");
+      }
+      const page = files ?? [];
+      for (const file of page) {
+        if (typeof file.object_path === "string"
+          && file.object_path.startsWith("org-submissions/")
+          && !file.object_path.includes("..")) mediaPaths.add(file.object_path);
+      }
+      if (page.length < 500) break;
+      if (fileOffset === 9_500) throw new Error("ACCOUNT_DELETE_TOO_MANY_SUBMISSION_FILES");
+    }
+  }
   for (const deck of decks || []) {
     if (typeof deck.file_url === "string" && deck.file_url.startsWith("/uploads/")) {
       const name = deck.file_url.slice("/uploads/".length);

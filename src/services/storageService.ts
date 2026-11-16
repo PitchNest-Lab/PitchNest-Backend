@@ -97,6 +97,19 @@ export const avatarUpload = makeUpload(
   "avatar",
 );
 
+/** Private organization program attachments, limited to documents and images. */
+export const organizationSubmissionUpload = makeUpload(
+  [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "image/png",
+    "image/jpeg",
+    "text/plain",
+  ],
+  10 * 1024 * 1024,
+  "submission",
+);
+
 /**
  * Business logos and covers. 6 MB is the cover limit; logos are held to 2 MB by
  * businessMediaService, which also re-checks the real bytes and re-encodes.

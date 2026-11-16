@@ -17,6 +17,17 @@ const MAX_ANALYTICS_CACHE_ENTRIES = 25;
 const DATABASE_PAGE_SIZE = 1_000;
 const analyticsCache = new Map<string, { expiresAt: number; value: Promise<any[]> }>();
 
+const missingMembershipTable = (error: any) => error?.code === "42P01" || error?.code === "PGRST205"
+  || (typeof error?.message === "string" && error.message.includes("pitchnest_org_founder_memberships")
+    && /not find|does not exist|schema cache/i.test(error.message));
+
+function organizationVisiblePitchConfig(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const config = value as Record<string, unknown>;
+  return Object.fromEntries(["industry", "fundingStage"].flatMap((key) =>
+    typeof config[key] === "string" ? [[key, config[key]]] : []));
+}
+
 async function cachedRows(key: string, load: () => Promise<any[]>): Promise<any[]> {
   const now = Date.now();
   const existing = analyticsCache.get(key);
@@ -46,13 +57,49 @@ async function loadAllPages(
   }
 }
 
-const getOrgUsers = async (orgId: string) => cachedRows(`users:${orgId}`, async () => {
-  return loadAllPages((from, to) => supabase
+const getOrgUsers = async (orgCode: string, organizationId: number) => cachedRows(`users:${organizationId}`, async () => {
+  const { data: firstPage, error: firstPageError } = await supabase
+    .from("pitchnest_org_founder_memberships")
+    .select("user_id, cohort, joined_at")
+    .eq("organization_id", organizationId)
+    .eq("status", "active")
+    .order("user_id", { ascending: true })
+    .range(0, DATABASE_PAGE_SIZE - 1);
+  if (firstPageError) {
+    if (missingMembershipTable(firstPageError)) return loadAllPages((from, to) => supabase
       .from("users")
-      .select("id, name, email, avatar_url, role, cohort, enrolled_at, created_at, last_active")
-      .eq("orgCode", orgId)
+      .select("id, name, email, avatar_url, role, enrolled_at, created_at, last_active")
+      .eq("orgCode", orgCode)
       .order("id", { ascending: true })
-      .range(from, to));
+      .range(from, to)).then((users) => users.map((user) => ({ ...user, cohort: null })));
+    throw firstPageError;
+  }
+  const memberships = await loadAllPages(async (from, to) => {
+    if (from === 0) return { data: firstPage ?? [], error: null };
+    return supabase.from("pitchnest_org_founder_memberships")
+      .select("user_id, cohort, joined_at")
+      .eq("organization_id", organizationId)
+      .eq("status", "active")
+      .order("user_id", { ascending: true })
+      .range(from, to);
+  });
+  const ids = [...new Set(memberships.map((membership: any) => membership.user_id))];
+  if (!ids.length) return [];
+  const users: any[] = [];
+  for (let offset = 0; offset < ids.length; offset += 500) {
+    const batch = ids.slice(offset, offset + 500);
+    const { data, error } = await supabase.from("users")
+      .select("id, name, email, avatar_url, role, created_at, last_active")
+      .in("id", batch)
+      .order("id", { ascending: true });
+    if (error) throw error;
+    users.push(...(data ?? []));
+  }
+  const membershipByUser = new Map(memberships.map((membership: any) => [String(membership.user_id), membership]));
+  return users.map((user: any) => {
+    const membership: any = membershipByUser.get(String(user.id));
+    return { ...user, cohort: membership?.cohort ?? null, enrolled_at: membership?.joined_at ?? null };
+  });
 });
 
 const getOrgSessions = async (orgId: string, userIds: (string | number)[]) => {
@@ -73,7 +120,13 @@ const getOrgSessions = async (orgId: string, userIds: (string | number)[]) => {
       const report = session.evaluation_report && typeof session.evaluation_report === "object"
         ? session.evaluation_report
         : {};
-      return { ...session, evaluation_report: report };
+      return {
+        ...session,
+        evaluation_report: report,
+        // Only these setup dimensions feed organization analytics. Deck data,
+        // replay-consent flags, business IDs, and other founder config stay private.
+        pitch_config: organizationVisiblePitchConfig(session.pitch_config),
+      };
     });
   });
 };
@@ -131,7 +184,7 @@ export const overview = async (req: Request, res: Response) => {
     const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
 
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const totalPitches = sessions.length;
@@ -198,7 +251,7 @@ export const seats = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
     const org = await getOrg(orgId);
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const { data: pendingInvites, error: inviteError } = await supabase.from("pitchnest_org_cohort_invites")
       .select("id")
       .eq("organization_id", req.organization!.id)
@@ -244,7 +297,7 @@ export const seats = async (req: Request, res: Response) => {
 export const activity = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const now = new Date();
@@ -296,7 +349,7 @@ export const activity = async (req: Request, res: Response) => {
 export const founderDrill = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
     const sessionsByUser = new Map<string, any[]>();
     for (const session of sessions) {
@@ -388,7 +441,7 @@ export const founderDrill = async (req: Request, res: Response) => {
 export const memberList = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const byUser: Record<string, any[]> = {};
@@ -539,7 +592,7 @@ export const weeklyReport = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
     const { date } = req.body;
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     if (date !== undefined && (typeof date !== "string" || date.length > 32)) {
@@ -580,7 +633,7 @@ export const monthlyReport = async (req: Request, res: Response) => {
   try {
     const orgId = req.organization!.orgCode;
     const { month, year } = req.body;
-    const users = await getOrgUsers(orgId);
+    const users = await getOrgUsers(orgId, req.organization!.id);
     const sessions = await getOrgSessions(orgId, users.map((u) => u.id));
 
     const now = new Date();
@@ -623,20 +676,33 @@ export const replays = async (req: Request, res: Response) => {
       .order("created_at", { ascending: false })
       .limit(100);
     if (error) throw error;
-    const userIds = [...new Set((data ?? []).map((session) => session.user_id))];
     const sessionIds = (data ?? []).map((session) => session.id);
-    const { data: recordings, error: recordingsError } = sessionIds.length
+    let { data: recordings, error: recordingsError } = sessionIds.length
       ? await supabase.from("sessions").select("id, user_id, video_url")
         .in("id", sessionIds).eq("org_id", req.organization!.orgCode).eq("visibility", "organization")
+        .eq("organization_replay_shared", true)
       : { data: [], error: null };
+    const missingReplayConsentColumn = recordingsError?.code === "42703" || recordingsError?.code === "PGRST204";
+    if (recordingsError && missingReplayConsentColumn && String(recordingsError.message || "").includes("organization_replay_shared")) {
+      // Old deployments keep their prior replay behavior until migration 0041
+      // has run; new deployments require the explicit per-session setting.
+      const legacy = sessionIds.length
+        ? await supabase.from("sessions").select("id, user_id, video_url")
+          .in("id", sessionIds).eq("org_id", req.organization!.orgCode).eq("visibility", "organization")
+        : { data: [], error: null };
+      recordings = legacy.data;
+      recordingsError = legacy.error;
+    }
     if (recordingsError) throw recordingsError;
     const recordingById = new Map((recordings ?? []).map((row) => [String(row.id), row.video_url]));
+    const visibleSessions = (data ?? []).filter((session) => recordingById.has(String(session.id)));
+    const userIds = [...new Set(visibleSessions.map((session) => session.user_id))];
     const { data: users, error: usersError } = userIds.length
       ? await supabase.from("users").select("id, name").in("id", userIds)
       : { data: [], error: null };
     if (usersError) throw usersError;
     const names = new Map((users ?? []).map((user) => [String(user.id), user.name]));
-    const records = await Promise.all((data ?? []).map(async (session) => {
+    const records = await Promise.all(visibleSessions.map(async (session) => {
       const storedRecording = recordingById.get(String(session.id));
       const target = await authorizedRecordingTarget(storedRecording, session.user_id);
       let replayUrl: string | null = null;
