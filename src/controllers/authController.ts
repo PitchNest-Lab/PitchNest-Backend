@@ -748,6 +748,84 @@ export const orgLogin = async (req: Request, res: Response) => {
   }
 };
 
+/** Organization Google sign-in is limited to staff identities that have
+ * already been provisioned for an organization. It does not create an
+ * organization or grant dashboard access to an ordinary founder account. */
+export const orgGoogleLogin = async (req: Request, res: Response) => {
+  try {
+    if (!config.googleClientId) {
+      return res.status(503).json({ error: "Google sign-in is not configured on the server." });
+    }
+
+    const { credential, rememberMe } = req.body;
+    if (typeof credential !== "string" || !credential || credential.length > 16_384) {
+      return res.status(400).json({ error: "Missing Google credential." });
+    }
+
+    const payload = await verifyGoogleCredential(credential);
+    if (!payload || typeof payload.email !== "string" || payload.email_verified !== true) {
+      return res.status(401).json({ error: "Invalid or unverified Google account." });
+    }
+
+    const email = payload.email.toLowerCase().trim();
+    const { data: member, error: memberError } = await supabase
+      .from("pitchnest_org_staff_accounts")
+      .select("id, organization_id, name, email, role, status, auth_version")
+      .eq("email", email)
+      .maybeSingle();
+    if (memberError) {
+      console.error("Organization Google member lookup failed:", memberError.message);
+      return res.status(503).json({ error: "Organization sign-in is temporarily unavailable." });
+    }
+    if (!member || member.status !== "active") {
+      return res.status(401).json({ error: "Invalid organization credentials." });
+    }
+
+    const { error: loginStateError } = await supabase
+      .from("pitchnest_org_staff_accounts")
+      .update({ failed_login_attempts: 0, locked_until: null, last_login_at: new Date().toISOString() })
+      .eq("id", member.id);
+    if (loginStateError) {
+      console.error("Organization Google login state could not be updated:", loginStateError.message);
+      return res.status(503).json({ error: "Organization sign-in is temporarily unavailable." });
+    }
+
+    const { data: organization, error: organizationError } = await supabase
+      .from("Organizations")
+      .select("id, org_code, org_name, plan, validity, trial_started_at, trial_expires_at, trial_status")
+      .eq("id", member.organization_id)
+      .maybeSingle();
+    if (organizationError || !organization || organization.org_code == null) {
+      console.error("Organization Google member's organization could not be loaded:", organizationError?.message);
+      return res.status(503).json({ error: "Organization account is temporarily unavailable." });
+    }
+
+    const token = signToken({
+      id: organization.id,
+      email: member.email,
+      accountType: "organization",
+      orgCode: String(organization.org_code),
+      authVersion: member.auth_version ?? 0,
+      organizationMemberId: member.id,
+    }, rememberMe === true);
+
+    return res.status(200).json({
+      user: {
+        ...toPublicOrganization(organization),
+        id: organization.id,
+        name: member.name,
+        email: member.email,
+        organizationRole: member.role,
+        organizationMemberId: member.id,
+      },
+      token,
+    });
+  } catch (error) {
+    console.error("Organization Google login error:", error);
+    return res.status(500).json({ error: "Organization Google sign-in failed." });
+  }
+};
+
 const ORG_RESET_GENERIC = "If an organization administrator account exists for that email, a reset link has been sent.";
 
 export const forgotOrganizationPassword = async (req: Request, res: Response) => {

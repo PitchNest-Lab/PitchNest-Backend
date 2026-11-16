@@ -4,6 +4,7 @@ import {
   signup,
   login,
   orgLogin,
+  orgGoogleLogin,
   forgotOrganizationPassword,
   resetOrganizationPassword,
   getOrganizationStaffInvite,
@@ -61,6 +62,7 @@ const sessionMaintenanceLimiter = rateLimit({
 router.post("/signup", authLimiter, signup);
 router.post("/login", authLimiter, login);
 router.post("/organization-login", authLimiter, orgLogin);
+router.post("/organization-google", authLimiter, orgGoogleLogin);
 router.post("/organization-forgot-password", authLimiter, forgotOrganizationPassword);
 router.post("/organization-reset-password", authLimiter, resetOrganizationPassword);
 router.get("/organization-invite", authLimiter, getOrganizationStaffInvite);
