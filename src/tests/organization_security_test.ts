@@ -45,18 +45,29 @@ const passwordHash = await bcrypt.hash("correct horse battery staple", 4);
 const organizationRow = {
   id: 71,
   email: "owner@example.com",
-  password: passwordHash,
   org_code: "12345",
   org_name: "Alpha Accelerator",
   plan: "enterprise",
   validity: new Date(Date.now() + 86_400_000).toISOString(),
   trial_status: "inactive",
 };
+const memberRow = {
+  id: 501,
+  organization_id: organizationRow.id,
+  name: "Organization Owner",
+  email: organizationRow.email,
+  password_hash: passwordHash,
+  role: "owner",
+  status: "active",
+  auth_version: 0,
+  locked_until: null,
+};
 
 const mutableSupabase = supabase as any;
 const originalFrom = mutableSupabase.from;
 const originalRpc = mutableSupabase.rpc;
 let selectedTable = "";
+const queriedTables: string[] = [];
 const rpcCalls: string[] = [];
 
 // A wrong password records a failed attempt through this RPC. Answer it here so
@@ -68,11 +79,14 @@ mutableSupabase.rpc = async (fn: string) => {
 
 mutableSupabase.from = (table: string) => {
   selectedTable = table;
+  queriedTables.push(table);
   const query = {
     select: () => query,
     eq: () => query,
+    update: () => ({ eq: async () => ({ error: null }) }),
     maybeSingle: async () => ({
-      data: table === "Organizations" ? organizationRow : null,
+      data: table === "Organizations" ? organizationRow
+        : table === "pitchnest_org_staff_accounts" ? memberRow : null,
       error: null,
     }),
   };
@@ -86,6 +100,8 @@ try {
       kind: ACCESS_TOKEN_KIND,
       accountType: "organization",
       orgCode: "99999",
+      organizationMemberId: memberRow.id,
+      authVersion: memberRow.auth_version,
     },
     config.jwtSecret,
     { algorithm: "HS256", issuer: ACCESS_TOKEN_ISSUER, audience: ACCESS_TOKEN_AUDIENCE },
@@ -103,8 +119,20 @@ try {
 
   assert.equal(organizationNextCalled, true);
   assert.equal(selectedTable, "Organizations");
+  assert.deepEqual(queriedTables.slice(0, 2), ["pitchnest_org_staff_accounts", "Organizations"]);
   assert.equal(organizationRequest.organization?.orgCode, "12345");
+  assert.equal(organizationRequest.organization?.memberId, memberRow.id);
   assert.notEqual(organizationRequest.organization?.orgCode, "99999");
+
+  memberRow.status = "revoked";
+  const revokedResponse = responseRecorder();
+  let revokedNextCalled = false;
+  await organizationAuthMiddleware(requestWithToken(forgedScopeToken), revokedResponse, (() => {
+    revokedNextCalled = true;
+  }) as NextFunction);
+  assert.equal(revokedNextCalled, false);
+  assert.equal(revokedResponse.statusCode, 401);
+  memberRow.status = "active";
 
   const wrongSurfaceResponse = responseRecorder();
   let wrongSurfaceNextCalled = false;
@@ -157,7 +185,7 @@ try {
   );
   assert.equal(wrongPasswordResponse.statusCode, 401);
   assert.equal(wrongPasswordResponse.body?.token, undefined);
-  assert.deepEqual(rpcCalls, ["record_failed_org_login"]);
+  assert.deepEqual(rpcCalls, ["record_failed_organization_member_login"]);
 
   const loginResponse = responseRecorder();
   await orgLogin(
@@ -175,6 +203,7 @@ try {
   const decoded = jwt.verify(loginResponse.body.token, config.jwtSecret) as any;
   assert.equal(decoded.accountType, "organization");
   assert.equal(decoded.orgCode, "12345");
+  assert.equal(decoded.organizationMemberId, memberRow.id);
 
   const publicUser = toPublicUser({
     id: 5,

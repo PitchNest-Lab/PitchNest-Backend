@@ -9,6 +9,7 @@ import { startApp, call } from "../helpers/httpServer.ts";
 import { signOrgToken, signUserToken } from "../helpers/tokens.ts";
 
 const ORG_A_PASS = "org-a-correct-horse";
+const ORG_A_MEMBER_ID = 70;
 const db = new FakeSupabase();
 let base = "";
 let close: () => Promise<void>;
@@ -16,20 +17,31 @@ let close: () => Promise<void>;
 function seed() {
   db.seed("Organizations", [
     // id 7 deliberately collides with founder users.id 7 (the C2 scenario).
-    { id: 7, org_code: 1111, email: "orga@x.test", org_name: "Org A", password: bcrypt.hashSync(ORG_A_PASS, 4) },
-    { id: 8, org_code: 2222, email: "orgb@x.test", org_name: "Org B", password: bcrypt.hashSync("org-b-pass", 4) },
-    { id: 9, org_code: 3333, email: "nohash@x.test", org_name: "No Hash", password: null },
-    { id: 10, org_code: 4444, email: "plain@x.test", org_name: "Plain", password: "plaintext123" },
+    { id: 7, org_code: 1111, email: "orga@x.test", org_name: "Org A" },
+    { id: 8, org_code: 2222, email: "orgb@x.test", org_name: "Org B" },
+    { id: 9, org_code: 3333, email: "nohash@x.test", org_name: "No Hash" },
+    { id: 10, org_code: 4444, email: "plain@x.test", org_name: "Plain" },
+  ]);
+  db.seed("pitchnest_org_staff_accounts", [
+    { id: ORG_A_MEMBER_ID, organization_id: 7, name: "Org A Owner", email: "orga@x.test", role: "owner", status: "active", auth_version: 0, password_hash: bcrypt.hashSync(ORG_A_PASS, 4) },
+    { id: 80, organization_id: 8, name: "Org B Owner", email: "orgb@x.test", role: "owner", status: "active", auth_version: 0, password_hash: bcrypt.hashSync("org-b-pass", 4) },
+    { id: 90, organization_id: 9, name: "No Hash Owner", email: "nohash@x.test", role: "owner", status: "active", auth_version: 0, password_hash: null },
+    { id: 100, organization_id: 10, name: "Plain Owner", email: "plain@x.test", role: "owner", status: "active", auth_version: 0, password_hash: "plaintext123" },
   ]);
   db.seed("users", [
     { id: 7, email: "victim@x.test", name: "Victim Founder", isEmailVerified: true, orgCode: "9999" },
     { id: 20, email: "a-member@x.test", name: "A Member", isEmailVerified: true, orgCode: "1111", enrolled_at: "2026-09-01T00:00:00Z" },
     { id: 21, email: "b-member@x.test", name: "B Member", isEmailVerified: true, orgCode: "2222", enrolled_at: "2026-09-01T00:00:00Z" },
   ]);
-  db.seed("sessions", [
-    { id: 501, user_id: 20, business_name: "A Startup", created_at: "2026-10-01T10:00:00Z", summary: "A feedback", evaluation_report: {} },
-    { id: 502, user_id: 21, business_name: "B Secret Startup", created_at: "2026-10-02T10:00:00Z", summary: "B private feedback", evaluation_report: {} },
+  db.seed("pitchnest_org_founder_memberships", [
+    { id: "membership-a", organization_id: 7, user_id: 20, status: "active", cohort: "A", joined_at: "2026-09-01T00:00:00Z" },
+    { id: "membership-b", organization_id: 8, user_id: 21, status: "active", cohort: "B", joined_at: "2026-09-01T00:00:00Z" },
   ]);
+  db.seed("sessions", [
+    { id: 501, user_id: 20, org_id: "1111", visibility: "organization", business_name: "A Startup", created_at: "2026-10-01T10:00:00Z", summary: "A feedback", evaluation_report: {} },
+    { id: 502, user_id: 21, org_id: "2222", visibility: "organization", business_name: "B Secret Startup", created_at: "2026-10-02T10:00:00Z", summary: "B private feedback", evaluation_report: {} },
+  ]);
+  db.seed("session_list_safe", db.rows("sessions"));
 }
 
 const ORG_ROUTES: [string, string][] = [
@@ -74,7 +86,7 @@ test("C1: every organization endpoint refuses unauthenticated and wrong-principa
 });
 
 test("C1: a valid org token sees only its own organization's members", async () => {
-  const token = signOrgToken({ id: 7, orgCode: 1111, email: "orga@x.test" });
+  const token = signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 1111, email: "orga@x.test" });
   for (const [method, path] of ORG_ROUTES) {
     const r = await call(base, method, path, { token, body: method === "POST" ? {} : undefined });
     assert.equal(r.status, 200, `${method} ${path} → ${r.status}`);
@@ -88,7 +100,7 @@ test("C1: a valid org token sees only its own organization's members", async () 
 test("C1: a client-supplied orgId never widens an org token's scope", async () => {
   // Handlers scope every query to the organization row behind the token; any
   // orgId in the body is ignored rather than trusted.
-  const tokenA = signOrgToken({ id: 7, orgCode: 1111, email: "orga@x.test" });
+  const tokenA = signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 1111, email: "orga@x.test" });
   for (const [method, path] of ORG_ROUTES.filter(([m]) => m === "POST")) {
     for (const orgId of [2222, "2222", " 2222 ", "1111 OR 1=1"]) {
       const r = await call(base, method, path, { token: tokenA, body: { orgId } });
@@ -102,31 +114,36 @@ test("C1: a client-supplied orgId never widens an org token's scope", async () =
 });
 
 test("C1: an org token for a deleted organization is refused; stale claims cannot change scope", async () => {
-  const ghost = signOrgToken({ id: 77, orgCode: 7777, email: "ghost@x.test" });
+  const ghost = signOrgToken({ id: 77, memberId: 770, orgCode: 7777, email: "ghost@x.test" });
   assert.equal((await call(base, "POST", "/api/organization/members", { token: ghost, body: {} })).status, 401);
 
   // The organization row, not the token's claims, decides the scope.
   for (const token of [
-    signOrgToken({ id: 7, orgCode: 2222, email: "orga@x.test" }),
-    signOrgToken({ id: 7, orgCode: 1111, email: "orgb@x.test" }),
+    signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 2222, email: "orga@x.test" }),
+    signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 1111, email: "orgb@x.test" }),
   ]) {
     const r = await call(base, "POST", "/api/organization/members", { token, body: {} });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.data.members.map((m: any) => m.email), ["a-member@x.test"]);
   }
 
-  // Bumping the organization's auth_version revokes every outstanding token.
-  const orgA = db.rows("Organizations").find((o) => o.id === 7)!;
-  orgA.auth_version = 1;
+  // Bumping a staff account's auth_version revokes its outstanding tokens.
+  const owner = db.rows("pitchnest_org_staff_accounts").find((member) => member.id === ORG_A_MEMBER_ID)!;
+  owner.auth_version = 1;
   try {
-    const revoked = signOrgToken({ id: 7, orgCode: 1111, email: "orga@x.test" });
+    const revoked = signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 1111, email: "orga@x.test" });
     assert.equal((await call(base, "POST", "/api/organization/members", { token: revoked, body: {} })).status, 401);
   } finally {
-    orgA.auth_version = 0;
+    owner.auth_version = 0;
   }
 });
 
-// ── C2: passwordless organization login ────────────────────────────────────
+// ── C2: named organization staff login ─────────────────────────────────────
+
+test("organization Google sign-in route is available", async () => {
+  const response = await call(base, "POST", "/api/auth/organization-google", { body: {} });
+  assert.ok([400, 503].includes(response.status), `organization Google route returned ${response.status}`);
+});
 
 test("C2: organization login requires the correct password", async () => {
   const path = "/api/auth/organization-login";
@@ -146,6 +163,7 @@ test("C2: organization login requires the correct password", async () => {
   assert.equal(claims.kind, "access");
   assert.equal(claims.accountType, "organization", "org tokens are typed so founder routes refuse them");
   assert.equal(claims.orgCode, "1111");
+  assert.equal(claims.organizationMemberId, ORG_A_MEMBER_ID);
   assert.equal(ok.json.user.accountType, "organization");
   assert.equal(String(ok.json.user.orgCode), "1111");
 });
@@ -157,10 +175,10 @@ test("C2: organizations without a usable bcrypt hash cannot log in (no silent pa
   // Plaintext stored value: even the exact stored string must not work.
   const plain = await call(base, "POST", path, { body: { email: "plain@x.test", password: "plaintext123" } });
   assert.equal(plain.status, 401);
-  // And nothing was written back to the rows.
-  const rows = db.rows("Organizations");
-  assert.equal(rows.find((o) => o.id === 9)!.password, null);
-  assert.equal(rows.find((o) => o.id === 10)!.password, "plaintext123");
+  // And nothing was written back to the staff credentials.
+  const rows = db.rows("pitchnest_org_staff_accounts");
+  assert.equal(rows.find((member) => member.id === 90)!.password_hash, null);
+  assert.equal(rows.find((member) => member.id === 100)!.password_hash, "plaintext123");
 });
 
 test("C2 + logs: organization login never logs the organization row, email or hash", async () => {
@@ -187,7 +205,7 @@ test("C2 + logs: organization login never logs the organization row, email or ha
 
 test("collision: no organization token — new or legacy — authenticates as the founder sharing its id", async () => {
   const legacyOrgToken = jwt.sign({ id: 7, email: "orga@x.test", rememberMe: true }, TEST_JWT_SECRET!);
-  const newOrgToken = signOrgToken({ id: 7, orgCode: 1111, email: "orga@x.test" });
+  const newOrgToken = signOrgToken({ id: 7, memberId: ORG_A_MEMBER_ID, orgCode: 1111, email: "orga@x.test" });
   const founderOnly = [
     ["GET", "/api/sessions"],
     ["GET", "/api/billing/plan"],

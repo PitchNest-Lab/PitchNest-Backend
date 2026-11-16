@@ -20,11 +20,12 @@ export function signUserToken(user: { id: number; email?: string }): string {
   return sign({ id: user.id, email: user.email, accountType: "user" });
 }
 
-export function signOrgToken(org: { id: number; email?: string; orgCode: string | number }): string {
+export function signOrgToken(org: { id: number; memberId: number; email?: string; orgCode: string | number }): string {
   return sign({
     id: org.id,
     email: org.email,
     accountType: "organization",
     orgCode: String(org.orgCode),
+    organizationMemberId: org.memberId,
   });
 }
