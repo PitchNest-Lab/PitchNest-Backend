@@ -94,13 +94,15 @@ export const config = {
   // ANY origin with credentials:true on the live site. Local dev sets
   // NODE_ENV=development explicitly in .env / npm scripts.
   nodeEnv: process.env.NODE_ENV || "production",
-  emailFrom: process.env.EMAIL_FROM || "PitchNest <hello@pitchnest.app>",
+  emailFrom:
+    (process.env.EMAIL_FROM || "").trim() || "PitchNest <hello@pitchnest.app>",
   // Where user REPLIES go. This is deliberately a different address from
   // emailFrom: Resend will only send from a domain we have verified by DNS, and
   // gmail.com can never be verified (it returns 403 "domain is not verified"),
   // so a Gmail address cannot be the sender. Reply-To is the supported way to
   // route replies into that inbox while still sending from pitchnest.app.
-  emailReplyTo: process.env.EMAIL_REPLY_TO || "pitchnestapp@gmail.com",
+  emailReplyTo:
+    (process.env.EMAIL_REPLY_TO || "").trim() || "pitchnestapp@gmail.com",
   // The public origin of the FRONTEND, used to build links inside outbound email.
   // A verification link or a trial reminder that points at localhost is a dead
   // end for the recipient and silently unrecoverable, so this is read through

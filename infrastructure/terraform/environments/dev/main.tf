@@ -15,7 +15,13 @@ module "api_lambda" {
   deployment_package = "${path.module}/../../../../dist/pitchnest-api.zip"
 
   environment_variables = {
-    NODE_ENV = "development"
+    NODE_ENV       = "development"
+    PITCHNEST_ENV  = "dev"
+    CLIENT_URL     = "https://pitchnestapp-git-dev-immanexs-projects.vercel.app"
+    ALLOWED_ORIGIN = "https://pitchnestapp-git-dev-immanexs-projects.vercel.app"
+    APP_BASE_URL   = "https://pitchnestapp-git-dev-immanexs-projects.vercel.app"
+    EMAIL_FROM     = "PitchNest <hello@pitchnest.app>"
+    EMAIL_REPLY_TO = "pitchnestapp@gmail.com"
   }
 }
 

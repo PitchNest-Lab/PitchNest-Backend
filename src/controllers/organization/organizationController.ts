@@ -17,6 +17,11 @@ const MAX_ANALYTICS_CACHE_ENTRIES = 25;
 const DATABASE_PAGE_SIZE = 1_000;
 const analyticsCache = new Map<string, { expiresAt: number; value: Promise<any[]> }>();
 
+export const invalidateOrganizationAnalytics = (organizationId: number, orgCode?: string | number) => {
+  analyticsCache.delete(`users:${organizationId}`);
+  if (orgCode !== undefined) analyticsCache.delete(`sessions:${orgCode}`);
+};
+
 const missingMembershipTable = (error: any) => error?.code === "42P01" || error?.code === "PGRST205"
   || (typeof error?.message === "string" && error.message.includes("pitchnest_org_founder_memberships")
     && /not find|does not exist|schema cache/i.test(error.message));
@@ -163,7 +168,7 @@ export const orgDetails = async (req: Request, res: Response) => {
         validity: org.validity,
         plan: org.plan ?? "—",
         email: org.email,
-        country: org.country ?? "—",
+        country: org.country ?? "",
         websiteUrl: org.website_url ?? "",
         trialStartedAt: org.trial_started_at ?? null,
         trialExpiresAt: org.trial_expires_at ?? null,

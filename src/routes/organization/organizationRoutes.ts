@@ -23,6 +23,11 @@ import {
   listOrganizationTeam,
   revokeOrganizationInvite,
   revokeOrganizationTeamMember,
+  createOrganizationInvitesBulk,
+  updateOrganizationFounderCohort,
+  removeOrganizationFounder,
+  updateOrganizationSettings,
+  deleteOrganizationAccount,
 } from "../../controllers/organization/organizationAdministrationController.ts";
 import {
   createOrganizationForm,
@@ -49,6 +54,8 @@ router.post("/reports/monthly", monthlyReport);
 router.get("/reports", listReports);
 router.get("/reports/:reportId/download", downloadReport);
 router.get("/replays", replays);
+router.patch("/settings", requireOrgRole("owner"), updateOrganizationSettings);
+router.delete("/settings", requireOrgRole("owner"), deleteOrganizationAccount);
 router.get("/program-forms", listOrganizationForms);
 router.post("/program-forms", createOrganizationForm);
 router.patch("/program-forms/:formId", updateOrganizationForm);
@@ -60,7 +67,10 @@ router.get("/team", requireOrgRole("owner", "admin"), listOrganizationTeam);
 router.post("/team/invites", requireOrgRole("owner", "admin"), inviteOrganizationTeamMember);
 router.delete("/team/:memberId", requireOrgRole("owner", "admin"), revokeOrganizationTeamMember);
 router.get("/invites", listOrganizationInvites);
+router.post("/invites/bulk", createOrganizationInvitesBulk);
 router.post("/invites", createOrganizationInvite);
 router.delete("/invites/:inviteId", revokeOrganizationInvite);
+router.patch("/members/:userId/cohort", requireOrgRole("owner", "admin", "facilitator"), updateOrganizationFounderCohort);
+router.delete("/members/:userId", requireOrgRole("owner", "admin", "facilitator"), removeOrganizationFounder);
 
 export default router;

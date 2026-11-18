@@ -5,6 +5,7 @@ import { supabase } from "../../config/supabase.ts";
 import { config } from "../../config/env.ts";
 import { hashAuthToken } from "../../utils/authTokens.ts";
 import { withTimeout } from "../../utils/withTimeout.ts";
+import { invalidateOrganizationAnalytics } from "./organizationController.ts";
 
 const resend = config.resendApiKey && config.resendApiKey !== "re_xxxxxxxxx"
   ? new Resend(config.resendApiKey)
@@ -17,8 +18,36 @@ function cleanEmail(value: unknown): string | null {
   return email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : null;
 }
 
+function cleanCohort(value: unknown): string | null | undefined {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string") return undefined;
+  const cohort = value.trim();
+  if (!cohort) return null;
+  return cohort.length <= 80 && !/[\u0000-\u001f\u007f]/.test(cohort) ? cohort : undefined;
+}
+
+function membershipTableMissing(error: any): boolean {
+  return error?.code === "42P01" || error?.code === "PGRST205"
+    || (typeof error?.message === "string"
+      && error.message.includes("pitchnest_org_founder_memberships")
+      && /not find|does not exist|schema cache/i.test(error.message));
+}
+
 function inviteExpiry(): string {
   return new Date(Date.now() + INVITE_TTL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function publicFounderInvite(invite: any, status: "pending" | "accepted" | "revoked" | "expired" = "pending") {
+  return {
+    id: String(invite.id),
+    email: invite.email,
+    cohort: invite.cohort ?? null,
+    expiresAt: invite.expires_at,
+    acceptedAt: invite.accepted_at ?? null,
+    revokedAt: invite.revoked_at ?? null,
+    createdAt: invite.created_at,
+    status,
+  };
 }
 
 function escapeHtml(value: string): string {
@@ -156,7 +185,7 @@ export const revokeOrganizationTeamMember = async (req: Request, res: Response) 
 
 export const listOrganizationInvites = async (req: Request, res: Response) => {
   const { data, error } = await supabase.from("pitchnest_org_cohort_invites")
-    .select("id, email, expires_at, accepted_at, revoked_at, created_at")
+    .select("id, email, cohort, expires_at, accepted_at, revoked_at, created_at")
     .eq("organization_id", req.organization!.id)
     .order("created_at", { ascending: false })
     .limit(100);
@@ -167,6 +196,7 @@ export const listOrganizationInvites = async (req: Request, res: Response) => {
   const invites = (data ?? []).map((invite) => ({
     id: invite.id,
     email: invite.email,
+    cohort: invite.cohort ?? null,
     expiresAt: invite.expires_at,
     acceptedAt: invite.accepted_at,
     revokedAt: invite.revoked_at,
@@ -180,6 +210,8 @@ export const createOrganizationInvite = async (req: Request, res: Response) => {
   try {
     const email = cleanEmail(req.body?.email);
     if (!email) return res.status(400).json({ error: "Enter a valid founder email address." });
+    const cohort = cleanCohort(req.body?.cohort);
+    if (cohort === undefined) return res.status(400).json({ error: "Cohort names must be 80 characters or fewer." });
     const orgId = req.organization!.id;
     const { data: organization, error: orgError } = await supabase.from("Organizations")
       .select("id, org_name, org_code, org_users_capacity, org_users_enrolled")
@@ -235,18 +267,239 @@ export const createOrganizationInvite = async (req: Request, res: Response) => {
     const { data: invite, error } = await supabase.from("pitchnest_org_cohort_invites").insert({
       organization_id: orgId,
       email,
+      cohort,
       token_hash: tokenHash,
       expires_at: inviteExpiry(),
       created_by: req.organization!.memberId ?? null,
-    }).select("id, email, expires_at, created_at").single();
+    }).select("id, email, cohort, expires_at, created_at").single();
     if (error || !invite) throw error || new Error("Invitation could not be created");
     const inviteUrl = `${config.clientUrl}/signup?organizationInvite=${rawToken}`;
     const emailSent = await sendInvite(email, organization.org_name || "Your organization", inviteUrl, `Join ${organization.org_name || "an organization"} on PitchNest`);
-    return res.status(201).json({ data: { invite: { ...invite, status: "pending" }, inviteUrl, emailSent } });
+    return res.status(201).json({ data: { invite: publicFounderInvite(invite), inviteUrl, emailSent } });
   } catch (error: any) {
     console.error("Founder organization invitation failed:", error?.message || error);
     return res.status(500).json({ error: "Could not create the founder invitation." });
   }
+};
+
+export const createOrganizationInvitesBulk = async (req: Request, res: Response) => {
+  try {
+    const input = req.body?.emails;
+    if (!Array.isArray(input) || input.length < 1 || input.length > 100) {
+      return res.status(400).json({ error: "Submit between 1 and 100 founder email addresses." });
+    }
+    const cohort = cleanCohort(req.body?.cohort);
+    if (cohort === undefined) return res.status(400).json({ error: "Cohort names must be 80 characters or fewer." });
+
+    const results: any[] = input.map((value: unknown) => ({
+      email: typeof value === "string" ? value.trim() : "",
+      status: "rejected",
+      message: "Enter a valid founder email address.",
+    }));
+    const candidates: { index: number; email: string }[] = [];
+    const seen = new Set<string>();
+    for (let index = 0; index < input.length; index += 1) {
+      const email = cleanEmail(input[index]);
+      if (!email) continue;
+      results[index].email = email;
+      if (seen.has(email)) {
+        results[index] = { email, status: "duplicate", message: "This address appears more than once in the list." };
+        continue;
+      }
+      seen.add(email);
+      candidates.push({ index, email });
+    }
+
+    if (candidates.length) {
+      const orgId = req.organization!.id;
+      const { data: organization, error: orgError } = await supabase.from("Organizations")
+        .select("id, org_name, org_code, org_users_capacity, org_users_enrolled")
+        .eq("id", orgId).maybeSingle();
+      if (orgError || !organization) throw orgError || new Error("Organization not found");
+
+      const emails = candidates.map((item) => item.email);
+      const { data: existingUsers, error: usersError } = await supabase.from("users")
+        .select("id, email, orgCode").in("email", emails);
+      if (usersError) throw usersError;
+
+      const existingUserIds = (existingUsers ?? []).map((user) => user.id);
+      const activeMemberUserIds = new Set<string>();
+      if (existingUserIds.length) {
+        const { data: memberships, error: membershipError } = await supabase.from("pitchnest_org_founder_memberships")
+          .select("user_id").eq("organization_id", orgId).eq("status", "active").in("user_id", existingUserIds);
+        if (membershipError && !membershipTableMissing(membershipError)) throw membershipError;
+        if (!membershipError) (memberships ?? []).forEach((membership) => activeMemberUserIds.add(String(membership.user_id)));
+      }
+
+      const memberEmails = new Set((existingUsers ?? []).filter((user) =>
+        activeMemberUserIds.has(String(user.id)) || String(user.orgCode ?? "") === String(organization.org_code),
+      ).map((user) => String(user.email).toLowerCase()));
+
+      const now = new Date().toISOString();
+      const { data: activeInvites, error: activeInvitesError } = await supabase.from("pitchnest_org_cohort_invites")
+        .select("email").eq("organization_id", orgId).in("email", emails)
+        .is("accepted_at", null).is("revoked_at", null).gt("expires_at", now);
+      if (activeInvitesError) throw activeInvitesError;
+      const inviteEmails = new Set((activeInvites ?? []).map((invite) => invite.email.toLowerCase()));
+
+      const { count: pendingInvites, error: pendingError } = await supabase.from("pitchnest_org_cohort_invites")
+        .select("id", { count: "exact", head: true })
+        .eq("organization_id", orgId).is("accepted_at", null).is("revoked_at", null).gt("expires_at", now);
+      if (pendingError) throw pendingError;
+      let seatsAvailable = Math.max(0,
+        Number(organization.org_users_capacity ?? 0)
+        - Number(organization.org_users_enrolled ?? 0)
+        - Number(pendingInvites ?? 0));
+
+      const toCreate: { index: number; email: string; rawToken: string }[] = [];
+      for (const candidate of candidates) {
+        if (memberEmails.has(candidate.email)) {
+          results[candidate.index] = { email: candidate.email, status: "rejected", message: "This founder is already in your organization." };
+        } else if (inviteEmails.has(candidate.email)) {
+          results[candidate.index] = { email: candidate.email, status: "rejected", message: "An active invitation already exists for this email." };
+        } else if (seatsAvailable <= 0) {
+          results[candidate.index] = { email: candidate.email, status: "rejected", message: "No organization seats are available for this invitation." };
+        } else {
+          seatsAvailable -= 1;
+          toCreate.push({ ...candidate, rawToken: crypto.randomBytes(32).toString("hex") });
+        }
+      }
+
+      if (toCreate.length) {
+        const rows = toCreate.map((item) => ({
+          organization_id: orgId,
+          email: item.email,
+          cohort,
+          token_hash: hashAuthToken("organization-invite", item.rawToken),
+          expires_at: inviteExpiry(),
+          created_by: req.organization!.memberId ?? null,
+        }));
+        const { data: inserted, error: insertError } = await supabase.from("pitchnest_org_cohort_invites")
+          .insert(rows).select("id, email, cohort, expires_at, created_at");
+        if (insertError) throw insertError;
+
+        const insertedByEmail = new Map((inserted ?? []).map((invite) => [invite.email.toLowerCase(), invite]));
+        for (let offset = 0; offset < toCreate.length; offset += 10) {
+          const batch = toCreate.slice(offset, offset + 10);
+          await Promise.all(batch.map(async (item) => {
+            const invite = insertedByEmail.get(item.email);
+            if (!invite) {
+              results[item.index] = { email: item.email, status: "rejected", message: "The invitation could not be confirmed." };
+              return;
+            }
+            const inviteUrl = `${config.clientUrl}/signup?organizationInvite=${item.rawToken}`;
+            const emailSent = await sendInvite(item.email, organization.org_name || "Your organization", inviteUrl,
+              `Join ${organization.org_name || "an organization"} on PitchNest`);
+            results[item.index] = {
+              email: item.email,
+              status: "invited",
+              invite: publicFounderInvite(invite),
+              inviteUrl,
+              emailSent,
+            };
+          }));
+        }
+      }
+    }
+
+    const created = results.filter((item) => item.status === "invited").length;
+    return res.status(201).json({ data: { results, created } });
+  } catch (error: any) {
+    console.error("Bulk founder organization invitations failed:", error?.message || error);
+    return res.status(500).json({ error: "Could not process the founder invitations." });
+  }
+};
+
+export const updateOrganizationFounderCohort = async (req: Request, res: Response) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isSafeInteger(userId) || userId <= 0) return res.status(400).json({ error: "Invalid founder." });
+  const cohort = cleanCohort(req.body?.cohort);
+  if (cohort === undefined) return res.status(400).json({ error: "Cohort names must be 80 characters or fewer." });
+  const { data, error } = await supabase.from("pitchnest_org_founder_memberships")
+    .update({ cohort, updated_at: new Date().toISOString() })
+    .eq("organization_id", req.organization!.id).eq("user_id", userId).eq("status", "active")
+    .select("id").maybeSingle();
+  if (error) return res.status(500).json({ error: "Could not update the founder's cohort." });
+  if (!data) return res.status(404).json({ error: "Active founder membership not found." });
+  invalidateOrganizationAnalytics(req.organization!.id, req.organization!.orgCode);
+  return res.json({ data: { cohort } });
+};
+
+export const removeOrganizationFounder = async (req: Request, res: Response) => {
+  const userId = Number(req.params.userId);
+  if (!Number.isSafeInteger(userId) || userId <= 0) return res.status(400).json({ error: "Invalid founder." });
+  const { data, error } = await supabase.rpc("revoke_organization_founder_membership", {
+    p_organization_id: req.organization!.id,
+    p_user_id: userId,
+  });
+  if (error) return res.status(500).json({ error: "Could not remove this founder from the organization." });
+  if (data !== true) return res.status(404).json({ error: "Active founder membership not found." });
+  invalidateOrganizationAnalytics(req.organization!.id, req.organization!.orgCode);
+  return res.status(204).send();
+};
+
+export const updateOrganizationSettings = async (req: Request, res: Response) => {
+  const orgName = typeof req.body?.orgName === "string" ? req.body.orgName.trim() : "";
+  const country = typeof req.body?.country === "string" ? req.body.country.trim() : "";
+  const websiteInput = typeof req.body?.websiteUrl === "string" ? req.body.websiteUrl.trim() : "";
+  if (orgName.length < 2 || orgName.length > 120) {
+    return res.status(400).json({ error: "Organization name must be between 2 and 120 characters." });
+  }
+  if (country.length > 100) return res.status(400).json({ error: "Country must be 100 characters or fewer." });
+  let websiteUrl: string | null = null;
+  if (websiteInput) {
+    try {
+      const parsed = new URL(websiteInput);
+      if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || websiteInput.length > 2048) throw new Error("invalid");
+      websiteUrl = parsed.toString();
+    } catch {
+      return res.status(400).json({ error: "Enter a website address beginning with https:// or http://." });
+    }
+  }
+  const { data, error } = await supabase.from("Organizations").update({
+    org_name: orgName,
+    country: country || null,
+    website_url: websiteUrl,
+  }).eq("id", req.organization!.id)
+    .select("id, org_code, org_name, country, website_url")
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: "Could not save organization settings." });
+  if (!data) return res.status(404).json({ error: "Organization not found." });
+  return res.json({ data: {
+    id: String(data.id),
+    orgCode: data.org_code,
+    orgName: data.org_name,
+    country: data.country ?? "",
+    websiteUrl: data.website_url ?? "",
+  } });
+};
+
+export const deleteOrganizationAccount = async (req: Request, res: Response) => {
+  const objectPaths: string[] = [];
+  for (let from = 0; ; from += 1_000) {
+    const { data: files, error: fileLookupError } = await supabase.from("pitchnest_org_submission_files")
+      .select("object_path").eq("organization_id", req.organization!.id).range(from, from + 999);
+    if (fileLookupError) return res.status(500).json({ error: "Could not prepare organization file deletion." });
+    objectPaths.push(...(files ?? []).map((file) => file.object_path).filter((path): path is string => typeof path === "string"));
+    if ((files ?? []).length < 1_000) break;
+  }
+  for (let offset = 0; offset < objectPaths.length; offset += 100) {
+    const { error: storageError } = await supabase.storage.from(config.storageBucket).remove(objectPaths.slice(offset, offset + 100));
+    if (storageError) {
+      console.error("Organization file cleanup failed:", storageError.message);
+      return res.status(500).json({ error: "Could not remove organization files. The organization was not deleted." });
+    }
+  }
+  const { data, error } = await supabase.rpc("delete_organization_account", {
+    p_organization_id: req.organization!.id,
+  });
+  if (error) {
+    console.error("Organization account deletion failed:", error.message);
+    return res.status(500).json({ error: "Could not delete this organization." });
+  }
+  if (data !== true) return res.status(404).json({ error: "Organization not found." });
+  invalidateOrganizationAnalytics(req.organization!.id, req.organization!.orgCode);
+  return res.status(204).send();
 };
 
 export const revokeOrganizationInvite = async (req: Request, res: Response) => {

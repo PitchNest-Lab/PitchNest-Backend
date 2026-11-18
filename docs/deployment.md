@@ -90,6 +90,18 @@ The deploy role must carry **no other policy**. Broad grants such as `lambda:*`,
 - **DEV:** a second web service on branch `dev`, with DEV values. Use the same build (`npm install; npm run build`) and start (`npm start`) commands as PROD. Its `JWT_SECRET` must equal `/pitchnest/dev/JWT_SECRET`.
 - **On both:** keep **Auto-Deploy** off, and copy the **Deploy Hook** from Settings.
 
+### Resend signup verification
+
+The API sends the signup code through Resend using `EMAIL_FROM` (default:
+`PitchNest <hello@pitchnest.app>`). The `pitchnest.app` domain must be verified
+in the Resend account used by each environment before real users can receive
+mail. Keep `RESEND_API_KEY` in SSM/Render environment settings; never commit it.
+
+For DEV, the Lambda points verification links at the DEV Vercel preview and
+uses the verified `pitchnest.app` sender. For PROD, set the same sender through
+Terraform's non-secret `extra_environment_variables` if you want to override
+the default.
+
 ### GitHub (this repository → Settings → Secrets and variables → Actions)
 | Secret | Value |
 |---|---|
