@@ -601,7 +601,7 @@ test("discount: the preview and the checkout charge the same discounted, one-tim
   assert.equal(preview.status, 200, JSON.stringify(preview.json));
   assert.deepEqual(
     { list: preview.json.data.listAmount, amount: preview.json.data.amount, mode: preview.json.data.billingMode, id: "codeId" in preview.json.data },
-    { list: 9.99, amount: 5, mode: "manual", id: false },
+    { list: 7.99, amount: 4, mode: "manual", id: false },
   );
   assert.equal((await call(base, "GET", "/api/billing/discount?code=pchu01&plan=prep&term=annual", { token })).json.reason, "not_applicable");
   assert.equal((await call(base, "GET", "/api/billing/discount?code=NOPE99", { token })).json.reason, "unknown");
@@ -616,11 +616,11 @@ test("discount: the preview and the checkout charge the same discounted, one-tim
   const payment = db.rows("payments").find((p) => p.user_id === 410)!;
   assert.deepEqual(
     { amount: payment.amount, mode: payment.billing_mode, plan: payment.plan, term: payment.term, providerPlan: payment.provider_plan_id },
-    { amount: 5, mode: "manual", plan: "prep", term: "monthly", providerPlan: null },
+    { amount: 4, mode: "manual", plan: "prep", term: "monthly", providerPlan: null },
     "the payment row records the discounted, one-time charge",
   );
   const init = flutterwave.find((c) => c.path === "/v3/payments")!;
-  assert.equal(init.body.amount, 5);
+  assert.equal(init.body.amount, 4);
   assert.equal("payment_plan" in init.body, false, "no Flutterwave payment plan, so it can never renew at half price");
   assert.equal(db.rows("discount_redemptions").find((r) => r.tx_ref === payment.tx_ref)?.status, "pending");
   assert.equal(flutterwave.some((c) => c.path === "/v3/payment-plans"), false);

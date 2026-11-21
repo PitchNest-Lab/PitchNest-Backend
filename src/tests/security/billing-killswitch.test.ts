@@ -63,7 +63,7 @@ test("public price: billingEnabled=false and Pro monthly is USD 15 for 30 days",
     billingModes: ["auto_renew", "manual"],
   });
   const founderMonthly = r.json.catalog.find((c: any) => c.plan === "prep" && c.term === "monthly");
-  assert.equal(founderMonthly.amount, 9.99, "Founder stays at USD 9.99");
+  assert.equal(founderMonthly.amount, 7.99, "Founder is USD 7.99");
   const unsold = r.json.catalog.filter((c: any) => !(c.plan === "pro" && c.term === "monthly"));
   assert.ok(unsold.length > 0 && unsold.every((c: any) => c.purchasable === false), "only Pro monthly is on sale by default");
 });

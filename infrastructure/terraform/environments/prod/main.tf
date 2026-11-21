@@ -26,7 +26,7 @@ locals {
 
       AZURE_OPENAI_API_VERSION = var.azure_openai_api_version
 
-      # Subscription price: Pro Founder, USD 15 for 30 days (Founder is USD 9.99,
+      # Subscription price: Pro Founder, USD 15 for 30 days (Founder is USD 7.99,
       # the code default). Checkout sells only BILLING_PURCHASABLE_SKUS (Pro and
       # Founder monthly by default) and stays OFF until billing_checkout_enabled = true
       # AND the Flutterwave keys are loadable. The Lambda module ignores later

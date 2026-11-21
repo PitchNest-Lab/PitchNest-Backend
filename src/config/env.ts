@@ -233,11 +233,10 @@ function envAmount(name: string, fallback: number): number {
 
 const ANNUAL_DAYS = positiveDaysEnv("PRO_ANNUAL_DAYS", 365);
 
-// Amounts per (plan, term). Founder (Prep) = $9.99/mo, Pro Founder = $15.00/mo
-// (matches the published pricing deck; Founder in naira is fixed below).
-// Annual defaults to 10x the monthly (≈2 months free), kept to 2 decimals so
-// $9.99/mo → $99.90/yr not $100.
-const FOUNDER_MONTHLY = envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 9.99));
+// Amounts per (plan, term). Founder (Prep) = $7.99/mo, Pro Founder = $15.00/mo
+// (Founder in naira is fixed below). Annual defaults to 10x the monthly
+// (≈2 months free), kept to 2 decimals so $7.99/mo → $79.90/yr not $80.
+const FOUNDER_MONTHLY = envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 7.99));
 const twoDp = (n: number) => Math.round(n * 100) / 100;
 const PLAN_AMOUNTS: Record<PaidPlan, Record<BillingTerm, number>> = {
   prep: {
