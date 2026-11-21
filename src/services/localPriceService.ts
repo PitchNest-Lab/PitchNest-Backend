@@ -1,5 +1,6 @@
 import {
   config,
+  fixedLocalAmount,
   hasBillingConfig,
   isPurchasable,
   resolvePlanPrice,
@@ -19,6 +20,10 @@ import { fetchUsdRate } from "./flutterwaveService.ts";
  * Flutterwave's current rate, rounded up to a neat figure. The pricing page and
  * checkout both price from the same row in billing_fx_rates (migration 0035),
  * so every server instance quotes, and charges, the same amount.
+ *
+ * FIXED PRICES. A few prices are set in a local currency instead (config:
+ * Founder in naira). They ignore the rate, which then only works out the
+ * dollar value shown beside them.
  *
  * STABILITY. A rate is re-checked with Flutterwave once it is a day old and
  * replaced only when it has moved by 2% or more, so local prices (and the
@@ -67,7 +72,10 @@ export type PricedSku = ResolvedPrice & {
   purchasable: boolean;
   /** Payment paths available for this currency on the current merchant account. */
   billingModes: BillingMode[];
-  /** On a converted price only: the dollar price it was converted from. */
+  /**
+   * On a local-currency price only: the dollar price it was converted from,
+   * or a fixed price's dollar value at the current rate.
+   */
   baseAmount?: number;
   baseCurrency?: string;
 };
@@ -127,6 +135,11 @@ export function convertFromUsd(usdAmount: number, usdRate: number, currency: str
   // not the intermediate binary-float artefact.
   const decimalPlaces = Math.max(0, (String(step).split(".")[1] ?? "").length);
   return Number(rounded.toFixed(decimalPlaces));
+}
+
+/** What `amount` of a local currency is worth in dollars at `usdRate`, to the cent. */
+export function dollarValue(amount: number, usdRate: number): number {
+  return Math.round((amount / usdRate) * 100) / 100;
 }
 
 async function readRates(currencies: string[]): Promise<Map<string, Rate> | null> {
@@ -244,13 +257,14 @@ export async function priceListIn(requested: unknown, now = Date.now()): Promise
         if (usdRate === undefined) {
           return { ...price, purchasable: isPurchasable(plan, term), billingModes: billingModesFor(price.currency) };
         }
+        const fixed = fixedLocalAmount(plan, term, currency);
         return {
           ...price,
-          amount: convertFromUsd(price.amount, usdRate, currency),
+          amount: fixed ?? convertFromUsd(price.amount, usdRate, currency),
           currency,
           purchasable: isPurchasable(plan, term),
           billingModes: billingModesFor(currency),
-          baseAmount: price.amount,
+          baseAmount: fixed === undefined ? price.amount : dollarValue(fixed, usdRate),
           baseCurrency: price.currency,
         };
       }),
@@ -272,5 +286,6 @@ export async function checkoutPrice(
   if (currency === price.currency) return price;
   const usdRate = (await usableRates(now)).get(currency);
   if (usdRate === undefined) return null;
-  return { ...price, amount: convertFromUsd(price.amount, usdRate, currency), currency };
+  const amount = fixedLocalAmount(plan, term, currency) ?? convertFromUsd(price.amount, usdRate, currency);
+  return { ...price, amount, currency };
 }

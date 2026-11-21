@@ -234,8 +234,9 @@ function envAmount(name: string, fallback: number): number {
 const ANNUAL_DAYS = positiveDaysEnv("PRO_ANNUAL_DAYS", 365);
 
 // Amounts per (plan, term). Founder (Prep) = $9.99/mo, Pro Founder = $15.00/mo
-// (matches the published pricing deck). Annual defaults to 10x the monthly
-// (≈2 months free), kept to 2 decimals so $9.99/mo → $99.90/yr not $100.
+// (matches the published pricing deck; Founder in naira is fixed below).
+// Annual defaults to 10x the monthly (≈2 months free), kept to 2 decimals so
+// $9.99/mo → $99.90/yr not $100.
 const FOUNDER_MONTHLY = envAmount("FOUNDER_PLAN_AMOUNT", envAmount("PREP_PLAN_AMOUNT", 9.99));
 const twoDp = (n: number) => Math.round(n * 100) / 100;
 const PLAN_AMOUNTS: Record<PaidPlan, Record<BillingTerm, number>> = {
@@ -248,6 +249,23 @@ const PLAN_AMOUNTS: Record<PaidPlan, Record<BillingTerm, number>> = {
     annual: envAmount("PRO_ANNUAL_AMOUNT", twoDp(config.proPlanAmount * 10)),
   },
 };
+
+// Prices fixed in a local currency. They ignore the exchange rate: a buyer
+// paying in that currency is charged exactly this amount, while other plans
+// and currencies are still converted from the dollar price. Founder costs
+// ₦11,400 a month in naira, and a year is 10 months, as in dollars.
+const FOUNDER_MONTHLY_NGN = envAmount("FOUNDER_PLAN_AMOUNT_NGN", 11_400);
+const FIXED_LOCAL_AMOUNTS: Partial<Record<PaidPlan, Record<BillingTerm, Readonly<Record<string, number>>>>> = {
+  prep: {
+    monthly: { NGN: FOUNDER_MONTHLY_NGN },
+    annual: { NGN: envAmount("FOUNDER_ANNUAL_AMOUNT_NGN", FOUNDER_MONTHLY_NGN * 10) },
+  },
+};
+
+/** A SKU's fixed price in `currency`, or undefined when it is converted from dollars. */
+export function fixedLocalAmount(plan: PaidPlan, term: BillingTerm, currency: string): number | undefined {
+  return FIXED_LOCAL_AMOUNTS[plan]?.[term]?.[currency];
+}
 
 const TERM_DAYS: Record<BillingTerm, number> = {
   monthly: config.proPlanDays,

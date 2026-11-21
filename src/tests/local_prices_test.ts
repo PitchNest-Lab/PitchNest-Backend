@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import type { Request, Response as ExpressResponse } from "express";
 import { config, resolvePlanPrice } from "../config/env.ts";
 import { supabase } from "../config/supabase.ts";
-import { checkoutPrice, convertFromUsd, priceListIn } from "../services/localPriceService.ts";
+import { checkoutPrice, convertFromUsd, dollarValue, priceListIn } from "../services/localPriceService.ts";
 import { getPlan, getPrice, handleWebhook, startCheckout } from "../controllers/billingController.ts";
 
 // ── Rounding ─────────────────────────────────────────────────────────────────
@@ -18,6 +18,8 @@ assert.equal(convertFromUsd(99.9, 0.7003, "GBP"), 69.96, "pound prices do not re
 assert.equal(convertFromUsd(15, 0.933, "EUR"), 14, "euro prices are normalized to cents");
 assert.equal(convertFromUsd(15, 3_500, "UGX"), 52_500, "Ugandan shillings round to 100");
 assert.equal(convertFromUsd(15, 50, "EGP"), 750, "Egyptian pounds round to 1");
+assert.equal(dollarValue(11_400, 1450), 7.86, "a fixed price's dollar value, to the cent");
+assert.equal(dollarValue(114_000, 1500), 76);
 
 // ── Fake database ────────────────────────────────────────────────────────────
 type Row = Record<string, any>;
@@ -28,6 +30,7 @@ const db: Record<string, Row[]> = {
     { id: 11, email: "abuja@example.com", name: "Abuja Founder", plan: "free", plan_expires_at: null },
     { id: 12, email: "accra@example.com", name: "Accra Founder", plan: "free", plan_expires_at: null },
     { id: 13, email: "dollars@example.com", name: "Dollar Founder", plan: "free", plan_expires_at: null },
+    { id: 14, email: "ibadan@example.com", name: "Ibadan Founder", plan: "free", plan_expires_at: null },
   ],
   payments: [],
   billing_provider_plans: [],
@@ -198,7 +201,10 @@ const T0 = Date.parse("2026-10-20T12:00:00Z");
 
 try {
   const proMonthly = resolvePlanPrice("pro", "monthly");
+  const founderMonthly = resolvePlanPrice("prep", "monthly");
   const pro = (list: { catalog: any[] }) => list.catalog.find((item) => item.plan === "pro" && item.term === "monthly");
+  const founder = (list: { catalog: any[] }, term = "monthly") =>
+    list.catalog.find((item) => item.plan === "prep" && item.term === term);
 
   // ── Dollars only until local currencies are switched on ───────────────────
   mutableConfig.billingLocalCurrencies = [];
@@ -223,10 +229,26 @@ try {
   assert.equal(rateRow("NGN").usd_rate, 1450);
   assert.equal(rateRow("KES").usd_rate, 129.4);
 
+  // Founder is fixed in naira: ₦11,400 a month, 10 months for a year, shown
+  // with its dollar value today.
+  assert.deepEqual(
+    { amount: founder(list).amount, currency: founder(list).currency, baseAmount: founder(list).baseAmount, baseCurrency: founder(list).baseCurrency },
+    { amount: 11_400, currency: "NGN", baseAmount: 7.86, baseCurrency: "USD" },
+  );
+  assert.deepEqual(
+    { amount: founder(list, "annual").amount, baseAmount: founder(list, "annual").baseAmount },
+    { amount: 114_000, baseAmount: 78.62 },
+  );
+
   // Within the day, the stored rate is used as it is.
   rateCalls.length = 0;
   list = await priceListIn("KES", T0 + 6 * HOUR);
   assert.equal(pro(list).amount, convertFromUsd(proMonthly.amount, 129.4, "KES"));
+  assert.deepEqual(
+    { amount: founder(list).amount, baseAmount: founder(list).baseAmount },
+    { amount: convertFromUsd(founderMonthly.amount, 129.4, "KES"), baseAmount: founderMonthly.amount },
+    "other currencies still convert Founder from dollars",
+  );
   assert.equal(rateCalls.length, 0, "a rate checked today is not asked for again");
 
   // ── A day later: small moves keep the price, big moves change it ──────────
@@ -250,6 +272,21 @@ try {
     { ...proMonthly, amount: proNaira, currency: "NGN" },
     "checkout charges what the price list shows",
   );
+  assert.deepEqual(
+    { amount: founder(list).amount, baseAmount: founder(list).baseAmount },
+    { amount: 11_400, baseAmount: 7.6 },
+    "a new rate moves only the dollar value of a fixed price",
+  );
+  assert.deepEqual(
+    await checkoutPrice("prep", "monthly", "NGN", T2 + HOUR),
+    { ...founderMonthly, amount: 11_400, currency: "NGN" },
+    "checkout charges the fixed naira price",
+  );
+  assert.deepEqual(
+    await checkoutPrice("prep", "annual", "NGN", T2 + HOUR),
+    { ...resolvePlanPrice("prep", "annual"), amount: 114_000, currency: "NGN" },
+  );
+  assert.deepEqual(await checkoutPrice("prep", "monthly", "USD", T2 + HOUR), founderMonthly, "dollars stay at the dollar price");
 
   // ── Flutterwave down: a recent rate still prices, an old one stops ────────
   ratesDown = true;
@@ -298,6 +335,10 @@ try {
   assert.deepEqual(res.body.currencies, ["USD", "NGN", "KES"]);
   assert.deepEqual(res.body.price, { amount: proNaira, currency: "NGN", days: proMonthly.days });
   assert.equal(pro(res.body).baseAmount, proMonthly.amount);
+  assert.deepEqual(
+    { amount: founder(res.body).amount, baseAmount: founder(res.body).baseAmount, baseCurrency: founder(res.body).baseCurrency },
+    { amount: 11_400, baseAmount: 7.6, baseCurrency: "USD" },
+  );
   res = recorder();
   await getPrice(withQuery({}), res);
   assert.equal(res.body.currency, "USD");
@@ -391,6 +432,24 @@ try {
   await handleWebhook(webhook({ event: "charge.completed", data: { id: 92 } }), res);
   assert.equal(res.body.rejected, true, "dollars paid against a naira checkout grant nothing");
   assert.equal(db.users.find((u) => u.id === 11)!.plan, "free");
+
+  // ── Founder checkout in naira: the fixed price, renewals included ─────────
+  calls.length = 0;
+  res = recorder();
+  await startCheckout(asUser(14, { plan: "prep", term: "monthly", currency: "NGN" }), res);
+  assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+  const founderPlan = calls.find((c) => c.path === "/payment-plans")!;
+  assert.deepEqual(
+    { name: founderPlan.body.name, amount: founderPlan.body.amount, currency: founderPlan.body.currency },
+    { name: "PitchNest Founder (monthly, NGN)", amount: 11_400, currency: "NGN" },
+  );
+  const founderCheckout = calls.find((c) => c.path === "/payments")!;
+  assert.deepEqual({ amount: founderCheckout.body.amount, currency: founderCheckout.body.currency }, { amount: 11_400, currency: "NGN" });
+  const founderPayment = db.payments.find((p) => p.user_id === 14)!;
+  assert.deepEqual(
+    { plan: founderPayment.plan, amount: founderPayment.amount, currency: founderPayment.currency },
+    { plan: "prep", amount: 11_400, currency: "NGN" },
+  );
 
   // ── Migration ─────────────────────────────────────────────────────────────
   const migration = readFileSync(new URL("../../migrations/0035_billing_fx_rates.sql", import.meta.url), "utf8");
