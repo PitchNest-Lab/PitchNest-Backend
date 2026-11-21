@@ -98,6 +98,24 @@ export function staticRefusal(
   return null;
 }
 
+/**
+ * Whether founders can use a code right now: a code is switched on in the
+ * staff tools and inside its dates. The pricing page shows its code box only
+ * then, so deactivating the last active code also hides the box. False when
+ * the table is missing or unreadable.
+ */
+export async function discountCodesOpen(now = new Date()): Promise<boolean> {
+  const { data, error } = await supabase.from("discount_codes").select("starts_at, ends_at").eq("active", true);
+  if (error) {
+    if (error.code !== "42P01" && error.code !== "PGRST205") console.error("Discount code lookup failed:", error.message);
+    return false;
+  }
+  const time = now.getTime();
+  return ((data as Pick<DiscountCodeRow, "starts_at" | "ends_at">[] | null) ?? []).some(
+    (code) => (!code.starts_at || time >= Date.parse(code.starts_at)) && (!code.ends_at || time < Date.parse(code.ends_at)),
+  );
+}
+
 /** null when the table is missing (migration 0037 not applied): codes are simply unavailable. */
 export async function findDiscountCode(code: string): Promise<DiscountCodeRow | null | "unavailable"> {
   const { data, error } = await supabase

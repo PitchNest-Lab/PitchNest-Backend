@@ -37,6 +37,7 @@ import {
 import { checkoutPrice, isBillingModeAvailable, priceListIn } from "../services/localPriceService.ts";
 import {
   DISCOUNT_REFUSAL_MESSAGES,
+  discountCodesOpen,
   discountedAmount,
   normalizeDiscountCode,
   quoteDiscount,
@@ -54,10 +55,12 @@ import {
  * from, so display can never drift from what is charged. `currency` is the one
  * the prices are in and `currencies` lists the ones a buyer can switch to.
  * `offer.freeMonths` is what a first subscription adds on top, so the pricing
- * page can only promise what checkout records.
+ * page can only promise what checkout records. `discountCodes` says whether a
+ * discount code is switched on (staff tools); the pricing page shows its code
+ * box only then.
  */
 async function pricingPayload(requestedCurrency: unknown) {
-  const prices = await priceListIn(requestedCurrency);
+  const [prices, discountCodes] = await Promise.all([priceListIn(requestedCurrency), discountCodesOpen()]);
   const featured = prices.catalog.find((item) => item.plan === "pro" && item.term === "monthly")!;
   return {
     price: {
@@ -69,6 +72,7 @@ async function pricingPayload(requestedCurrency: unknown) {
     currency: prices.currency,
     currencies: prices.currencies,
     offer: { freeMonths: config.firstSubscriptionFreeMonths },
+    discountCodes,
   };
 }
 

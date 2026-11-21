@@ -597,6 +597,7 @@ test("images: the poster is public, the founder's screenshot is private", async 
 test("discount: the preview and the checkout charge the same discounted, one-time price", async () => {
   const token = signUserToken({ id: 410, email: "dee@x.test" });
   db.rows("users").push({ id: 410, email: "dee@x.test", name: "Dee", isEmailVerified: true, plan: "free", plan_expires_at: null });
+  assert.equal((await call(base, "GET", "/api/billing/price")).json.discountCodes, true, "an active code shows the pricing page's code box");
   const preview = await call(base, "GET", "/api/billing/discount?code=pchu01&plan=prep&term=monthly&currency=USD", { token });
   assert.equal(preview.status, 200, JSON.stringify(preview.json));
   assert.deepEqual(
@@ -630,6 +631,11 @@ test("discount: the preview and the checkout charge the same discounted, one-tim
   const reuse = await call(base, "GET", "/api/billing/discount?code=PCHU01&plan=prep&term=monthly", { token });
   assert.equal(reuse.json.reason, "already_used");
   db.rows("discount_codes")[0].active = false;
+  assert.equal((await call(base, "GET", "/api/billing/price")).json.discountCodes, false, "deactivating the only code hides the box");
+  assert.equal((await call(base, "GET", "/api/billing/plan", { token })).json.discountCodes, false, "for signed-in founders too");
+  Object.assign(db.rows("discount_codes")[0], { active: true, ends_at: iso(-1) });
+  assert.equal((await call(base, "GET", "/api/billing/price")).json.discountCodes, false, "so does an active code past its end date");
+  Object.assign(db.rows("discount_codes")[0], { active: false, ends_at: null });
   const inactive = await call(base, "POST", "/api/billing/checkout", { token: tokenB, body: { discountCode: "PCHU01" } });
   assert.equal(inactive.json.reason, "inactive");
   const plain = await call(base, "POST", "/api/billing/checkout", { token: tokenB, body: { plan: "pro", term: "monthly" } });
